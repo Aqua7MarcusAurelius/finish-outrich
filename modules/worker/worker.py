@@ -6,6 +6,9 @@
 профиль собеседника и публикует message.received на шину с полным
 payload (snapshot + peer_profile + media[]).
 
+Параллельно запускает нагон истории (HistorySyncService) — догрузит
+всё что пропустили пока воркер не работал.
+
 Менеджер воркеров управляет жизненным циклом — см. worker_manager/service.py.
 """
 from __future__ import annotations
@@ -77,35 +80,42 @@ class Worker:
         self._inflight_zero.set()
         # Если handler поймал SessionExpired — сохраняем сюда и роняем run()
         # её наружу, чтобы WorkerManager перевёл аккаунт в session_expired.
-        # Без этого протухшая сессия, обнаруженная при download_media или
-        # resolve_event_peer, молча гасла бы внутри callback'а.
         self._pending_exception: Exception | None = None
+        # Параллельная задача нагона — отменяется при stop()
+        self._sync_task: asyncio.Task | None = None
 
     # ─── Жизненный цикл ────────────────────────────────────────────
 
     async def run(self) -> None:
         """
-        Основной цикл воркера. Возвращается когда:
+        Возвращается когда:
         - вызвали stop()
-        - сессия протухла (SessionExpired из handler'а или connect)
+        - сессия протухла (SessionExpired)
         - оба прокси отвалились (ProxyUnavailable)
         Исключения наружу — ловит WorkerManager.
         """
+        # Импорт здесь — чтобы избежать циклических импортов через
+        # history_sync → wrapper → history_sync.
+        from modules.history_sync.service import HistorySyncService
+
         await self.wrapper.connect(require_authorized=True)
+
         # Прогрев entity-кэша Telethon: StringSession не сохраняет entity
         # (access_hash) между рестартами, без get_dialogs на старте
         # send_message(user_id) падает с "Could not find input entity".
+        # Результат переиспользуем для нагона — один запрос вместо двух.
+        dialogs_snapshot: list[dict] | None = None
         try:
-            await self.wrapper.get_dialogs(limit=None)
+            dialogs_snapshot = await self.wrapper.get_dialogs(limit=None)
         except SessionExpired:
             raise
         except Exception:
             log.exception(
-                "worker account=%s: failed to warm entity cache — "
-                "send_message may fail until first incoming message",
+                "worker account=%s: failed to warm entity cache",
                 self.account_id,
             )
 
+        # Подписка на новые сообщения
         self.wrapper.on_new_message(
             self._on_new_message, incoming=True, outgoing=True,
         )
@@ -118,11 +128,34 @@ class Worker:
             data={"name": self.account_name},
         )
 
+        # Нагон — параллельная задача, не блокирует основной цикл.
+        # Новые сообщения ловит handler, старые догружает нагон.
+        # Дубли отсекает unique-индекс (dialog_id, telegram_message_id).
+        sync_service = HistorySyncService(
+            account_id=self.account_id,
+            wrapper=self.wrapper,
+            dialogs_snapshot=dialogs_snapshot,
+        )
+        self._sync_task = asyncio.create_task(self._run_sync_safe(sync_service))
+
         try:
             # Блокируемся до stop_event. Telethon-клиент сам крутит
             # свой internal event loop и вызывает наши handlers.
             await self._stop_event.wait()
         finally:
+            # Отменяем нагон если ещё не завершился
+            if self._sync_task and not self._sync_task.done():
+                self._sync_task.cancel()
+                try:
+                    await self._sync_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    log.exception(
+                        "worker account=%s: sync task errored on cancel",
+                        self.account_id,
+                    )
+
             # Дожидаемся inflight handler'ов (таймаут — 10 сек на всё)
             try:
                 await asyncio.wait_for(self._inflight_zero.wait(), timeout=10)
@@ -137,6 +170,26 @@ class Worker:
         if self._pending_exception is not None:
             raise self._pending_exception
 
+    async def _run_sync_safe(self, sync_service) -> None:
+        """
+        Обёртка для нагона: ловит SessionExpired и сигналит воркеру
+        остановку — так же как это делают входящие хендлеры.
+        """
+        try:
+            await sync_service.run()
+        except asyncio.CancelledError:
+            raise
+        except SessionExpired as e:
+            self._pending_exception = e
+            self._stop_event.set()
+        except Exception:
+            # Все остальные ошибки нагона НЕ валят воркер — нагон
+            # уже опубликовал system.error сам. Просто завершаемся.
+            log.exception(
+                "worker account=%s: sync task failed (non-fatal)",
+                self.account_id,
+            )
+
     async def stop(self) -> None:
         """Попросить воркер остановиться. Идемпотентно."""
         self._stop_event.set()
@@ -144,15 +197,6 @@ class Worker:
     # ─── Handlers ──────────────────────────────────────────────────
 
     async def _on_new_message(self, event: tg_events.NewMessage.Event) -> None:
-        """
-        Обработка входящего/исходящего сообщения Telegram.
-
-        1. Фильтруем: только private-чаты, без системного 777000
-        2. Резолвим профиль собеседника (обычно из кэша Telethon)
-        3. Разбираем snapshot + media_info
-        4. Если есть медиа — качаем в MinIO
-        5. Публикуем message.received с полным payload
-        """
         if self._stop_event.is_set():
             return
 
@@ -173,7 +217,6 @@ class Worker:
         try:
             await self._handle_message(event, telegram_user_id)
         except SessionExpired as e:
-            # Сохраняем и просим остановку — run() выбросит её наружу
             self._pending_exception = e
             self._stop_event.set()
         except Exception:
@@ -194,8 +237,7 @@ class Worker:
         event: tg_events.NewMessage.Event,
         telegram_user_id: int,
     ) -> None:
-        # 1. Профиль собеседника — в ~всех случаях это чтение из кэша Telethon,
-        # сетевой запрос только при "первой встрече" нового человека.
+        # 1. Профиль собеседника — в ~всех случаях чтение из кэша Telethon
         peer_entity = await self.wrapper.resolve_event_peer(event)
         peer_profile = extract_user_profile(peer_entity)
 
@@ -204,7 +246,7 @@ class Worker:
         snapshot = serialize_message(msg)
         telegram_message_id = snapshot["telegram_message_id"]
 
-        # 3. Разбор и загрузка медиа (если есть)
+        # 3. Разбор и загрузка медиа
         media_info = detect_media_info(msg)
         media_payload: list[dict[str, Any]] = []
 
@@ -223,24 +265,17 @@ class Worker:
                         blob,
                         content_type=media_info.get("mime_type"),
                     )
-                    # в payload кладём всё кроме служебного `ext`, плюс storage_key
                     entry = {k: v for k, v in media_info.items() if k != "ext"}
                     entry["storage_key"] = storage_key
                     media_payload.append(entry)
                 else:
-                    # Не критично — сообщение всё равно запишется, но без файла
                     log.warning(
                         "worker account=%s msg=%s: empty blob from download_media_bytes",
                         self.account_id, telegram_message_id,
                     )
             except SessionExpired:
-                # Пробрасываем наверх — остановит воркер
                 raise
             except Exception as e:
-                # Инфра: MinIO недоступен, качалка ошиблась — публикуем
-                # system.error, но само сообщение всё равно публикуем (без media).
-                # Иначе потеряем факт получения сообщения, а это хуже чем
-                # потерять файл (метаданные и текст останутся).
                 log.exception(
                     "worker account=%s msg=%s: media store failed",
                     self.account_id, telegram_message_id,
