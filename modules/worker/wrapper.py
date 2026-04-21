@@ -18,9 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any, Awaitable, Callable
-from urllib.parse import urlparse
 
-import socks  # из пакета pysocks
 from telethon import TelegramClient, events
 from telethon.errors import (
     AuthKeyError,
@@ -34,12 +32,11 @@ from telethon.sessions import StringSession
 
 from core import bus
 from core.events import EventType, Module, Status
+from core.proxy import mask as mask_proxy, parse_socks5
 
 log = logging.getLogger(__name__)
 
 
-# Ошибки Telegram, которые означают что сессия мертва — переключением
-# прокси это не починить, нужна переавторизация.
 _SESSION_EXPIRED_ERRORS: tuple[type[Exception], ...] = (
     AuthKeyError,
     AuthKeyUnregisteredError,
@@ -51,7 +48,7 @@ _SESSION_EXPIRED_ERRORS: tuple[type[Exception], ...] = (
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Свои исключения — чтобы воркер/авторизация реагировали адресно
+# Свои исключения
 # ─────────────────────────────────────────────────────────────────────
 
 class WrapperError(Exception):
@@ -71,44 +68,7 @@ class NotConnected(WrapperError):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Утилиты
-# ─────────────────────────────────────────────────────────────────────
-
-def _parse_socks5(url: str) -> tuple:
-    """
-    `socks5://user:pass@host:port` → кортеж для параметра `proxy` Telethon:
-    (socks.SOCKS5, host, port, rdns=True, user, pass)
-    """
-    parsed = urlparse(url)
-    if parsed.scheme != "socks5":
-        raise ValueError(f"Поддерживается только socks5, получено: {parsed.scheme!r}")
-    if not parsed.hostname or not parsed.port:
-        raise ValueError(f"Некорректный прокси: {url}")
-    return (
-        socks.SOCKS5,
-        parsed.hostname,
-        parsed.port,
-        True,  # rdns — резолвим DNS на стороне прокси, не на стороне клиента
-        parsed.username or None,
-        parsed.password or None,
-    )
-
-
-def mask_proxy(url: str | None) -> str:
-    """Замазать user:pass в прокси-строке. Для публикаций в шину."""
-    if not url:
-        return ""
-    try:
-        p = urlparse(url)
-    except Exception:
-        return "***"
-    if p.username or p.password:
-        return f"{p.scheme}://***@{p.hostname}:{p.port}"
-    return url
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Сериализация сообщения Telethon → dict (для get_history и хендлеров)
+# Сериализация сообщения Telethon → dict
 # ─────────────────────────────────────────────────────────────────────
 
 def serialize_message(m: Any) -> dict[str, Any]:
@@ -166,7 +126,6 @@ class TelegramWrapper:
         self.connection_retries = connection_retries
         self.connection_timeout = connection_timeout
 
-        # StringSession сериализуется в UTF-8 строку — храним её в bytea БД как есть
         self._initial_session: str = (
             session_data.decode("utf-8") if session_data else ""
         )
@@ -189,11 +148,7 @@ class TelegramWrapper:
         return self._client is not None and self._client.is_connected()
 
     def get_session_data(self) -> bytes:
-        """
-        Текущая строка сессии в байтах — для записи в accounts.session_data.
-        После успешного connect/login Telethon обновляет внутреннее состояние
-        сессии, поэтому пересохранять имеет смысл периодически.
-        """
+        """Текущая строка сессии в байтах — для записи в accounts.session_data."""
         if self._client is not None:
             try:
                 s = self._client.session.save()
@@ -206,13 +161,6 @@ class TelegramWrapper:
     # ─── Подключение ───────────────────────────────────────────────
 
     async def connect(self, *, require_authorized: bool = True) -> None:
-        """
-        Поднять соединение через primary; если не вышло — через fallback.
-        Если оба отвалились — публикуем system.error и кидаем ProxyUnavailable.
-
-        require_authorized=False используется в модуле авторизации, где
-        сессии ещё нет — и это нормально (будет send_code_request).
-        """
         proxies: list[str] = [self.proxy_primary]
         if self.proxy_fallback:
             proxies.append(self.proxy_fallback)
@@ -227,7 +175,6 @@ class TelegramWrapper:
 
                 if require_authorized:
                     if not await client.is_user_authorized():
-                        # Ключ есть, но Telegram его не принял — значит мёртвый.
                         await client.disconnect()
                         await self._publish_session_expired("is_user_authorized=False")
                         raise SessionExpired("Сессия не авторизована")
@@ -241,10 +188,8 @@ class TelegramWrapper:
                 return
 
             except SessionExpired:
-                # Уже опубликовано, прокидываем наверх
                 raise
             except _SESSION_EXPIRED_ERRORS as e:
-                # Сессия мертва — нет смысла пробовать fallback
                 if client is not None:
                     try:
                         await client.disconnect()
@@ -253,7 +198,6 @@ class TelegramWrapper:
                 await self._publish_session_expired(str(e))
                 raise SessionExpired(str(e)) from e
             except Exception as e:
-                # Проблема сетевая/прокси — пробуем следующий
                 log.warning(
                     "wrapper connect failed account=%s proxy=%s error=%s",
                     self.account_id, mask_proxy(proxy_url), e,
@@ -266,7 +210,6 @@ class TelegramWrapper:
                         pass
                 continue
 
-        # Оба прокси провалились
         err_text = (
             f"оба прокси недоступны (последняя ошибка: {last_error})"
             if last_error else "оба прокси недоступны"
@@ -295,7 +238,7 @@ class TelegramWrapper:
             self._client = None
             self._active_proxy = None
 
-    # ─── Команды (wrapper.md) ──────────────────────────────────────
+    # ─── Команды ───────────────────────────────────────────────────
 
     async def send_message(
         self,
@@ -304,7 +247,6 @@ class TelegramWrapper:
         *,
         reply_to: int | None = None,
     ) -> dict[str, Any]:
-        """Отправить текст. dialog — entity (id, @username, телефон)."""
         async def _do():
             return await self.client.send_message(
                 entity=dialog, message=text, reply_to=reply_to,
@@ -320,10 +262,6 @@ class TelegramWrapper:
         dialog: int | str,
         message: int | None = None,
     ) -> bool:
-        """
-        Отметить прочитанным.
-        message=None → весь диалог до последнего входящего.
-        """
         async def _do():
             return await self.client.send_read_acknowledge(
                 entity=dialog, message=message,
@@ -331,10 +269,6 @@ class TelegramWrapper:
         return bool(await self._guard(_do))
 
     async def get_dialogs(self, limit: int | None = None) -> list[dict[str, Any]]:
-        """
-        Список диалогов. Возвращаем только личные (users) — группы/каналы
-        в этой системе не поддерживаются (architecture.md).
-        """
         if self._client is None:
             raise NotConnected("Сначала вызвать connect()")
         out: list[dict[str, Any]] = []
@@ -367,7 +301,6 @@ class TelegramWrapper:
         limit: int = 100,
         offset_id: int = 0,
     ) -> list[dict[str, Any]]:
-        """Кусок истории диалога. offset_id=0 — с последнего."""
         if self._client is None:
             raise NotConnected("Сначала вызвать connect()")
         out: list[dict[str, Any]] = []
@@ -390,10 +323,6 @@ class TelegramWrapper:
         incoming: bool = True,
         outgoing: bool = True,
     ) -> None:
-        """
-        Зарегистрировать хендлер входящих/исходящих сообщений.
-        Хендлер сам решает что делать — wrapper не лезет в бизнес-логику.
-        """
         if self._client is None:
             raise NotConnected("Сначала вызвать connect()")
         self._client.add_event_handler(
@@ -408,16 +337,12 @@ class TelegramWrapper:
             StringSession(self._initial_session),
             self.api_id,
             self.api_hash,
-            proxy=_parse_socks5(proxy_url),
+            proxy=parse_socks5(proxy_url),
             connection_retries=self.connection_retries,
             timeout=self.connection_timeout,
         )
 
     async def _guard(self, coro_fn: Callable[[], Awaitable[Any]]) -> Any:
-        """
-        Обёртка вокруг Telethon-вызова: ловит протухшую сессию,
-        публикует событие и поднимает SessionExpired наружу.
-        """
         if self._client is None:
             raise NotConnected("Сначала вызвать connect()")
         try:
