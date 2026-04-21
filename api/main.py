@@ -2,7 +2,7 @@
 Точка входа FastAPI.
 
 Этап 2: шина событий, архивный писатель, SSE /events/stream.
-Этап 3: модуль авторизации (/auth/*), /system/proxy-check.
+Этап 3: модуль авторизации, менеджер воркеров, /system/proxy-check.
 """
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ from core import redis as redis_mod
 from core.config import settings
 from modules.auth.routes import router as auth_router
 from modules.auth.service import AuthService
+from modules.worker_manager.routes import router as workers_router
+from modules.worker_manager.service import WorkerManager
 
 log = logging.getLogger("uvicorn.error")
 
@@ -36,11 +38,17 @@ async def lifespan(app: FastAPI):
     app.state.archive_task = archive_task
 
     app.state.auth_service = AuthService()
+    app.state.worker_manager = WorkerManager()
 
     try:
         yield
     finally:
         # ── Shutdown ───────────────────────────────────────────────
+        try:
+            await app.state.worker_manager.shutdown()
+        except Exception:
+            log.exception("worker_manager shutdown error")
+
         try:
             await app.state.auth_service.shutdown()
         except Exception:
@@ -73,7 +81,7 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization", "X-Confirm-Delete", "Last-Event-ID"],
 )
 
-# Роутеры
 app.include_router(system_router)
 app.include_router(events_router)
 app.include_router(auth_router)
+app.include_router(workers_router)
