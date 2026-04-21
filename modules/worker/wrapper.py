@@ -6,9 +6,9 @@
 
 Жизненный цикл:
     w = TelegramWrapper(...)
-    await w.connect()               # подключился через primary или fallback
-    w.on_new_message(handler)       # (опц.) подписка на входящие
-    ... send_message / get_dialogs / get_history / read_message ...
+    await w.connect()                    # подключился через primary или fallback
+    w.on_new_message(handler)            # (опц.) подписка на входящие
+    ... send_message / get_dialogs / get_history / download_media_bytes ...
     await w.disconnect()
 
 См. docs/wrapper.md.
@@ -29,6 +29,16 @@ from telethon.errors import (
     UserDeactivatedError,
 )
 from telethon.sessions import StringSession
+from telethon.tl.types import (
+    DocumentAttributeAnimated,
+    DocumentAttributeAudio,
+    DocumentAttributeFilename,
+    DocumentAttributeImageSize,
+    DocumentAttributeSticker,
+    DocumentAttributeVideo,
+    MessageMediaDocument,
+    MessageMediaPhoto,
+)
 
 from core import bus
 from core.events import EventType, Module, Status
@@ -68,27 +78,234 @@ class NotConnected(WrapperError):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Сериализация сообщения Telethon → dict
+# Разбор сообщений Telethon → JSON-совместимый dict
 # ─────────────────────────────────────────────────────────────────────
+
+# Расширение файла по типу медиа на случай если Telethon не смог вычислить его сам
+_DEFAULT_EXT: dict[str, str] = {
+    "photo": "jpg",
+    "sticker": "webp",
+    "video_note": "mp4",
+    "voice": "ogg",
+    "gif": "mp4",
+    "video": "mp4",
+    "audio": "mp3",
+    "document": "bin",
+}
+
+
+def _extract_forward_info(m: Any) -> dict[str, Any] | None:
+    """
+    Снимок данных о пересылке. None если сообщение не пересланное.
+    Структура соответствует docs/event_bus.md → forward_from.
+    """
+    fwd = getattr(m, "fwd_from", None)
+    if fwd is None:
+        return None
+    from_id = getattr(fwd, "from_id", None)
+    user_id = getattr(from_id, "user_id", None) if from_id else None
+    chat_id: int | None = None
+    if from_id is not None:
+        chat_id = (
+            getattr(from_id, "channel_id", None)
+            or getattr(from_id, "chat_id", None)
+        )
+    return {
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "name": getattr(fwd, "from_name", None),
+        "date": getattr(fwd, "date", None),
+    }
+
 
 def serialize_message(m: Any) -> dict[str, Any]:
     """
-    Минимальный снимок сообщения.
-    Полная распаковка медиа/пересылок — задача модуля истории (Этап 4).
+    Базовый снимок сообщения без медиа.
+    Медиа разбирает detect_media_info — отдельно, чтобы не таскать
+    большие вложенные структуры когда они не нужны.
     """
-    fwd = getattr(m, "forward", None)
     reply = getattr(m, "reply_to", None)
+    fwd_info = _extract_forward_info(m)
     return {
         "telegram_message_id": getattr(m, "id", None),
         "date": getattr(m, "date", None),
         "is_outgoing": bool(getattr(m, "out", False)),
         "text": getattr(m, "message", None) or None,
-        "reply_to_msg_id": getattr(reply, "reply_to_msg_id", None) if reply else None,
-        "forward_from_user_id": getattr(fwd, "sender_id", None) if fwd else None,
-        "forward_date": getattr(fwd, "date", None) if fwd else None,
+        "reply_to_telegram_message_id": (
+            getattr(reply, "reply_to_msg_id", None) if reply else None
+        ),
+        "forward_from": fwd_info,
         "media_group_id": getattr(m, "grouped_id", None),
-        "has_media": getattr(m, "media", None) is not None,
     }
+
+
+def extract_user_profile(entity: Any) -> dict[str, Any] | None:
+    """
+    Снимок профиля собеседника (Telethon User entity → dict).
+
+    Достаёт всё что доступно без дополнительного GetFullUserRequest:
+    username, имя, фамилия, телефон, флаги бот/контакт. Поля FullUser
+    (bio, birthday, имена из адресной книги) тянутся отдельно когда
+    реально нужны — например при открытии карточки диалога.
+
+    None — если entity пустой или не User-подобный (нет id).
+    """
+    if entity is None:
+        return None
+    user_id = getattr(entity, "id", None)
+    if user_id is None:
+        return None
+    return {
+        "telegram_user_id": user_id,
+        "username": getattr(entity, "username", None),
+        "first_name": getattr(entity, "first_name", None),
+        "last_name": getattr(entity, "last_name", None),
+        "phone": getattr(entity, "phone", None),
+        "is_bot": bool(getattr(entity, "bot", False)),
+        "is_contact": bool(getattr(entity, "contact", False)),
+    }
+
+
+def detect_media_info(m: Any) -> dict[str, Any] | None:
+    """
+    Распаковка атрибутов медиа сообщения.
+
+    Возвращает dict со всеми полями таблицы `media` кроме
+    storage_key/transcription/description (они появляются позже —
+    storage_key после загрузки в MinIO, тексты после обработки модулями).
+
+    Служебное поле `ext` — расширение для построения storage_key, в БД не пишется.
+
+    None — если у сообщения нет файлового медиа (включая web_page, geo, contact).
+    """
+    media = getattr(m, "media", None)
+    if media is None:
+        return None
+
+    # ── Фото ─────────────────────────────────────────────────────────
+    if isinstance(media, MessageMediaPhoto):
+        file = getattr(m, "file", None)
+        photo = getattr(media, "photo", None)
+        ext = (getattr(file, "ext", "") or "").lstrip(".").lower() or "jpg"
+        return {
+            "type": "photo",
+            "file_name": None,
+            "telegram_file_id": (
+                str(photo.id) if photo and getattr(photo, "id", None) else None
+            ),
+            "mime_type": getattr(file, "mime_type", None) or "image/jpeg",
+            "file_size": getattr(file, "size", None),
+            "duration": None,
+            "width": getattr(file, "width", None),
+            "height": getattr(file, "height", None),
+            "ext": ext,
+        }
+
+    # ── Документ — подвид определяем по атрибутам ───────────────────
+    # voice / video / video_note / audio / sticker / gif / document
+    if isinstance(media, MessageMediaDocument):
+        doc = getattr(media, "document", None)
+        if doc is None:
+            return None
+        attrs = getattr(doc, "attributes", []) or []
+
+        def _find(cls: type) -> Any | None:
+            for a in attrs:
+                if isinstance(a, cls):
+                    return a
+            return None
+
+        sticker_attr = _find(DocumentAttributeSticker)
+        animated_attr = _find(DocumentAttributeAnimated)
+        video_attr = _find(DocumentAttributeVideo)
+        audio_attr = _find(DocumentAttributeAudio)
+        filename_attr = _find(DocumentAttributeFilename)
+        imgsize_attr = _find(DocumentAttributeImageSize)
+
+        # Порядок проверок важен: кружок — это тоже video_attr,
+        # голосовое — тоже audio_attr. Сначала различаем подтипы.
+        if sticker_attr:
+            media_type = "sticker"
+        elif video_attr and getattr(video_attr, "round_message", False):
+            media_type = "video_note"
+        elif audio_attr and getattr(audio_attr, "voice", False):
+            media_type = "voice"
+        elif animated_attr:
+            media_type = "gif"
+        elif video_attr:
+            media_type = "video"
+        elif audio_attr:
+            media_type = "audio"
+        else:
+            media_type = "document"
+
+        file = getattr(m, "file", None)
+        ext = (getattr(file, "ext", "") or "").lstrip(".").lower()
+        if not ext:
+            ext = _DEFAULT_EXT.get(media_type, "bin")
+
+        raw_duration = (
+            getattr(video_attr, "duration", None) if video_attr
+            else getattr(audio_attr, "duration", None) if audio_attr
+            else None
+        )
+        duration: int | None
+        if raw_duration is None:
+            duration = None
+        else:
+            try:
+                duration = int(raw_duration)
+            except Exception:
+                duration = None
+
+        width = (
+            getattr(video_attr, "w", None)
+            or getattr(imgsize_attr, "w", None)
+        )
+        height = (
+            getattr(video_attr, "h", None)
+            or getattr(imgsize_attr, "h", None)
+        )
+
+        return {
+            "type": media_type,
+            "file_name": (
+                getattr(filename_attr, "file_name", None) if filename_attr else None
+            ),
+            "telegram_file_id": (
+                str(doc.id) if getattr(doc, "id", None) else None
+            ),
+            "mime_type": getattr(doc, "mime_type", None),
+            "file_size": getattr(doc, "size", None),
+            "duration": duration,
+            "width": width,
+            "height": height,
+            "ext": ext,
+        }
+
+    # MessageMediaWebPage / Geo / Contact / Poll / Invoice / … — игнорируем
+    return None
+
+
+def build_storage_key(
+    *,
+    account_id: int,
+    telegram_user_id: int,
+    telegram_message_id: int,
+    ext: str,
+) -> str:
+    """
+    Ключ файла в MinIO.
+
+    Формат: account_{account_id}/{telegram_user_id}/{telegram_message_id}.{ext}
+
+    Используем telegram_user_id вместо внутреннего dialog_id из БД: враппер
+    работает до модуля истории и не знает внутренних id. Для пары
+    (account_id, telegram_user_id) у нас гарантированный уникальный
+    dialog_id, так что ключ однозначен.
+    """
+    ext = (ext or "bin").lstrip(".").lower() or "bin"
+    return f"account_{account_id}/{telegram_user_id}/{telegram_message_id}.{ext}"
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -300,19 +517,77 @@ class TelegramWrapper:
         *,
         limit: int = 100,
         offset_id: int = 0,
-    ) -> list[dict[str, Any]]:
+    ) -> list[Any]:
+        """
+        История диалога — сырые Telethon Message-объекты.
+
+        Возвращаем именно объекты (а не snapshot-ы), чтобы вызывающий
+        модуль (нагон) мог скачивать медиа через download_media_bytes(msg)
+        без повторного запроса в Telegram. Для превращения в payload —
+        вызывать serialize_message + detect_media_info поштучно.
+        """
         if self._client is None:
             raise NotConnected("Сначала вызвать connect()")
-        out: list[dict[str, Any]] = []
+        out: list[Any] = []
         try:
             async for m in self._client.iter_messages(
                 entity=dialog, limit=limit, offset_id=offset_id,
             ):
-                out.append(serialize_message(m))
+                out.append(m)
         except _SESSION_EXPIRED_ERRORS as e:
             await self._publish_session_expired(str(e))
             raise SessionExpired(str(e)) from e
         return out
+
+    async def download_media_bytes(self, msg: Any) -> bytes | None:
+        """
+        Скачать медиа сообщения в память. None если у сообщения нет файла.
+        Ошибки сессии — через _guard → SessionExpired.
+        """
+        if self._client is None:
+            raise NotConnected("Сначала вызвать connect()")
+        if not getattr(msg, "media", None):
+            return None
+
+        async def _do():
+            return await self._client.download_media(msg, file=bytes)
+
+        result = await self._guard(_do)
+        if result is None:
+            return None
+        if isinstance(result, (bytes, bytearray)):
+            return bytes(result)
+        # На всякий случай — если Telethon вдруг вернул не bytes
+        return None
+
+    async def resolve_event_peer(self, event: Any) -> Any | None:
+        """
+        Entity собеседника для NewMessage event (в private chat — User).
+
+        Обычно не ходит в сеть — Telethon кэширует entity прямо в сессии.
+        Запрос случается только если собеседник "первой встречи" и его
+        ещё нет в кэше.
+
+        SessionExpired пробрасывается наверх (её обязан обработать воркер),
+        прочие ошибки глушим в None — профиль не критичен, сообщение
+        запишется в историю и без него.
+        """
+        if self._client is None:
+            raise NotConnected("Сначала вызвать connect()")
+
+        async def _do():
+            return await event.get_chat()
+
+        try:
+            return await self._guard(_do)
+        except SessionExpired:
+            raise
+        except Exception:
+            log.exception(
+                "wrapper account=%s: resolve_event_peer failed",
+                self.account_id,
+            )
+            return None
 
     # ─── Подписка на события Telegram ──────────────────────────────
 

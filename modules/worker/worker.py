@@ -2,7 +2,9 @@
 Жизненный цикл воркера одного Telegram-аккаунта.
 
 Отдельный asyncio-таск: поднимает TelegramWrapper, подписывается
-на входящие/исходящие сообщения, публикует их в шину.
+на входящие/исходящие сообщения, качает медиа в MinIO, резолвит
+профиль собеседника и публикует message.received на шину с полным
+payload (snapshot + peer_profile + media[]).
 
 Менеджер воркеров управляет жизненным циклом — см. worker_manager/service.py.
 """
@@ -15,16 +17,24 @@ from typing import Any
 from telethon import events as tg_events
 
 from core import bus
+from core import minio as minio_mod
 from core.config import settings
 from core.events import EventType, Module, Status
 from modules.worker.wrapper import (
-    ProxyUnavailable,
+    ProxyUnavailable,  # noqa: F401 (публичный API подмодуля, наружу пробрасывается менеджером)
     SessionExpired,
     TelegramWrapper,
+    build_storage_key,
+    detect_media_info,
+    extract_user_profile,
     serialize_message,
 )
 
 log = logging.getLogger(__name__)
+
+# Системный аккаунт Telegram — уведомления "You added account on Android" и т.п.
+# Игнорируем целиком: не создаём диалог, не пишем сообщения, не качаем медиа.
+TELEGRAM_SYSTEM_USER_ID = 777000
 
 
 class Worker:
@@ -61,10 +71,15 @@ class Worker:
         )
 
         self._stop_event = asyncio.Event()
-        # Флаг чтобы при остановке дождаться уходящего message.received
+        # При остановке ждём завершения inflight-хендлеров message.received
         self._inflight: int = 0
         self._inflight_zero = asyncio.Event()
         self._inflight_zero.set()
+        # Если handler поймал SessionExpired — сохраняем сюда и роняем run()
+        # её наружу, чтобы WorkerManager перевёл аккаунт в session_expired.
+        # Без этого протухшая сессия, обнаруженная при download_media или
+        # resolve_event_peer, молча гасла бы внутри callback'а.
+        self._pending_exception: Exception | None = None
 
     # ─── Жизненный цикл ────────────────────────────────────────────
 
@@ -72,7 +87,7 @@ class Worker:
         """
         Основной цикл воркера. Возвращается когда:
         - вызвали stop()
-        - сессия протухла (SessionExpired)
+        - сессия протухла (SessionExpired из handler'а или connect)
         - оба прокси отвалились (ProxyUnavailable)
         Исключения наружу — ловит WorkerManager.
         """
@@ -95,7 +110,7 @@ class Worker:
             # свой internal event loop и вызывает наши handlers.
             await self._stop_event.wait()
         finally:
-            # Дожидаемся inflight message.received (таймаут — 10 сек на всё)
+            # Дожидаемся inflight handler'ов (таймаут — 10 сек на всё)
             try:
                 await asyncio.wait_for(self._inflight_zero.wait(), timeout=10)
             except asyncio.TimeoutError:
@@ -105,6 +120,10 @@ class Worker:
                 )
             await self.wrapper.disconnect()
 
+        # Если handler поймал SessionExpired — пробрасываем наружу
+        if self._pending_exception is not None:
+            raise self._pending_exception
+
     async def stop(self) -> None:
         """Попросить воркер остановиться. Идемпотентно."""
         self._stop_event.set()
@@ -113,47 +132,129 @@ class Worker:
 
     async def _on_new_message(self, event: tg_events.NewMessage.Event) -> None:
         """
-        Входящее или исходящее сообщение Telegram → публикация message.received.
+        Обработка входящего/исходящего сообщения Telegram.
 
-        Распаковкой медиа/записью в БД займётся модуль истории на Этапе 4.
-        Сейчас публикуем минимальный снимок — модуль истории получит его
-        из шины и обработает сам.
+        1. Фильтруем: только private-чаты, без системного 777000
+        2. Резолвим профиль собеседника (обычно из кэша Telethon)
+        3. Разбираем snapshot + media_info
+        4. Если есть медиа — качаем в MinIO
+        5. Публикуем message.received с полным payload
         """
         if self._stop_event.is_set():
+            return
+
+        # Только личные чаты — группы/каналы мимо
+        if not getattr(event, "is_private", False):
+            return
+
+        msg = event.message
+        peer = getattr(msg, "peer_id", None)
+        telegram_user_id = getattr(peer, "user_id", None) if peer else None
+        if telegram_user_id is None:
+            return
+        if telegram_user_id == TELEGRAM_SYSTEM_USER_ID:
             return
 
         self._inflight += 1
         self._inflight_zero.clear()
         try:
-            msg = event.message
-            snapshot = serialize_message(msg)
-
-            # Кто собеседник — нужен чтобы модуль истории нашёл dialog
-            sender_id: int | None = None
-            try:
-                sender_id = (
-                    msg.peer_id.user_id if hasattr(msg.peer_id, "user_id") else None
-                )
-            except Exception:
-                sender_id = None
-
-            await bus.publish(
-                module=Module.WRAPPER,
-                type=EventType.MESSAGE_RECEIVED,
-                status=Status.SUCCESS,
-                account_id=self.account_id,
-                data={
-                    **snapshot,
-                    "telegram_user_id": sender_id,
-                },
-            )
+            await self._handle_message(event, telegram_user_id)
+        except SessionExpired as e:
+            # Сохраняем и просим остановку — run() выбросит её наружу
+            self._pending_exception = e
+            self._stop_event.set()
         except Exception:
             log.exception(
-                "worker account=%s: error in new_message handler",
-                self.account_id,
+                "worker account=%s msg=%s: handler error",
+                self.account_id, getattr(msg, "id", None),
             )
         finally:
             self._inflight -= 1
             if self._inflight <= 0:
                 self._inflight = 0
                 self._inflight_zero.set()
+
+    # ─── Основная логика ───────────────────────────────────────────
+
+    async def _handle_message(
+        self,
+        event: tg_events.NewMessage.Event,
+        telegram_user_id: int,
+    ) -> None:
+        # 1. Профиль собеседника — в ~всех случаях это чтение из кэша Telethon,
+        # сетевой запрос только при "первой встрече" нового человека.
+        peer_entity = await self.wrapper.resolve_event_peer(event)
+        peer_profile = extract_user_profile(peer_entity)
+
+        # 2. Базовый snapshot сообщения
+        msg = event.message
+        snapshot = serialize_message(msg)
+        telegram_message_id = snapshot["telegram_message_id"]
+
+        # 3. Разбор и загрузка медиа (если есть)
+        media_info = detect_media_info(msg)
+        media_payload: list[dict[str, Any]] = []
+
+        if media_info is not None and telegram_message_id is not None:
+            storage_key = build_storage_key(
+                account_id=self.account_id,
+                telegram_user_id=telegram_user_id,
+                telegram_message_id=telegram_message_id,
+                ext=media_info["ext"],
+            )
+            try:
+                blob = await self.wrapper.download_media_bytes(msg)
+                if blob:
+                    await minio_mod.put_object(
+                        storage_key,
+                        blob,
+                        content_type=media_info.get("mime_type"),
+                    )
+                    # в payload кладём всё кроме служебного `ext`, плюс storage_key
+                    entry = {k: v for k, v in media_info.items() if k != "ext"}
+                    entry["storage_key"] = storage_key
+                    media_payload.append(entry)
+                else:
+                    # Не критично — сообщение всё равно запишется, но без файла
+                    log.warning(
+                        "worker account=%s msg=%s: empty blob from download_media_bytes",
+                        self.account_id, telegram_message_id,
+                    )
+            except SessionExpired:
+                # Пробрасываем наверх — остановит воркер
+                raise
+            except Exception as e:
+                # Инфра: MinIO недоступен, качалка ошиблась — публикуем
+                # system.error, но само сообщение всё равно публикуем (без media).
+                # Иначе потеряем факт получения сообщения, а это хуже чем
+                # потерять файл (метаданные и текст останутся).
+                log.exception(
+                    "worker account=%s msg=%s: media store failed",
+                    self.account_id, telegram_message_id,
+                )
+                await bus.publish(
+                    module=Module.WRAPPER,
+                    type=EventType.SYSTEM_ERROR,
+                    status=Status.ERROR,
+                    account_id=self.account_id,
+                    data={
+                        "message": f"не удалось сохранить медиа: {e}",
+                        "telegram_message_id": telegram_message_id,
+                        "telegram_user_id": telegram_user_id,
+                        "media_type": media_info.get("type"),
+                    },
+                )
+
+        # 4. Публикуем событие
+        await bus.publish(
+            module=Module.WRAPPER,
+            type=EventType.MESSAGE_RECEIVED,
+            status=Status.SUCCESS,
+            account_id=self.account_id,
+            data={
+                **snapshot,
+                "telegram_user_id": telegram_user_id,
+                "peer_profile": peer_profile,
+                "media": media_payload,
+            },
+        )

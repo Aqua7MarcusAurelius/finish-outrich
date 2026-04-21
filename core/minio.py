@@ -8,6 +8,7 @@ asyncio.to_thread() чтобы не блокировать event loop.
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 
 from minio import Minio
@@ -70,6 +71,56 @@ async def check_health() -> bool:
 # ─────────────────────────────────────────────────────────────────────
 # Операции с объектами
 # ─────────────────────────────────────────────────────────────────────
+
+async def put_object(
+    storage_key: str,
+    data: bytes,
+    *,
+    content_type: str | None = None,
+) -> None:
+    """
+    Загрузить байты в MinIO под заданным ключом.
+
+    Используется враппером при сохранении медиа из входящих сообщений
+    и модулем нагона истории. Ошибки пробрасываются наружу — решение
+    что делать принимает вызывающий.
+    """
+    client = get_client()
+    bucket = settings.MINIO_BUCKET
+
+    def _put() -> None:
+        client.put_object(
+            bucket,
+            storage_key,
+            io.BytesIO(data),
+            length=len(data),
+            content_type=content_type or "application/octet-stream",
+        )
+
+    await asyncio.to_thread(_put)
+
+
+async def get_object(storage_key: str) -> bytes:
+    """
+    Скачать объект как байты. Бросает исключение при отсутствии/ошибке.
+
+    Используется модулями транскрипции и описания (Этапы 5-6).
+    """
+    client = get_client()
+    bucket = settings.MINIO_BUCKET
+
+    def _get() -> bytes:
+        resp = None
+        try:
+            resp = client.get_object(bucket, storage_key)
+            return resp.read()
+        finally:
+            if resp is not None:
+                resp.close()
+                resp.release_conn()
+
+    return await asyncio.to_thread(_get)
+
 
 async def remove_object(storage_key: str) -> None:
     """Удалить один объект из bucket-а. Ошибки пробрасываются наружу."""
