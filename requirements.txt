@@ -1,0 +1,20 @@
+# Web framework
+fastapi==0.115.4
+uvicorn[standard]==0.32.0
+
+# Database
+asyncpg==0.30.0
+psycopg2-binary==2.9.10
+SQLAlchemy==2.0.36
+alembic==1.13.3
+
+# Redis
+redis==5.2.0
+
+# MinIO / S3
+minio==7.2.10
+
+# Config
+pydantic==2.9.2
+pydantic-settings==2.6.1
+python-dotenv==1.0.1
