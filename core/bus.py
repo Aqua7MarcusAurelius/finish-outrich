@@ -16,6 +16,9 @@ consumer group и пишет события в PostgreSQL (таблица events
         ├──▶ archive_writer_loop (consumer group "archive-writer")
         │       └── INSERT в events_archive
         │
+        ├──▶ history_service_loop (consumer group "history-writer")
+        │       └── upsert dialogs / insert messages+media
+        │
         └──▶ SSE-подписчики /events/stream
                 └── XREAD по Last-Event-ID
 """
@@ -33,6 +36,8 @@ from core.redis import get_client
 log = logging.getLogger(__name__)
 
 STREAM_KEY = "events:stream"
+
+# Consumer groups
 ARCHIVE_GROUP = "archive-writer"
 ARCHIVE_CONSUMER = "archive-writer-1"
 
@@ -95,20 +100,8 @@ async def publish(
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Чтение — для архивного писателя (через consumer group)
+# Consumer groups — обобщённый API
 # ─────────────────────────────────────────────────────────────────────
-
-async def ensure_consumer_group() -> None:
-    """Создать consumer group если её ещё нет. Идемпотентно."""
-    client = get_client()
-    try:
-        await client.xgroup_create(STREAM_KEY, ARCHIVE_GROUP, id="0", mkstream=True)
-        log.info("Created consumer group %s on %s", ARCHIVE_GROUP, STREAM_KEY)
-    except Exception as e:
-        # BUSYGROUP — группа уже существует, это норма
-        if "BUSYGROUP" not in str(e):
-            raise
-
 
 def _decode_event(fields: dict) -> dict | None:
     """Распаковать JSON из полей Redis-сообщения."""
@@ -124,40 +117,66 @@ def _decode_event(fields: dict) -> dict | None:
         return None
 
 
-async def _read_for_archive(count: int = 100, block_ms: int = 5000) -> list[tuple[str, dict]]:
+async def ensure_group(group: str, *, start_id: str = "0") -> None:
     """
-    Прочитать батч новых событий для архивного писателя.
+    Создать consumer group если её ещё нет. Идемпотентно.
+
+    start_id="0" — группа прочитает поток с начала (до STREAM_MAXLEN).
+    start_id="$" — только новые события после создания группы.
+    """
+    client = get_client()
+    try:
+        await client.xgroup_create(STREAM_KEY, group, id=start_id, mkstream=True)
+        log.info("Created consumer group %s on %s (start=%s)", group, STREAM_KEY, start_id)
+    except Exception as e:
+        # BUSYGROUP — группа уже существует, это норма
+        if "BUSYGROUP" not in str(e):
+            raise
+
+
+async def read_group(
+    group: str,
+    consumer: str,
+    *,
+    count: int = 100,
+    block_ms: int = 5000,
+) -> list[tuple[str, dict]]:
+    """
+    Прочитать батч новых событий через consumer group.
     Возвращает [(stream_id, event_dict), ...].
+
+    Некорректные события (не распарсился JSON) автоматически ack'аются,
+    чтобы не висели в pending forever.
     """
     client = get_client()
     result = await client.xreadgroup(
-        ARCHIVE_GROUP,
-        ARCHIVE_CONSUMER,
+        group,
+        consumer,
         {STREAM_KEY: ">"},
         count=count,
         block=block_ms,
     )
-    out = []
+    out: list[tuple[str, dict]] = []
     if not result:
         return out
     for _stream_key, messages in result:
         for stream_id, fields in messages:
+            sid = stream_id.decode() if isinstance(stream_id, bytes) else stream_id
             event = _decode_event(fields)
             if event is None:
-                # всё равно подтвердим, чтобы не ходить по нему бесконечно
-                sid = stream_id.decode() if isinstance(stream_id, bytes) else stream_id
-                await client.xack(STREAM_KEY, ARCHIVE_GROUP, sid)
+                # Мусор — подтверждаем и пропускаем
+                await client.xack(STREAM_KEY, group, sid)
                 continue
-            sid = stream_id.decode() if isinstance(stream_id, bytes) else stream_id
             out.append((sid, event))
     return out
 
 
-async def _ack_archive(stream_ids: list[str]) -> None:
+async def ack_group(group: str, stream_ids: list[str]) -> None:
+    """Подтвердить обработку батча событий."""
     if not stream_ids:
         return
     client = get_client()
-    await client.xack(STREAM_KEY, ARCHIVE_GROUP, *stream_ids)
+    await client.xack(STREAM_KEY, group, *stream_ids)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -177,7 +196,7 @@ async def read_live(
     """
     client = get_client()
     result = await client.xread({STREAM_KEY: last_id}, count=count, block=block_ms)
-    out = []
+    out: list[tuple[str, dict]] = []
     if not result:
         return out
     for _stream_key, messages in result:
@@ -202,12 +221,15 @@ async def archive_writer_loop() -> None:
     # Импорт здесь чтобы избежать циклических импортов
     from core import db
 
-    await ensure_consumer_group()
+    await ensure_group(ARCHIVE_GROUP)
     log.info("archive_writer_loop started")
 
     while True:
         try:
-            batch = await _read_for_archive(count=50, block_ms=5000)
+            batch = await read_group(
+                ARCHIVE_GROUP, ARCHIVE_CONSUMER,
+                count=50, block_ms=5000,
+            )
             if not batch:
                 continue
 
@@ -246,7 +268,7 @@ async def archive_writer_loop() -> None:
                         # Не ack'аем — попробуем в следующий проход
 
             if ack_ids:
-                await _ack_archive(ack_ids)
+                await ack_group(ARCHIVE_GROUP, ack_ids)
 
         except asyncio.CancelledError:
             log.info("archive_writer_loop cancelled")
