@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     MINIO_ROOT_PASSWORD: str = ""
     MINIO_BUCKET: str = "tgframework"
 
+    # Telegram API (общие креды для всех аккаунтов, берутся с my.telegram.org)
+    TELEGRAM_API_ID: int = 0
+    TELEGRAM_API_HASH: str = ""
+
     # OpenRouter
     OPENROUTER_API_KEY: str = ""
     OPENROUTER_MODEL_TRANSCRIPTION: str = "openai/whisper"

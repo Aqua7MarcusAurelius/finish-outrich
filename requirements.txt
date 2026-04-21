@@ -18,3 +18,7 @@ minio==7.2.10
 pydantic==2.9.2
 pydantic-settings==2.6.1
 python-dotenv==1.0.1
+
+# Telegram
+telethon==1.36.0
+pysocks==1.7.1
