@@ -268,6 +268,19 @@ class WorkerManager:
             },
         }
 
+    def get_wrapper(self, account_id: int):
+        """
+        Вернуть живой TelegramWrapper для аккаунта. None если воркер
+        не запущен или ещё/уже не подключён. Используется endpoints'ами
+        модуля истории для send_message / read_message.
+        """
+        slot = self._slots.get(account_id)
+        if slot is None:
+            return None
+        if not slot.worker.wrapper.is_connected():
+            return None
+        return slot.worker.wrapper
+
     async def shutdown(self) -> None:
         """Остановить все воркеры при shutdown приложения."""
         ids = list(self._slots.keys())

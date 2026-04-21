@@ -92,6 +92,19 @@ class Worker:
         Исключения наружу — ловит WorkerManager.
         """
         await self.wrapper.connect(require_authorized=True)
+        # Прогрев entity-кэша Telethon: StringSession не сохраняет entity
+        # (access_hash) между рестартами, без get_dialogs на старте
+        # send_message(user_id) падает с "Could not find input entity".
+        try:
+            await self.wrapper.get_dialogs(limit=None)
+        except SessionExpired:
+            raise
+        except Exception:
+            log.exception(
+                "worker account=%s: failed to warm entity cache — "
+                "send_message may fail until first incoming message",
+                self.account_id,
+            )
 
         self.wrapper.on_new_message(
             self._on_new_message, incoming=True, outgoing=True,

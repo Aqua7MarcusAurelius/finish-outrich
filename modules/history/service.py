@@ -322,8 +322,8 @@ class HistoryService:
     async def _on_transcription_done(self, event: dict) -> None:
         """
         Обновить media.transcription + статус, опубликовать message.updated.
-        Модуль транскрипции появится на Этапе 5, сейчас обработчик готов
-        но никто события этого типа не публикует.
+        В message.updated кладём dialog_id — чтобы SSE-фильтр на /dialogs/*/stream
+        мог его отсечь.
         """
         data = event.get("data") or {}
         media_id = data.get("media_id")
@@ -338,11 +338,15 @@ class HistoryService:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                UPDATE media SET
-                    transcription = $1,
-                    transcription_status = $2
-                WHERE id = $3
-                RETURNING message_id
+                WITH upd AS (
+                    UPDATE media SET
+                        transcription = $1,
+                        transcription_status = $2
+                    WHERE id = $3
+                    RETURNING message_id
+                )
+                SELECT u.message_id, m.dialog_id
+                FROM upd u JOIN messages m ON m.id = u.message_id
                 """,
                 text, status, media_id,
             )
@@ -359,6 +363,7 @@ class HistoryService:
             account_id=event.get("account_id"),
             data={
                 "message_id": row["message_id"],
+                "dialog_id": row["dialog_id"],
                 "media_id": media_id,
                 "field": "transcription",
                 "status": status,
@@ -380,11 +385,15 @@ class HistoryService:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                UPDATE media SET
-                    description = $1,
-                    description_status = $2
-                WHERE id = $3
-                RETURNING message_id
+                WITH upd AS (
+                    UPDATE media SET
+                        description = $1,
+                        description_status = $2
+                    WHERE id = $3
+                    RETURNING message_id
+                )
+                SELECT u.message_id, m.dialog_id
+                FROM upd u JOIN messages m ON m.id = u.message_id
                 """,
                 text, status, media_id,
             )
@@ -401,6 +410,7 @@ class HistoryService:
             account_id=event.get("account_id"),
             data={
                 "message_id": row["message_id"],
+                "dialog_id": row["dialog_id"],
                 "media_id": media_id,
                 "field": "description",
                 "status": status,

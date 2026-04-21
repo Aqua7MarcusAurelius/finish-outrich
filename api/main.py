@@ -4,7 +4,7 @@
 Этап 2: шина событий, архивный писатель, SSE /events/stream.
 Этап 3: модуль авторизации, менеджер воркеров, /system/proxy-check.
 Этап 4: модуль истории (consumer шины, запись dialogs/messages/media),
-         чистильщик файлов MinIO.
+         чистильщик файлов MinIO, endpoints /accounts/*/dialogs, /dialogs/*, /messages/*.
 """
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from core.config import settings
 from modules.auth.routes import router as auth_router
 from modules.auth.service import AuthService
 from modules.history.cleaner import Cleaner
+from modules.history.routes import router as history_router
 from modules.history.service import HistoryService
 from modules.worker_manager.routes import router as workers_router
 from modules.worker_manager.service import WorkerManager
@@ -121,3 +122,4 @@ app.include_router(system_router)
 app.include_router(events_router)
 app.include_router(auth_router)
 app.include_router(workers_router)
+app.include_router(history_router)
