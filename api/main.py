@@ -3,6 +3,7 @@
 
 Этап 2: шина событий, архивный писатель, SSE /events/stream.
 Этап 3: модуль авторизации, менеджер воркеров, /system/proxy-check.
+Этап 4: модуль истории (consumer шины, запись dialogs/messages/media).
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ from core import redis as redis_mod
 from core.config import settings
 from modules.auth.routes import router as auth_router
 from modules.auth.service import AuthService
+from modules.history.service import HistoryService
 from modules.worker_manager.routes import router as workers_router
 from modules.worker_manager.service import WorkerManager
 
@@ -36,6 +38,11 @@ async def lifespan(app: FastAPI):
 
     archive_task = asyncio.create_task(bus.archive_writer_loop())
     app.state.archive_task = archive_task
+
+    history_service = HistoryService()
+    app.state.history_service = history_service
+    history_task = asyncio.create_task(history_service.run())
+    app.state.history_task = history_task
 
     app.state.auth_service = AuthService()
     app.state.worker_manager = WorkerManager()
@@ -54,6 +61,17 @@ async def lifespan(app: FastAPI):
         except Exception:
             log.exception("auth_service shutdown error")
 
+        try:
+            await history_service.stop()
+        except Exception:
+            log.exception("history_service stop error")
+
+        history_task.cancel()
+        try:
+            await history_task
+        except asyncio.CancelledError:
+            pass
+
         archive_task.cancel()
         try:
             await archive_task
@@ -66,7 +84,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Telegram Automation Framework",
-    version="0.3.0",
+    version="0.4.0",
     docs_url="/docs" if settings.DOCS_PUBLIC else None,
     redoc_url="/redoc" if settings.DOCS_PUBLIC else None,
     openapi_url="/openapi.json" if settings.DOCS_PUBLIC else None,
