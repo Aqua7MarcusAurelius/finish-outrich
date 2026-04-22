@@ -5,6 +5,7 @@
 Этап 3: модуль авторизации, менеджер воркеров, /system/proxy-check.
 Этап 4: модуль истории (consumer шины, запись dialogs/messages/media),
          чистильщик файлов MinIO, endpoints /accounts/*/dialogs, /dialogs/*, /messages/*.
+Этап 5: модуль транскрибации (OpenRouter chat-completions + ffmpeg-конвертер).
 """
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ from modules.auth.service import AuthService
 from modules.history.cleaner import Cleaner
 from modules.history.routes import router as history_router
 from modules.history.service import HistoryService
+from modules.transcription.service import TranscriptionService
 from modules.worker_manager.routes import router as workers_router
 from modules.worker_manager.service import WorkerManager
 
@@ -52,6 +54,11 @@ async def lifespan(app: FastAPI):
     cleaner_task = asyncio.create_task(cleaner.run())
     app.state.cleaner_task = cleaner_task
 
+    transcription_service = TranscriptionService()
+    app.state.transcription_service = transcription_service
+    transcription_task = asyncio.create_task(transcription_service.run())
+    app.state.transcription_task = transcription_task
+
     app.state.auth_service = AuthService()
     app.state.worker_manager = WorkerManager()
 
@@ -68,6 +75,17 @@ async def lifespan(app: FastAPI):
             await app.state.auth_service.shutdown()
         except Exception:
             log.exception("auth_service shutdown error")
+
+        try:
+            await transcription_service.stop()
+        except Exception:
+            log.exception("transcription_service stop error")
+
+        transcription_task.cancel()
+        try:
+            await transcription_task
+        except asyncio.CancelledError:
+            pass
 
         try:
             await cleaner.stop()
@@ -103,7 +121,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Telegram Automation Framework",
-    version="0.4.0",
+    version="0.5.0",
     docs_url="/docs" if settings.DOCS_PUBLIC else None,
     redoc_url="/redoc" if settings.DOCS_PUBLIC else None,
     openapi_url="/openapi.json" if settings.DOCS_PUBLIC else None,
