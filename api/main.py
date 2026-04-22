@@ -6,6 +6,7 @@
 Этап 4: модуль истории (consumer шины, запись dialogs/messages/media),
          чистильщик файлов MinIO, endpoints /accounts/*/dialogs, /dialogs/*, /messages/*.
 Этап 5: модуль транскрибации (OpenRouter chat-completions + ffmpeg-конвертер).
+Этап 6: модуль описания медиа (GPT-4o для картинок/кадров, Gemini для документов).
 """
 from __future__ import annotations
 
@@ -27,6 +28,7 @@ from modules.auth.service import AuthService
 from modules.history.cleaner import Cleaner
 from modules.history.routes import router as history_router
 from modules.history.service import HistoryService
+from modules.media_description.service import DescriptionService
 from modules.transcription.service import TranscriptionService
 from modules.worker_manager.routes import router as workers_router
 from modules.worker_manager.service import WorkerManager
@@ -59,6 +61,11 @@ async def lifespan(app: FastAPI):
     transcription_task = asyncio.create_task(transcription_service.run())
     app.state.transcription_task = transcription_task
 
+    description_service = DescriptionService()
+    app.state.description_service = description_service
+    description_task = asyncio.create_task(description_service.run())
+    app.state.description_task = description_task
+
     app.state.auth_service = AuthService()
     app.state.worker_manager = WorkerManager()
 
@@ -75,6 +82,17 @@ async def lifespan(app: FastAPI):
             await app.state.auth_service.shutdown()
         except Exception:
             log.exception("auth_service shutdown error")
+
+        try:
+            await description_service.stop()
+        except Exception:
+            log.exception("description_service stop error")
+
+        description_task.cancel()
+        try:
+            await description_task
+        except asyncio.CancelledError:
+            pass
 
         try:
             await transcription_service.stop()
@@ -121,7 +139,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Telegram Automation Framework",
-    version="0.5.0",
+    version="0.6.0",
     docs_url="/docs" if settings.DOCS_PUBLIC else None,
     redoc_url="/redoc" if settings.DOCS_PUBLIC else None,
     openapi_url="/openapi.json" if settings.DOCS_PUBLIC else None,
