@@ -41,15 +41,16 @@ class OpenRouterError(Exception):
 async def transcribe_audio(
     audio_bytes: bytes,
     *,
-    audio_format: str = "mp3",
+    audio_format: str = "wav",
     model: str | None = None,
 ) -> str:
     """
     Отправить аудио-байты в OpenRouter и получить текстовую транскрипцию.
 
-    `audio_format` — значение для поля format в input_audio. На текущий
-    момент gpt-4o-audio-preview поддерживает только "wav" и "mp3", поэтому
-    во всех случаях вызывающий должен предварительно конвертнуть в mp3.
+    `audio_format` — значение для поля format в input_audio. gpt-4o-audio-preview
+    формально принимает "wav" и "mp3", но провайдер OpenAI на mp3 иногда
+    отвечает "not of valid mp3 format" (капризит к VBR/Xing-заголовкам),
+    поэтому по умолчанию гоним wav (PCM 16kHz mono из ffmpeg).
 
     Возвращает строку. Пустая строка — валидный результат (тишина/невнятно).
 

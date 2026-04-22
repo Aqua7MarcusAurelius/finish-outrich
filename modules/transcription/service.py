@@ -3,7 +3,7 @@
 
 Слушает шину через consumer group "transcription-worker":
   - message.saved             → для каждого media типа voice/audio/video/video_note
-                                скачиваем из MinIO, конвертим в mp3 через ffmpeg,
+                                скачиваем из MinIO, конвертим в wav через ffmpeg,
                                 отправляем в OpenRouter и публикуем transcription.done
   - media.reprocess.requested → то же самое, но media_id берём из payload и
                                 storage_key/type подтягиваем из БД
@@ -23,7 +23,7 @@ from core import minio as minio_mod
 from core.events import EventType, Module, Status
 from core.openrouter import OpenRouterError, transcribe_audio
 
-from .ffmpeg import FfmpegError, to_mp3
+from .ffmpeg import FfmpegError, NoAudioError, to_wav
 
 log = logging.getLogger(__name__)
 
@@ -235,9 +235,23 @@ class TranscriptionService:
             )
             return
 
-        # 3) конвертим в mp3 (ogg/opus, mp4, что угодно → mp3)
+        # 3) конвертим в wav (ogg/opus, mp4, что угодно → wav PCM 16kHz mono)
         try:
-            mp3 = await to_mp3(raw)
+            audio = await to_wav(raw)
+        except NoAudioError as e:
+            # Немое видео / тишина на аудиодорожке — не ошибка, а валидный
+            # пустой результат. Публикуем done с пустым текстом.
+            log.info("transcription: media=%s — no audio (%s)", media_id, e)
+            await self._publish_done(
+                account_id=account_id,
+                parent_id=started_id,
+                media_id=media_id,
+                text="",
+                status_str="done",
+                error=None,
+                event_status=Status.SUCCESS,
+            )
+            return
         except FfmpegError as e:
             log.warning("ffmpeg failed for media %s: %s", media_id, e)
             await self._publish_done(
@@ -253,7 +267,7 @@ class TranscriptionService:
 
         # 4) OpenRouter + ретраи
         retries = await _get_retries()
-        text, status_str, error = await self._call_with_retries(mp3, retries)
+        text, status_str, error = await self._call_with_retries(audio, retries)
 
         # 5) transcription.done
         await self._publish_done(
@@ -269,7 +283,7 @@ class TranscriptionService:
         )
 
     async def _call_with_retries(
-        self, mp3: bytes, retries: int,
+        self, audio: bytes, retries: int,
     ) -> tuple[str, str, str | None]:
         """
         Вызов OpenRouter с политикой из docs/transcription.md:
@@ -285,7 +299,7 @@ class TranscriptionService:
 
         for attempt in range(attempts):
             try:
-                text = await transcribe_audio(mp3)
+                text = await transcribe_audio(audio)
             except OpenRouterError as e:
                 last_error = str(e)
                 log.warning(
@@ -300,7 +314,7 @@ class TranscriptionService:
 
             # Пустой результат — одна повторная попытка.
             try:
-                retry_text = await transcribe_audio(mp3)
+                retry_text = await transcribe_audio(audio)
             except OpenRouterError as e:
                 log.warning("transcription: retry-on-empty OpenRouter error: %s", e)
                 # Первый ответ был валидным (пустым), ошибка на ретрае — фиксируем пустой done.
