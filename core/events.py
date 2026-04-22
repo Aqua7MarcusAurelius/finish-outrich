@@ -20,6 +20,8 @@ class Module:
     CLEANER = "cleaner"
     API = "api"
     SYSTEM = "system"
+    BUS = "bus"
+    AUTOCHAT = "autochat"
 
 
 class Status:
@@ -61,6 +63,20 @@ class EventType:
     SYNC_STARTED = "sync.started"
     SYNC_DIALOG_DONE = "sync.dialog.done"
     SYNC_DONE = "sync.done"
+
+    # ── AutoChat (автодиалоги через Opus 4.7) ────────────────────────
+    AUTOCHAT_STARTED = "autochat.started"
+    AUTOCHAT_INITIAL_SENT = "autochat.initial_sent"
+    AUTOCHAT_ENTERED_CHAT = "autochat.entered_chat"
+    AUTOCHAT_LEFT_CHAT = "autochat.left_chat"
+    AUTOCHAT_GENERATION_REQUESTED = "autochat.generation_requested"
+    AUTOCHAT_GENERATION_DONE = "autochat.generation_done"
+    AUTOCHAT_SEGMENT_SENT = "autochat.segment_sent"
+    AUTOCHAT_SESSION_STOPPED = "autochat.session_stopped"
+    AUTOCHAT_SESSION_ERROR = "autochat.session_error"
+
+    # Тайпинг собеседника — публикует враппер, слушает AutoChat
+    DIALOG_TYPING_OBSERVED = "dialog.typing_observed"
 
     # ── Системные ────────────────────────────────────────────────────
     SYSTEM_ERROR = "system.error"

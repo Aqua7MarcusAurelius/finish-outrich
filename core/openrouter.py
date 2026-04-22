@@ -192,6 +192,42 @@ async def describe_images(
     return await _post(payload)
 
 
+async def chat_completion(
+    messages: list[dict[str, Any]],
+    *,
+    model: str | None = None,
+    temperature: float = 0.7,
+    max_tokens: int | None = None,
+) -> str:
+    """
+    Универсальный chat-completion — для модуля AutoChat и любых будущих
+    задач "сырого" диалога с моделью (без аудио/картинок/файлов).
+
+    messages — список в формате OpenAI chat:
+        [{"role": "system", "content": "..."},
+         {"role": "user",   "content": "..."},
+         {"role": "assistant", "content": "..."}]
+
+    По умолчанию модель `settings.OPENROUTER_MODEL_AUTOCHAT`
+    (Opus 4.7 через OpenRouter). Возвращает строку ответа.
+    Пустая строка — валидный результат; ошибки — OpenRouterError.
+    """
+    if not messages:
+        raise OpenRouterError("chat_completion called with empty messages")
+
+    model_name = model or settings.OPENROUTER_MODEL_AUTOCHAT
+
+    payload: dict[str, Any] = {
+        "model": model_name,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+
+    return await _post(payload)
+
+
 async def describe_document(
     doc_bytes: bytes,
     *,

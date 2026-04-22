@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     OPENROUTER_MODEL_TRANSCRIPTION: str = "openai/whisper"
     OPENROUTER_MODEL_DESCRIPTION: str = "openai/gpt-4o"
     OPENROUTER_MODEL_DESCRIPTION_DOCUMENTS: str = "google/gemini-2.5-flash"
+    # Модель для автодиалогов (chat_completion). Точное имя уточнить в
+    # каталоге OpenRouter — на момент релиза Opus 4.7 ожидается как
+    # "anthropic/claude-opus-4.7" (или похожее). При несовпадении —
+    # поменять только в .env без правок кода.
+    OPENROUTER_MODEL_AUTOCHAT: str = "anthropic/claude-opus-4.7"
 
     # ── Вычисляемые свойства ─────────────────────────────────────────
 

@@ -78,6 +78,42 @@ _TEMPLATES: dict[str, Callable[[dict[str, Any]], str]] = {
         f"({d.get('messages_count', 0)} сообщений)"
     ),
     EventType.SYNC_DONE: lambda d: "нагон завершён",
+
+    # ── AutoChat ─────────────────────────────────────────────────────
+    EventType.AUTOCHAT_STARTED: lambda d: (
+        f"автодиалог #{d.get('session_id', '?')} с @{d.get('username', '?')} запущен"
+    ),
+    EventType.AUTOCHAT_INITIAL_SENT: lambda d: (
+        f"автодиалог #{d.get('session_id', '?')}: отправлено первое сообщение"
+    ),
+    EventType.AUTOCHAT_ENTERED_CHAT: lambda d: (
+        f"автодиалог #{d.get('session_id', '?')}: вошли в чат "
+        f"(задержка {d.get('delay_sec', '?')}с)"
+    ),
+    EventType.AUTOCHAT_LEFT_CHAT: lambda d: (
+        f"автодиалог #{d.get('session_id', '?')}: вышли из чата по idle"
+    ),
+    EventType.AUTOCHAT_GENERATION_REQUESTED: lambda d: (
+        f"автодиалог #{d.get('session_id', '?')}: запрос в Opus"
+    ),
+    EventType.AUTOCHAT_GENERATION_DONE: lambda d: (
+        f"автодиалог #{d.get('session_id', '?')}: получен ответ "
+        f"({d.get('segments_count', 0)} сегментов)"
+    ),
+    EventType.AUTOCHAT_SEGMENT_SENT: lambda d: (
+        f"автодиалог #{d.get('session_id', '?')}: отправлен сегмент "
+        f"{d.get('segment_index', '?')}/{d.get('segments_total', '?')}"
+    ),
+    EventType.AUTOCHAT_SESSION_STOPPED: lambda d: (
+        f"автодиалог #{d.get('session_id', '?')} остановлен"
+    ),
+    EventType.AUTOCHAT_SESSION_ERROR: lambda d: (
+        f"автодиалог #{d.get('session_id', '?')}: ошибка — "
+        f"{d.get('message', d.get('error', 'неизвестно'))}"
+    ),
+    EventType.DIALOG_TYPING_OBSERVED: lambda d: (
+        f"собеседник печатает (user={d.get('telegram_user_id', '?')})"
+    ),
 }
 
 
