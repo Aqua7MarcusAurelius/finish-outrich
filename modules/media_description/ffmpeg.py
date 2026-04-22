@@ -132,6 +132,9 @@ async def _grab_frame(path: str, at_seconds: float) -> bytes:
     хватает). `-frames:v 1` — ровно один кадр. `-q:v 3` — приличное
     качество JPEG при умеренном размере.
     """
+    # -pix_fmt yuvj420p — MJPEG требует full-range YUV; без этого на
+    # GIF/видео с yuv420p ffmpeg падает с
+    # "Non full-range YUV is non-standard" → ff_frame_thread_encoder_init failed.
     args = [
         "ffmpeg",
         "-hide_banner",
@@ -139,6 +142,7 @@ async def _grab_frame(path: str, at_seconds: float) -> bytes:
         "-ss", f"{at_seconds:.3f}",
         "-i", path,
         "-frames:v", "1",
+        "-pix_fmt", "yuvj420p",
         "-f", "image2",
         "-c:v", "mjpeg",
         "-q:v", "3",

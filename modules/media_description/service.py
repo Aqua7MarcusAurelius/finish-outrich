@@ -44,6 +44,10 @@ DESCRIBE_TYPES = STATIC_IMAGE_TYPES | FRAME_TYPES | DOCUMENT_TYPES
 DEFAULT_RETRIES = 1
 DEFAULT_FRAMES_COUNT = 5
 
+# TGS — анимированный Lottie-JSON в gzip. Не картинка, vision-модели
+# его не читают. Пропускаем как пустой `done`.
+TGS_MIME = "application/x-tgsticker"
+
 
 async def _get_int_setting(key: str, default: int) -> int:
     pool = db.get_pool()
@@ -232,6 +236,21 @@ class DescriptionService:
                 status_str="failed",
                 error="file_not_available",
                 event_status=Status.ERROR,
+            )
+            return
+
+        # TGS-стикер (анимированный Lottie) — не картинка, описывать нечем.
+        # Валидный пустой результат, без скачивания.
+        if media_type == "sticker" and mime_type == TGS_MIME:
+            log.info("description: media %s is TGS sticker — skipping", media_id)
+            await self._publish_done(
+                account_id=account_id,
+                parent_id=parent_id,
+                media_id=media_id,
+                text="",
+                status_str="done",
+                error=None,
+                event_status=Status.SUCCESS,
             )
             return
 
