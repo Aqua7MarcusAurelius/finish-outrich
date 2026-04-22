@@ -46,6 +46,7 @@
 | Медиа | `/media` | Файлы, транскрипты, описания |
 | События | `/events` | Бегущий лог, фильтры, экспорт |
 | Поиск | `/search` | Глобальный поиск по сообщениям |
+| AutoChat | `/autochat` | Автодиалоги через Opus 4.7 |
 | Система | `/system` | Health, stats, proxy-check, dashboard |
 
 ---
@@ -590,6 +591,49 @@ Query:
 
 ---
 
+## AutoChat
+
+Модуль автодиалогов. Инициирует переписку с `@username` через выбранный воркер, ведёт её по заданному промту с имитацией живого поведения. Подробно — в `autochat.md`.
+
+| Метод | Путь | Что делает |
+|---|---|---|
+| POST | `/autochat/start` | Создать и запустить сессию |
+| GET | `/autochat/sessions` | Список сессий (фильтры `account_id`, `status`) |
+| GET | `/autochat/sessions/{id}` | Одна сессия |
+| POST | `/autochat/sessions/{id}/stop` | Остановить (идемпотентно) |
+
+**POST /autochat/start**
+
+Request:
+```
+{
+  "account_id": 1,
+  "username": "durov",
+  "system_prompt": "Ты энтузиаст крипто-стартапов, пишешь коротко, ...",
+  "initial_prompt": "Напиши дружелюбное первое сообщение на тему ..."
+}
+```
+
+Синхронная цепочка: резолв username через враппер → генерация первого сообщения в Opus 4.7 → отправка → INSERT в `autochat_sessions` → запуск per-session таска → возврат сессии клиенту.
+
+Ответы:
+```
+200 { "session": { id, account_id, dialog_id, telegram_user_id, ..., initial_sent_text } }
+409 WORKER_NOT_RUNNING
+409 SESSION_ALREADY_ACTIVE
+409 CANNOT_WRITE
+404 USERNAME_NOT_FOUND
+400 USERNAME_UNAVAILABLE
+```
+
+**GET /autochat/sessions** — список. Query: `account_id`, `status`, `limit`, `cursor`.
+
+**GET /autochat/sessions/{id}** — полный объект сессии.
+
+**POST /autochat/sessions/{id}/stop** — `status=stopped`, отмена per-session таска (текущая отправка сегментов допечатывается). Публикует `autochat.session_stopped`. Идемпотентно.
+
+---
+
 ## Система
 
 | Метод | Путь | Что делает |
@@ -902,12 +946,16 @@ HTTP-коды:
 | События | GET | `/events/{id}` |
 | События | GET | `/events/export` |
 | Поиск | GET | `/search` |
+| AutoChat | POST | `/autochat/start` |
+| AutoChat | GET | `/autochat/sessions` |
+| AutoChat | GET | `/autochat/sessions/{id}` |
+| AutoChat | POST | `/autochat/sessions/{id}/stop` |
 | Система | GET | `/system/health` |
 | Система | GET | `/system/stats` |
 | Система | POST | `/system/proxy-check` |
 | Система | GET | `/dashboard` |
 
-Всего: **33 endpoint'а**. Из них 3 SSE-стрима.
+Всего: **37 endpoint'ов**. Из них 3 SSE-стрима.
 
 ---
 

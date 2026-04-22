@@ -54,6 +54,7 @@ MINIO_BUCKET=tgframework
 OPENROUTER_API_KEY=
 OPENROUTER_MODEL_TRANSCRIPTION=openai/whisper
 OPENROUTER_MODEL_DESCRIPTION=openai/gpt-4o
+OPENROUTER_MODEL_AUTOCHAT=anthropic/claude-opus-4-7     # уточнить точное имя в каталоге OpenRouter
 ```
 
 ---
@@ -73,6 +74,13 @@ OPENROUTER_MODEL_DESCRIPTION=openai/gpt-4o
 | `description.retries` | `1` | Сколько повторных попыток при ошибке OpenRouter |
 | `description.frames_count` | `5` | Сколько кадров нарезает FFmpeg из видео / GIF / кружков |
 | `history_sync.chunk_size` | `100` | Сколько сообщений запрашивает нагон за один раз |
+| `autochat.enter_delay_short_sec` | `15` | Задержка входа в чат при возрасте последнего сообщения 0–5 мин |
+| `autochat.enter_delay_mid_sec` | `60` | То же для 5–10 мин |
+| `autochat.enter_delay_long_sec` | `120` | То же для ≥10 мин |
+| `autochat.idle_leave_sec` | `180` | Через сколько тишины в чате уходим в `InChat=0` (3 мин) |
+| `autochat.reply_timer_sec` | `30` | Базовый reply-таймер перед запросом в LLM |
+| `autochat.openrouter_retries` | `2` | Ретраи при ошибке OpenRouter в автодиалогах |
+| `autochat.typing_ms_per_char` | `40` | Имитация печати — миллисекунд на символ |
 
 ---
 

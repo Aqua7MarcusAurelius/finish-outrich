@@ -140,6 +140,24 @@ data: {
 ### `media.reprocess.requested` — запрос на повторную обработку медиа
 Публикуется API при вызове `/media/{id}/retranscribe` или `/media/{id}/redescribe`.
 
+### `dialog.typing_observed` — собеседник печатает
+Публикует враппер, получив `UpdateUserTyping` от Telegram. Payload: `{ telegram_user_id, at }`. Слушает модуль AutoChat — использует для перезапуска reply-таймера в активной сессии. Остальные модули игнорируют.
+
+### `autochat.started` / `autochat.initial_sent` — инициация автосессии
+Публикует модуль AutoChat. `started` — сессия создана (запись в `autochat_sessions`). `initial_sent` — первое сообщение ушло через враппер.
+
+### `autochat.entered_chat` / `autochat.left_chat` — смена InChat
+Публикует AutoChat при переходах `InChat=0 → 1` (после enter-таймера 15/60/120с) и обратно (по idle 3 минуты).
+
+### `autochat.generation_requested` / `autochat.generation_done` — обращения к Opus 4.7
+`generation_requested` — ушёл запрос в OpenRouter с собранным контекстом. `generation_done` — получен ответ, распарсены `<msg>`-сегменты.
+
+### `autochat.segment_sent` — сегмент ответа отправлен
+Публикует AutoChat после каждого успешно отправленного сегмента через враппер.
+
+### `autochat.session_stopped` / `autochat.session_error` — финал сессии
+`stopped` — штатная остановка через API. `session_error` — фатальная ошибка (нас заблокировали, нельзя писать, критический сбой); сессия переводится в `status=failed`.
+
 ### `system.error` — системная ошибка
 Публикует любой модуль при технической ошибке не связанной с конкретным сообщением. Поле `account` может быть null если ошибка общесистемная.
 

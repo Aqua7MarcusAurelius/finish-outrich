@@ -17,6 +17,7 @@
 | `message_edits` | Предыдущие версии текста отредактированных сообщений | История |
 | `settings` | Настройки поведения модулей (меняются без перезапуска) | API |
 | `events_archive` | Архив всех событий шины для фильтрации и экспорта | API |
+| `autochat_sessions` | Инициированные нами автодиалоги через Opus 4.7 | AutoChat |
 
 Принцип: **в каждую таблицу пишет только один модуль — тот что ей владеет.** Остальные модули либо читают, либо получают данные через шину.
 
@@ -37,8 +38,9 @@ messages
     │   ├──▶ reactions       ← реакции
     │   └──▶ message_edits   ← предыдущие версии текста
 
-settings         ← независимая, без связей
-events_archive   ← независимая, без связей
+settings           ← независимая, без связей
+events_archive     ← независимая, без связей
+autochat_sessions  ← account_id → accounts, dialog_id → dialogs
 ```
 
 ---
@@ -216,6 +218,33 @@ events_archive   ← независимая, без связей
 | Только ошибки | `(status, time DESC)` где `status='error'` |
 
 Поле `message` (готовая фраза для отображения в UI) здесь **не хранится** — вычисляется в API при отдаче из справочника шаблонов. Это позволяет менять формулировки без миграций.
+
+---
+
+## Таблица `autochat_sessions` — автодиалоги
+
+Инициированные нами переписки через модуль AutoChat. Одна строка = одна сессия (один воркер ↔ один собеседник). Подробнее — в `autochat.md`.
+
+| Поле | Тип | Что тут лежит |
+|---|---|---|
+| `id` | int | PK |
+| `account_id` | int | FK → accounts (воркер, от которого пишем) |
+| `dialog_id` | int | FK → dialogs (nullable — до первого `message.saved` может отсутствовать) |
+| `telegram_user_id` | bigint | целевой tg id (кэш после `resolve_username`) |
+| `target_username` | string | @username как был задан в запросе |
+| `system_prompt` | text | системный промт (персонаж, правила сегментации) |
+| `initial_prompt` | text | промт для генерации первого сообщения |
+| `initial_sent_text` | text | что реально отправили первым |
+| `status` | string | `starting` / `active` / `paused` / `failed` / `stopped` |
+| `in_chat` | bool | текущее состояние InChat (дубликат для восстановления при рестарте) |
+| `last_our_activity_at` | timestamp | время последнего нашего сообщения |
+| `last_their_message_at` | timestamp | время последнего сообщения собеседника |
+| `last_any_message_at` | timestamp | max двух выше — для расчёта enter-timer |
+| `last_error` | text | последняя ошибка (nullable) |
+| `created_at` | timestamp | |
+| `updated_at` | timestamp | |
+
+**Уникальность:** partial unique index по `(account_id, telegram_user_id)` при `status IN ('active','paused')` — не даём завести две активные сессии на одну и ту же пару.
 
 ---
 

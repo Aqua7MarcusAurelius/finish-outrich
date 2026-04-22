@@ -60,13 +60,14 @@
 
 ### 4. Модули — подробности по каждому
 Все модули в папке `modules/`:
-- `modules/wrapper.md` — враппер Telegram (единственная точка общения)
-- `modules/auth.md` — авторизация и переавторизация аккаунтов
-- `modules/worker_manager.md` — запуск/остановка/удаление воркеров
-- `modules/history.md` — запись истории и чистильщик
-- `modules/history_sync.md` — нагон истории при старте воркера
-- `modules/transcription.md` — аудио → текст
-- `modules/media_description.md` — визуальный контент → текст
+- `wrapper.md` — враппер Telegram (единственная точка общения)
+- `auth.md` — авторизация и переавторизация аккаунтов
+- `worker_manager.md` — запуск/остановка/удаление воркеров
+- `history.md` — запись истории и чистильщик
+- `history_sync.md` — нагон истории при старте воркера
+- `transcription.md` — аудио → текст
+- `media_description.md` — визуальный контент → текст
+- `autochat.md` — автодиалоги через Opus 4.7 (инициированные переписки с имитацией живого поведения)
 
 ### 5. История изменений
 - `CHANGELOG.md` — как эволюционировала документация по версиям
@@ -197,13 +198,13 @@ docs/
 ├── project_structure.md
 ├── docker.md
 ├── configuration.md
-├── modules/
-│   ├── wrapper.md
-│   ├── auth.md
-│   ├── worker_manager.md
-│   ├── history.md
-│   ├── history_sync.md
-│   ├── transcription.md
-│   └── media_description.md
+├── wrapper.md
+├── auth.md
+├── worker_manager.md
+├── history.md
+├── history_sync.md
+├── transcription.md
+├── media_description.md
+├── autochat.md
 └── CHANGELOG.md
 ```

@@ -47,8 +47,15 @@ tg-framework/
 │   ├── transcription/           ← транскрибация аудио в текст
 │   │   └── service.py           ← логика транскрибации через OpenRouter
 │   │
-│   └── media_description/       ← описание медиа через GPT-4o
-│       └── service.py           ← логика описания + нарезка кадров FFmpeg
+│   ├── media_description/       ← описание медиа через GPT-4o
+│   │   └── service.py           ← логика описания + нарезка кадров FFmpeg
+│   │
+│   └── autochat/                ← автодиалоги через Opus 4.7
+│       ├── service.py           ← consumer шины + роутер событий по сессиям
+│       ├── session.py           ← AutoChatSession: state-loop + planner + sender
+│       ├── generation.py        ← сборка контекста, сегментация ответа
+│       ├── routes.py            ← API endpoints /autochat/*
+│       └── errors.py            ← иерархия AutoChatError
 │
 ├── api/
 │   ├── main.py                  ← точка входа FastAPI, регистрация роутеров
@@ -88,6 +95,7 @@ tg-framework/
 | Нагон истории | `modules/history_sync/service.py` |
 | Транскрибация | `modules/transcription/service.py` |
 | Описание медиа / FFmpeg | `modules/media_description/service.py` |
+| Автодиалоги (AutoChat) | `modules/autochat/` |
 | SSE потоки для дашборда | `api/sse.py` |
 | Подключение к базе | `core/db.py` |
 | Шина событий | `core/bus.py` |
