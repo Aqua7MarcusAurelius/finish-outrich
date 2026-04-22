@@ -26,6 +26,8 @@ from core import redis as redis_mod
 from core.config import settings
 from modules.auth.routes import router as auth_router
 from modules.auth.service import AuthService
+from modules.autochat.routes import router as autochat_router
+from modules.autochat.service import AutoChatService
 from modules.history.cleaner import Cleaner
 from modules.history.routes import router as history_router
 from modules.history.service import HistoryService
@@ -70,10 +72,33 @@ async def lifespan(app: FastAPI):
     app.state.auth_service = AuthService()
     app.state.worker_manager = WorkerManager()
 
+    # AutoChat: обращается к wrapper через worker_manager.get_wrapper.
+    # Создаётся после WorkerManager, останавливается раньше него
+    # (чтобы sender-loop успел закончить отправку до разрыва TG-сессий).
+    autochat_service = AutoChatService(
+        get_wrapper=app.state.worker_manager.get_wrapper,
+    )
+    app.state.autochat_service = autochat_service
+    autochat_task = asyncio.create_task(autochat_service.run())
+    app.state.autochat_task = autochat_task
+
     try:
         yield
     finally:
         # ── Shutdown ───────────────────────────────────────────────
+        # AutoChat — первым: дадим активным сессиям дописать сегменты
+        # до того как закроем Telegram-сессии.
+        try:
+            await autochat_service.stop()
+        except Exception:
+            log.exception("autochat_service stop error")
+
+        autochat_task.cancel()
+        try:
+            await autochat_task
+        except asyncio.CancelledError:
+            pass
+
         try:
             await app.state.worker_manager.shutdown()
         except Exception:
@@ -140,7 +165,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Telegram Automation Framework",
-    version="0.6.0",
+    version="0.7.0",
     docs_url="/docs" if settings.DOCS_PUBLIC else None,
     redoc_url="/redoc" if settings.DOCS_PUBLIC else None,
     openapi_url="/openapi.json" if settings.DOCS_PUBLIC else None,
@@ -161,3 +186,4 @@ app.include_router(auth_router)
 app.include_router(workers_router)
 app.include_router(history_router)
 app.include_router(media_router)
+app.include_router(autochat_router)

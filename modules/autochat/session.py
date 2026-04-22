@@ -26,7 +26,6 @@ from typing import Any, Callable
 from core import bus, db
 from core.events import EventType, Module, Status
 from core.openrouter import OpenRouterError, chat_completion
-from core.config import settings as app_settings
 
 from .errors import SessionExpired as AutoSessionExpired
 from .generation import (
