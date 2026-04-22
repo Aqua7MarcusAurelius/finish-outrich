@@ -120,6 +120,10 @@ class Worker:
             self._on_new_message, incoming=True, outgoing=True,
         )
 
+        # Тайпинг собеседника → dialog.typing_observed (для модуля AutoChat).
+        # Для воркеров без активных автосессий событие просто архивируется.
+        self.wrapper.enable_typing_observer()
+
         await bus.publish(
             module=Module.WORKER,
             type=EventType.WORKER_STARTED,

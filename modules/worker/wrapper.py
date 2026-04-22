@@ -27,8 +27,11 @@ from telethon.errors import (
     SessionRevokedError,
     UserDeactivatedBanError,
     UserDeactivatedError,
+    UsernameInvalidError,
+    UsernameNotOccupiedError,
 )
 from telethon.sessions import StringSession
+from telethon.tl.functions.messages import SetTypingRequest
 from telethon.tl.types import (
     DocumentAttributeAnimated,
     DocumentAttributeAudio,
@@ -38,6 +41,9 @@ from telethon.tl.types import (
     DocumentAttributeVideo,
     MessageMediaDocument,
     MessageMediaPhoto,
+    SendMessageCancelAction,
+    SendMessageTypingAction,
+    User,
 )
 
 from core import bus
@@ -75,6 +81,14 @@ class ProxyUnavailable(WrapperError):
 
 class NotConnected(WrapperError):
     """Команда вызвана до connect()."""
+
+
+class UsernameNotFound(WrapperError):
+    """@username не существует / не занят."""
+
+
+class UsernameUnavailable(WrapperError):
+    """@username не резолвится (privacy, это не user-тип, и т.п.)."""
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -485,6 +499,86 @@ class TelegramWrapper:
             )
         return bool(await self._guard(_do))
 
+    async def resolve_username(self, username: str) -> dict[str, Any]:
+        """
+        Резолв @username → снимок профиля User entity.
+
+        Используется модулем AutoChat при старте автосессии. Telethon
+        внутри делает ResolveUsernameRequest + кэширует entity, так что
+        дальше send_message(user_id) работает без лишних запросов.
+
+        Бросает:
+          - UsernameNotFound — такого username нет.
+          - UsernameUnavailable — резолвится, но не в User (канал/бот-клиент и т.п.).
+          - SessionExpired — сессия протухла.
+        """
+        cleaned = (username or "").strip().lstrip("@")
+        if not cleaned:
+            raise UsernameUnavailable("пустой username")
+
+        async def _do():
+            return await self.client.get_entity(cleaned)
+
+        try:
+            entity = await self._guard(_do)
+        except SessionExpired:
+            raise
+        except (UsernameNotOccupiedError, UsernameInvalidError) as e:
+            raise UsernameNotFound(str(e)) from e
+        except ValueError as e:
+            # get_entity кидает ValueError при "Cannot find any entity…"
+            raise UsernameNotFound(str(e)) from e
+        except Exception as e:
+            raise UsernameUnavailable(f"resolve failed: {e}") from e
+
+        if not isinstance(entity, User):
+            raise UsernameUnavailable(
+                f"@{cleaned} — не пользовательский аккаунт"
+            )
+
+        profile = extract_user_profile(entity)
+        if profile is None or profile.get("telegram_user_id") is None:
+            raise UsernameUnavailable(f"@{cleaned} — не удалось снять профиль")
+        return profile
+
+    async def set_typing(self, user_id: int) -> None:
+        """
+        Включить индикатор "печатает" в private-диалоге с user_id.
+
+        Telegram автоматически гасит индикатор ~через 6 сек, если не
+        продлевать. Для длинной печати — дёргать повторно каждые ~4 сек
+        (за это отвечает caller, модуль AutoChat).
+        """
+        async def _do():
+            return await self.client(SetTypingRequest(
+                peer=user_id,
+                action=SendMessageTypingAction(),
+            ))
+        await self._guard(_do)
+
+    async def cancel_typing(self, user_id: int) -> None:
+        """
+        Снять индикатор "печатает" немедленно.
+
+        Нужно перед send_message, чтобы Telegram не показывал "печатает"
+        во время реальной отправки (визуальный артефакт на 0.5 сек).
+        """
+        async def _do():
+            return await self.client(SetTypingRequest(
+                peer=user_id,
+                action=SendMessageCancelAction(),
+            ))
+        try:
+            await self._guard(_do)
+        except SessionExpired:
+            raise
+        except Exception:
+            # Отмена typing — best-effort. Сбой не валит отправку.
+            log.debug(
+                "wrapper account=%s: cancel_typing failed (non-fatal)",
+                self.account_id,
+            )
+
     async def get_dialogs(self, limit: int | None = None) -> list[dict[str, Any]]:
         if self._client is None:
             raise NotConnected("Сначала вызвать connect()")
@@ -604,6 +698,55 @@ class TelegramWrapper:
             handler,
             events.NewMessage(incoming=incoming, outgoing=outgoing),
         )
+
+    def enable_typing_observer(self) -> None:
+        """
+        Активировать публикацию dialog.typing_observed на шину при
+        тайпинге собеседника в любом private-диалоге этого воркера.
+
+        Слушает модуль AutoChat для перезапуска reply-таймера.
+        Вызывается воркером один раз после connect().
+        """
+        if self._client is None:
+            raise NotConnected("Сначала вызвать connect()")
+        self._client.add_event_handler(
+            self._on_user_update,
+            events.UserUpdate(),
+        )
+
+    async def _on_user_update(self, event: Any) -> None:
+        """
+        Handler events.UserUpdate — публикует dialog.typing_observed
+        только для случая "собеседник печатает".
+
+        Другие типы user-update (uploading/recording/playing/…) игнорируем:
+        модуль AutoChat реагирует только на "печатает".
+        """
+        try:
+            # events.UserUpdate предоставляет .typing — True если
+            # action=SendMessageTypingAction. Отфильтровываем всё остальное.
+            if not getattr(event, "typing", False):
+                return
+            user_id = getattr(event, "user_id", None)
+            if user_id is None:
+                return
+            await bus.publish(
+                module=Module.WRAPPER,
+                type=EventType.DIALOG_TYPING_OBSERVED,
+                status=Status.SUCCESS,
+                account_id=self.account_id,
+                data={
+                    "telegram_user_id": int(user_id),
+                    "at": bus.now_utc().isoformat(),
+                },
+            )
+        except Exception:
+            # Тайпинг-события публикуются часто и не критичны — глушим,
+            # чтобы handler не вывалил Telethon dispatch loop.
+            log.debug(
+                "wrapper account=%s: typing observer failed",
+                self.account_id,
+            )
 
     # ─── Внутренности ──────────────────────────────────────────────
 
