@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     OPENROUTER_API_KEY: str = ""
     OPENROUTER_MODEL_TRANSCRIPTION: str = "openai/whisper"
     OPENROUTER_MODEL_DESCRIPTION: str = "openai/gpt-4o"
+    OPENROUTER_MODEL_DESCRIPTION_DOCUMENTS: str = "google/gemini-2.5-flash"
 
     # ── Вычисляемые свойства ─────────────────────────────────────────
 
