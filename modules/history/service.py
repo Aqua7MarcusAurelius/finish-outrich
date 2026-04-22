@@ -97,16 +97,23 @@ class HistoryService:
                     try:
                         await self._handle(event)
                         ack_ids.append(stream_id)
+                        await bus.record_success(HISTORY_GROUP, stream_id)
                     except asyncio.CancelledError:
                         raise
-                    except Exception:
+                    except Exception as e:
                         log.exception(
                             "history: failed to handle event %s (type=%s)",
                             event.get("id"), event.get("type"),
                         )
-                        # Не ack'аем — переобработка в следующем прогоне.
-                        # Для message.received защита от задваивания обеспечена
-                        # уникальным индексом (dialog_id, telegram_message_id).
+                        # Dead-letter: после порога ретраев принудительно
+                        # ack'аем, чтобы очередь не стопорилась на poison.
+                        # Для message.received задваивание отсекает
+                        # уникальный индекс (dialog_id, telegram_message_id).
+                        force_ack = await bus.record_failure(
+                            HISTORY_GROUP, stream_id, event, e,
+                        )
+                        if force_ack:
+                            ack_ids.append(stream_id)
 
                 if ack_ids:
                     await bus.ack_group(HISTORY_GROUP, ack_ids)

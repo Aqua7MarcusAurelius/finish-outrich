@@ -76,14 +76,19 @@ class TranscriptionService:
                     try:
                         await self._handle(event)
                         ack_ids.append(stream_id)
+                        await bus.record_success(TRANSCRIPTION_GROUP, stream_id)
                     except asyncio.CancelledError:
                         raise
-                    except Exception:
+                    except Exception as e:
                         log.exception(
                             "transcription: failed to handle event %s (type=%s)",
                             event.get("id"), event.get("type"),
                         )
-                        # Не ack'аем — переобработка в следующем прогоне.
+                        force_ack = await bus.record_failure(
+                            TRANSCRIPTION_GROUP, stream_id, event, e,
+                        )
+                        if force_ack:
+                            ack_ids.append(stream_id)
 
                 if ack_ids:
                     await bus.ack_group(TRANSCRIPTION_GROUP, ack_ids)

@@ -180,6 +180,89 @@ async def ack_group(group: str, stream_ids: list[str]) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Dead-letter: защита от poison-message
+# ─────────────────────────────────────────────────────────────────────
+#
+# Если обработка события падает постоянно (битый payload, баг в коде),
+# оно не ack'ается и копится в pending-list consumer group. Со временем
+# это блокирует перечитывание pending при рестарте и маскирует баги.
+#
+# Схема: на каждую неудачу инкрементим счётчик в Redis; при достижении
+# порога DEAD_LETTER_MAX_RETRIES — публикуем system.error и принудительно
+# ack'аем, чтобы очередь двигалась дальше.
+
+DEAD_LETTER_MAX_RETRIES = 5
+_RETRY_KEY_TTL = 86400  # секунд; истекает, если поток замер и событие ушло
+
+
+def _retry_key(group: str, stream_id: str) -> str:
+    return f"bus:retries:{group}:{stream_id}"
+
+
+async def record_failure(
+    group: str,
+    stream_id: str,
+    event: dict,
+    error: BaseException,
+) -> bool:
+    """
+    Записать неудачу обработки события consumer-группой.
+
+    Возвращает True, если порог ретраев превышен и событие нужно
+    принудительно ack'нуть (дальше блокировать нельзя — публикуем
+    system.error и двигаемся дальше). False — обычная неудача,
+    пусть повторится при следующем приходе.
+    """
+    client = get_client()
+    key = _retry_key(group, stream_id)
+    count = await client.incr(key)
+    await client.expire(key, _RETRY_KEY_TTL)
+
+    if count < DEAD_LETTER_MAX_RETRIES:
+        return False
+
+    log.error(
+        "bus: poison message %s in group=%s after %d retries: %s",
+        stream_id, group, count, error,
+    )
+    try:
+        await publish(
+            module="bus",
+            type="system.error",
+            status="error",
+            data={
+                "message": "poison_message",
+                "group": group,
+                "stream_id": stream_id,
+                "event_id": event.get("id"),
+                "event_type": event.get("type"),
+                "retries": count,
+                "error": str(error)[:500],
+            },
+        )
+    except Exception:
+        # Если даже publish упал — хуже только хуже; логируем и ack'аем.
+        log.exception("bus: failed to publish poison_message system.error")
+
+    try:
+        await client.delete(key)
+    except Exception:
+        log.exception("bus: failed to delete retry key %s", key)
+
+    return True
+
+
+async def record_success(group: str, stream_id: str) -> None:
+    """Сбросить счётчик ретраев после успешной обработки."""
+    client = get_client()
+    try:
+        await client.delete(_retry_key(group, stream_id))
+    except Exception:
+        # Не критично — счётчик сам истечёт по TTL.
+        log.debug("bus: retry key cleanup failed for %s/%s", group, stream_id)
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Чтение — для живых SSE-подписчиков (без consumer group)
 # ─────────────────────────────────────────────────────────────────────
 
@@ -263,9 +346,14 @@ async def archive_writer_loop() -> None:
                             json.dumps(event.get("data") or {}, ensure_ascii=False, default=str),
                         )
                         ack_ids.append(stream_id)
-                    except Exception:
+                        await record_success(ARCHIVE_GROUP, stream_id)
+                    except Exception as e:
                         log.exception("Failed to archive event %s", event.get("id"))
-                        # Не ack'аем — попробуем в следующий проход
+                        force_ack = await record_failure(
+                            ARCHIVE_GROUP, stream_id, event, e,
+                        )
+                        if force_ack:
+                            ack_ids.append(stream_id)
 
             if ack_ids:
                 await ack_group(ARCHIVE_GROUP, ack_ids)

@@ -53,6 +53,23 @@
 [049] account_2 | wrapper   | system.error | error | сессия протухла, требуется переавторизация
 ```
 
+### Poison messages и dead-letter
+
+Consumer-группа (`history`, `transcription`, `description`, `archive-writer`) подтверждает событие через `XACK` только после успешной обработки. Если обработчик упал — событие не ack'ается и прочитается заново в следующем проходе. Это защищает от потери событий при временных сбоях (БД подвисла, OpenRouter ответил 500).
+
+Но если событие падает **всегда** (битый payload, баг в обработчике), оно копилось бы в pending-list бесконечно. Чтобы очередь не зависала, действует dead-letter:
+
+1. На каждую неудачу обработки конкретного события инкрементится счётчик в Redis (ключ `bus:retries:{group}:{stream_id}`, TTL 24 часа).
+2. При достижении `DEAD_LETTER_MAX_RETRIES = 5` — публикуется `system.error` с типом `poison_message`, событие принудительно ack'ается, счётчик удаляется.
+3. При успешной обработке — счётчик сбрасывается.
+
+Пример:
+```
+[150] —  | bus | system.error | error | poison_message group=transcription-worker event_id=... retries=5
+```
+
+Это видно в общем логе и в `events_archive` — разбираться с конкретным кейсом можно по `event_id` из payload.
+
 ---
 
 ## Ключевые события с payload
