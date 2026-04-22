@@ -36,7 +36,11 @@ def _err(e: AutoChatError) -> JSONResponse:
 class StartIn(BaseModel):
     account_id: int
     username: str = Field(min_length=1, max_length=64)
-    system_prompt: str = Field(min_length=1, max_length=20000)
+    # Может быть пустым — если персонаж уже описан в
+    # prompts/autochat_*_system.md. В этом случае поле используется
+    # как "заметка оператора под сессию" и просто подставляется
+    # в плейсхолдер {user_system_prompt}.
+    system_prompt: str = Field(default="", max_length=20000)
     initial_prompt: str = Field(min_length=1, max_length=10000)
 
 
