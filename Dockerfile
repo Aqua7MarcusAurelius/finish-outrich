@@ -19,5 +19,6 @@ COPY . .
 EXPOSE 8000
 
 # Старт: сначала миграции, потом приложение.
-# --reload удобен при разработке (код монтируется volume-ом), для prod убрать.
-CMD ["sh", "-c", "alembic upgrade head && uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload"]
+# Для dev с hot-reload запускать uvicorn локально вне Docker,
+# либо использовать docker-compose.dev.yml с override команды.
+CMD ["sh", "-c", "alembic upgrade head && uvicorn api.main:app --host 0.0.0.0 --port 8000"]
