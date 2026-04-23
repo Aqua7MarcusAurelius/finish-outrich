@@ -78,6 +78,7 @@ class AutoChatService:
 
     async def run(self) -> None:
         await bus.ensure_group(AUTOCHAT_GROUP)
+        await self._restore_active_sessions()
         log.info("AutoChatService loop started")
 
         while not self._stop_event.is_set():
@@ -117,6 +118,46 @@ class AutoChatService:
             except Exception:
                 log.exception("AutoChatService loop error")
                 await asyncio.sleep(1)
+
+    async def _restore_active_sessions(self) -> None:
+        """
+        Поднять из БД все сессии со status='active' после рестарта приложения.
+
+        Всегда форсим in_chat=False — состояние enter/idle таймеров не
+        переживает рестарт, следующий inbound нормально запустит enter-timer
+        (см. docs/autochat.md → «Восстановление при рестарте»).
+
+        Воркер аккаунта может быть ещё не запущен — это ок, сессия будет
+        ждать события. Когда пользователь сделает POST /workers/{id}/start
+        и придёт первое message.saved — state machine оживёт.
+        """
+        pool = db.get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM autochat_sessions WHERE status = 'active'",
+            )
+        if not rows:
+            return
+
+        restored = 0
+        for row in rows:
+            data = dict(row)
+            data["in_chat"] = False  # форсим сброс на рестарте
+            try:
+                session = AutoChatSession(row=data, get_wrapper=self._get_wrapper)
+                async with self._lock:
+                    self._sessions_by_id[session.id] = session
+                    self._by_tg_user[(session.account_id, session.telegram_user_id)] = session.id
+                    if session.dialog_id is not None:
+                        self._by_dialog[(session.account_id, session.dialog_id)] = session.id
+                await session.start()
+                restored += 1
+            except Exception:
+                log.exception(
+                    "autochat: failed to restore session %s", row["id"],
+                )
+        if restored:
+            log.info("autochat: restored %d active session(s)", restored)
 
     async def stop(self) -> None:
         """Остановить consumer и все активные сессии."""

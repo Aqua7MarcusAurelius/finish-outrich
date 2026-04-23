@@ -301,7 +301,13 @@ async def build_conversation_context(
     ]
     for t in turns:
         role = "assistant" if t["is_outgoing"] else "user"
-        out.append({"role": role, "content": t["body"]})
+        when = t["date"]
+        if isinstance(when, datetime):
+            stamp = when.strftime("%Y-%m-%d %H:%M")
+            content = f"[{stamp}] {t['body']}"
+        else:
+            content = t["body"]
+        out.append({"role": role, "content": content})
     if not turns:
         # Диалога ещё нет — пусть LLM что-то скажет.
         out.append({"role": "user", "content": "Поздоровайся или продолжи разговор."})

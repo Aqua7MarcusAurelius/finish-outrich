@@ -282,7 +282,11 @@ class AutoChatSession:
                     self._enter_after(delay), name=f"autochat_enter_{self.id}",
                 )
         else:
-            # InChat=1: тригерим planner. Параллельно ресетим idle-timer.
+            # InChat=1: живой человек в открытом чате сразу видит сообщение.
+            # Помечаем весь диалог прочитанным (read_message без message_id
+            # делает ReadHistoryRequest до последнего).
+            await self._mark_dialog_read_safe()
+            # Тригерим planner + ресетим idle.
             self._bump_planner()
             self._reset_idle()
             # Если у inbound есть pending media — медиа-готовность ещё не
