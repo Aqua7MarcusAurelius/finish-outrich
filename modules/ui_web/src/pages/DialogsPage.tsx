@@ -96,22 +96,27 @@ export function DialogsPage() {
         </aside>
 
         <section className="flex min-w-0 flex-1 flex-col">
-          <header className="flex items-center gap-3 border-b border-border p-2">
-            {dialogQ.data ? (
-              <>
-                <div className="text-sm font-semibold">
-                  {dialogQ.data.first_name || ""} {dialogQ.data.last_name || ""}
-                </div>
-                <div className="mono text-xs text-muted-foreground">
-                  {dialogQ.data.username ? `@${dialogQ.data.username}` : "—"} · {dialogQ.data.phone ?? "—"} · dialog #{dialogQ.data.id}
-                </div>
-              </>
-            ) : (
-              <div className="text-xs text-muted-foreground">выберите диалог</div>
-            )}
+          <header className="border-b border-border">
+            <div className="mx-auto flex max-w-[780px] items-center gap-3 p-2">
+              {dialogQ.data ? (
+                <>
+                  <div className="text-sm font-semibold">
+                    {dialogQ.data.first_name || ""} {dialogQ.data.last_name || ""}
+                  </div>
+                  <div className="mono text-xs text-muted-foreground">
+                    {dialogQ.data.username ? `@${dialogQ.data.username}` : "—"} · {dialogQ.data.phone ?? "—"} · dialog #{dialogQ.data.id}
+                  </div>
+                </>
+              ) : (
+                <div className="text-xs text-muted-foreground">выберите диалог</div>
+              )}
+            </div>
           </header>
+          {/* Лента шириной 780px по центру — как Telegram Desktop. Пустые
+             поля слева/справа свободны под будущие виджеты (профиль
+             собеседника, лента связанных событий шины). */}
           <ScrollArea className="flex-1">
-            <div className="flex flex-col gap-2 p-3">
+            <div className="mx-auto flex max-w-[780px] flex-col gap-2 p-3">
               {messagesQ.isError && <ErrorBox title="Сообщения не загрузились" detail={String(messagesQ.error)} />}
               {messagesQ.isLoading && <div className="text-xs text-muted-foreground">загрузка…</div>}
               {(messagesQ.data?.items ?? []).map((m) => (
