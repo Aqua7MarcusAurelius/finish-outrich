@@ -114,16 +114,22 @@ export function DialogsPage() {
           </header>
           {/* Лента шириной 780px прижата к левому краю — пустое поле справа
              свободно под будущие виджеты (профиль собеседника, лента
-             связанных событий шины). */}
-          <ScrollArea className="flex-1">
-            <div className="flex max-w-[780px] flex-col gap-2 p-3">
+             связанных событий шины).
+
+             flex-col-reverse: backend отдаёт сообщения в DESC (новые первыми),
+             в DOM они идут как пришли, но flex-col-reverse кладёт первый
+             элемент визуально в низ. Результат — старые сверху, новые снизу,
+             как в любом мессенджере. Скролл по умолчанию в самом низу потому
+             что scrollTop=0 в reverse-контейнере = крайнее нижнее положение. */}
+          <div className="flex-1 overflow-y-auto">
+            <div className="flex max-w-[780px] flex-col-reverse gap-2 p-3">
               {messagesQ.isError && <ErrorBox title="Сообщения не загрузились" detail={String(messagesQ.error)} />}
               {messagesQ.isLoading && <div className="text-xs text-muted-foreground">загрузка…</div>}
               {(messagesQ.data?.items ?? []).map((m) => (
                 <MessageBubble key={m.id} m={m} />
               ))}
             </div>
-          </ScrollArea>
+          </div>
         </section>
       </div>
     </div>
