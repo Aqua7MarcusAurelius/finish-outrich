@@ -18,6 +18,25 @@ services:
       - ./:/app
     restart: unless-stopped
 
+  # ── Web UI (модуль ui_web) ────────────────────────────────────────────
+  # Изолированный Node-контейнер, запускает Vite dev-сервер на :3000.
+  # Ходит на FastAPI через docker-сеть (http://app:8000) — см. vite.config.ts.
+  # Падение UI не влияет на app / воркеры: это отдельный сервис без общего state.
+  ui:
+    build: ./modules/ui_web
+    container_name: tgf_ui
+    ports:
+      - "3000:3000"
+    environment:
+      VITE_API_URL: http://app:8000
+    volumes:
+      - ./modules/ui_web:/app
+      # именованный том хранит node_modules, чтобы bind-mount не затирал их
+      - ui_node_modules:/app/node_modules
+    depends_on:
+      - app
+    restart: unless-stopped
+
   postgres:
     image: postgres:16
     container_name: tgf_postgres
@@ -68,3 +87,4 @@ volumes:
   postgres_data:
   redis_data:
   minio_data:
+  ui_node_modules:
