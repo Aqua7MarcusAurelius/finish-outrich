@@ -80,8 +80,11 @@ def _build_filter_sql(
     status: Optional[str],
     from_: Optional[datetime],
     to: Optional[datetime],
+    dialog_id: Optional[int] = None,
 ) -> tuple[str, list[Any]]:
-    """Собрать WHERE-клоз и параметры. type с суффиксом `*` → LIKE-префикс."""
+    """Собрать WHERE-клоз и параметры. type с суффиксом `*` → LIKE-префикс.
+    dialog_id фильтрует по JSONB-полю `data->>'dialog_id'` — удобно для
+    мини-лога конкретного диалога в UI."""
     where: list[str] = []
     params: list[Any] = []
 
@@ -100,6 +103,11 @@ def _build_filter_sql(
             _add("type = ?", type)
     if status:
         _add("status = ?", status)
+    if dialog_id is not None:
+        # JSONB оператор ->> возвращает text, кастуем в bigint и сравниваем.
+        # На маленьких объёмах хватает sequential-scan; для горячего пути
+        # можно будет добавить GIN или функциональный индекс отдельно.
+        _add("(data->>'dialog_id')::bigint = ?", dialog_id)
     if from_:
         _add("time >= ?", from_)
     if to:
@@ -115,6 +123,7 @@ def _match_filters_memory(
     module: Optional[str],
     type: Optional[str],
     status: Optional[str],
+    dialog_id: Optional[int] = None,
 ) -> bool:
     """Серверная фильтрация SSE-потока — повторяем семантику _build_filter_sql."""
     if account_id is not None and event.get("account_id") != account_id:
@@ -130,6 +139,16 @@ def _match_filters_memory(
             return False
     if status and event.get("status") != status:
         return False
+    if dialog_id is not None:
+        data = event.get("data") or {}
+        raw = data.get("dialog_id")
+        if raw is None:
+            return False
+        try:
+            if int(raw) != dialog_id:
+                return False
+        except (TypeError, ValueError):
+            return False
     return True
 
 
@@ -143,6 +162,7 @@ async def list_events(
     module: Optional[str] = None,
     type: Optional[str] = None,
     status: Optional[str] = None,
+    dialog_id: Optional[int] = None,
     parent_id: Optional[str] = None,
     root_id: Optional[str] = Query(
         None,
@@ -181,7 +201,7 @@ async def list_events(
     # Обычный режим — фильтры + курсорная пагинация
     where_expr, params = _build_filter_sql(
         account_id=account_id, module=module, type=type, status=status,
-        from_=from_, to=to,
+        from_=from_, to=to, dialog_id=dialog_id,
     )
     where_parts = [where_expr] if where_expr else []
     if parent_id:
@@ -236,6 +256,7 @@ async def events_stats(
     module: Optional[str] = None,
     type: Optional[str] = None,
     status: Optional[str] = None,
+    dialog_id: Optional[int] = None,
     from_: Optional[datetime] = Query(None, alias="from"),
     to: Optional[datetime] = None,
 ):
@@ -248,7 +269,7 @@ async def events_stats(
 
     where_expr, params = _build_filter_sql(
         account_id=account_id, module=module, type=type, status=status,
-        from_=from_, to=to,
+        from_=from_, to=to, dialog_id=dialog_id,
     )
     where_sql = ("WHERE " + where_expr) if where_expr else ""
 
@@ -256,7 +277,7 @@ async def events_stats(
     # времени — иначе в маленьких окнах (1 сек) оно шумит как сумасшедшее.
     eps_where, eps_params = _build_filter_sql(
         account_id=account_id, module=module, type=type, status=status,
-        from_=now - timedelta(seconds=60), to=now,
+        from_=now - timedelta(seconds=60), to=now, dialog_id=dialog_id,
     )
     eps_sql = ("WHERE " + eps_where) if eps_where else ""
 
@@ -303,6 +324,7 @@ async def events_export(
     module: Optional[str] = None,
     type: Optional[str] = None,
     status: Optional[str] = None,
+    dialog_id: Optional[int] = None,
     from_: Optional[datetime] = Query(None, alias="from"),
     to: Optional[datetime] = None,
 ):
@@ -310,7 +332,7 @@ async def events_export(
     качаться сразу, страница не блокируется. Потолок — _EXPORT_LIMIT строк."""
     where_expr, params = _build_filter_sql(
         account_id=account_id, module=module, type=type, status=status,
-        from_=from_, to=to,
+        from_=from_, to=to, dialog_id=dialog_id,
     )
     where_sql = ("WHERE " + where_expr) if where_expr else ""
 
@@ -408,6 +430,7 @@ async def stream_events(
     module: Optional[str] = None,
     type: Optional[str] = None,
     status: Optional[str] = None,
+    dialog_id: Optional[int] = None,
 ):
     """
     SSE-поток. Фильтрация — на сервере: в UI всегда прилетают только события
@@ -444,7 +467,7 @@ async def stream_events(
                 last_id = stream_id
                 if not _match_filters_memory(
                     event, account_id=account_id, module=module,
-                    type=type, status=status,
+                    type=type, status=status, dialog_id=dialog_id,
                 ):
                     continue
                 enriched = _enrich(event)
