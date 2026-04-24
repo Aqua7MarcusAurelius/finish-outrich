@@ -19,6 +19,9 @@ export default defineConfig(({ mode }) => {
       host: "0.0.0.0",
       port: 3000,
       strictPort: true,
+      // inotify не работает через Docker bind-mount с Windows-хоста —
+      // без polling Vite не видит изменения в src/**.
+      watch: { usePolling: true, interval: 300 },
       proxy: {
         "/api":    { target: apiTarget, changeOrigin: true, rewrite: p => p.replace(/^\/api/, "") },
         "/media":  { target: apiTarget, changeOrigin: true },
