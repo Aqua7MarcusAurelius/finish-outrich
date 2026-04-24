@@ -227,23 +227,12 @@ class AutoChatService:
 
         is_outgoing = bool(data.get("is_outgoing", False))
 
-        # Проверим pending media — чтобы session знал нужно ли ждать
-        has_pending = False
-        for m in data.get("media") or []:
-            # У свежевставленных inbound-медиа ещё нет финальных статусов;
-            # проверяем через БД по media_id.
-            mid = m.get("media_id")
-            if mid and await self._media_has_pending(mid):
-                has_pending = True
-                break
-
         payload = {
             "message_id": data.get("message_id"),
             "telegram_message_id": data.get("telegram_message_id"),
             "dialog_id": dialog_id,
             "is_outgoing": is_outgoing,
             "date": _now(),   # message.saved не содержит сырой date; используем now
-            "_has_pending_media": has_pending,
         }
         kind = "outbound" if is_outgoing else "inbound"
         await session.handle_event(kind, payload)
@@ -548,20 +537,6 @@ class AutoChatService:
                 "SELECT telegram_user_id FROM dialogs WHERE id = $1", dialog_id,
             )
         return int(row["telegram_user_id"]) if row else None
-
-    async def _media_has_pending(self, media_id: int) -> bool:
-        pool = db.get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT 1 FROM media
-                WHERE id = $1
-                  AND (transcription_status = 'pending' OR description_status = 'pending')
-                LIMIT 1
-                """,
-                media_id,
-            )
-        return row is not None
 
     async def _mark_failed(self, session_id: int, reason: str) -> None:
         pool = db.get_pool()

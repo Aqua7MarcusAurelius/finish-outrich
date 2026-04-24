@@ -117,7 +117,6 @@ class AutoChatSession:
         self._queue: asyncio.Queue = asyncio.Queue()
         self._send_queue: asyncio.Queue = asyncio.Queue()
         self._planner_bump: asyncio.Event = asyncio.Event()
-        self._media_ready: asyncio.Event = asyncio.Event()
 
         # Запущенные таски (заполняются в start())
         self._state_task: asyncio.Task | None = None
@@ -127,9 +126,6 @@ class AutoChatSession:
         # Вспомогательные таймеры
         self._enter_task: asyncio.Task | None = None
         self._idle_task: asyncio.Task | None = None
-
-        # Inbound сообщения, ждущие готовности медиа (message_id → True)
-        self._pending_media_msg_ids: set[int] = set()
 
         self._stopped: asyncio.Event = asyncio.Event()
 
@@ -170,7 +166,6 @@ class AutoChatSession:
 
         # Будим планнер, чтобы вышел из ожидания bump'а
         self._planner_bump.set()
-        self._media_ready.set()
 
         # Сигнализируем sender'у маркером
         try:
@@ -249,8 +244,6 @@ class AutoChatSession:
         Inbound сообщение от собеседника (message.saved, is_outgoing=false).
         """
         msg_time = _parse_dt(payload.get("date")) or _now()
-        msg_id = payload.get("message_id")
-        has_pending = bool(payload.get("_has_pending_media", False))
 
         # 1. Запомним возраст последнего сообщения ДО этого inbound —
         # нужен для расчёта enter-delay.
@@ -261,11 +254,7 @@ class AutoChatSession:
         self.last_any_message_at = msg_time
         await self._persist_state()
 
-        # 3. Если медиа ещё не готово — отметим, что это inbound в ожидании.
-        if has_pending and msg_id is not None:
-            self._pending_media_msg_ids.add(msg_id)
-
-        # 4. Поведение зависит от InChat
+        # 3. Поведение зависит от InChat
         if not self.in_chat:
             # InChat=0: первый inbound после тишины — запускаем enter_timer.
             # Повторные inbound пока таймер идёт — НЕ перезапускают его
@@ -307,21 +296,11 @@ class AutoChatSession:
     async def _on_media_updated(self, payload: dict[str, Any]) -> None:
         """
         message.updated — транскрипция или описание готовы.
-        Снимаем блок pending_media для этого message_id если он был.
+        Сам по себе не влияет на таймеры: ожидание готовности медиа —
+        через polling БД перед генерацией, см. _wait_for_transcriptions().
         """
-        msg_id = payload.get("message_id")
-        if msg_id is None:
-            return
-        # Проверим есть ли у этого message ещё pending media
-        has_pending = await self._message_has_pending_media(msg_id)
-        if not has_pending:
-            self._pending_media_msg_ids.discard(msg_id)
-            if not self._pending_media_msg_ids:
-                self._media_ready.set()
-        # В любом случае для InChat=1 тригерим planner: контекст обновился,
-        # возможно стоит сгенерить новый ответ.
-        if self.in_chat:
-            self._bump_planner()
+        # no-op: оставлено для совместимости с dispatcher'ом.
+        return
 
     async def _on_typing(self, payload: dict[str, Any]) -> None:
         """Собеседник печатает → ресетим reply_timer (если InChat=1)."""
@@ -415,10 +394,9 @@ class AutoChatSession:
                 if self._stopped.is_set() or not self.in_chat:
                     continue
 
-                # Ждём готовность всех pending-медиа у inbound сообщений
-                # (максимум 2 минуты — чтобы не зависнуть если медиа-модули лежат).
-                if self._pending_media_msg_ids:
-                    await self._wait_media_ready(timeout=120)
+                # Перед генерацией — дождаться готовности всех транскрипций/
+                # описаний по всему диалогу (polling 30с, max 10 попыток).
+                await self._wait_for_transcriptions()
 
                 # Генерация и постановка сегментов в очередь на отправку.
                 try:
@@ -470,21 +448,58 @@ class AutoChatSession:
             # если нет новых сообщений — продолжаем ждать.
             continue
 
-    async def _wait_media_ready(self, *, timeout: float) -> None:
-        deadline = asyncio.get_event_loop().time() + timeout
-        while self._pending_media_msg_ids and not self._stopped.is_set():
-            remaining = deadline - asyncio.get_event_loop().time()
-            if remaining <= 0:
-                log.warning(
-                    "autochat session %s: waiting_media timeout, generating anyway",
-                    self.id,
-                )
+    async def _wait_for_transcriptions(
+        self, *, poll_sec: int = 30, max_attempts: int = 10,
+    ) -> None:
+        """
+        Перед генерацией LLM-ответа: проверяем нет ли в истории диалога
+        сообщений с незавершённой транскрипцией или описанием. Если есть —
+        откладываем генерацию на `poll_sec` и проверяем снова. Повторяем
+        до `max_attempts` раз (дефолт = 10 × 30с = 5 минут).
+
+        После max_attempts всё равно идём генерировать — в контексте у LLM
+        будут пометки вида `[голос: расшифровывается…]` и она ответит
+        общими словами.
+        """
+        for attempt in range(1, max_attempts + 1):
+            if self._stopped.is_set():
                 return
-            self._media_ready.clear()
+            if not await self._dialog_has_pending_media():
+                return
+            log.info(
+                "autochat session %s: pending media in dialog, "
+                "postponing generation %ds (attempt %d/%d)",
+                self.id, poll_sec, attempt, max_attempts,
+            )
             try:
-                await asyncio.wait_for(self._media_ready.wait(), timeout=remaining)
-            except asyncio.TimeoutError:
+                await asyncio.sleep(poll_sec)
+            except asyncio.CancelledError:
                 return
+        log.warning(
+            "autochat session %s: transcription not ready after %d attempts, "
+            "generating anyway",
+            self.id, max_attempts,
+        )
+
+    async def _dialog_has_pending_media(self) -> bool:
+        """Есть ли в текущем диалоге media с pending статусом?"""
+        if self.dialog_id is None:
+            return False
+        pool = db.get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT 1 FROM media m
+                JOIN messages msg ON msg.id = m.message_id
+                WHERE msg.dialog_id = $1
+                  AND msg.deleted_at IS NULL
+                  AND (m.transcription_status = 'pending'
+                       OR m.description_status = 'pending')
+                LIMIT 1
+                """,
+                self.dialog_id,
+            )
+        return row is not None
 
     # ─── Генерация ───────────────────────────────────────────────────
 
@@ -693,20 +708,6 @@ class AutoChatSession:
                 "UPDATE autochat_sessions SET dialog_id = $2, updated_at = NOW() WHERE id = $1",
                 self.id, dialog_id,
             )
-
-    async def _message_has_pending_media(self, message_id: int) -> bool:
-        pool = db.get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT 1 FROM media
-                WHERE message_id = $1
-                  AND (transcription_status = 'pending' OR description_status = 'pending')
-                LIMIT 1
-                """,
-                message_id,
-            )
-        return row is not None
 
     async def _mark_dialog_read_safe(self) -> None:
         """Пометить диалог прочитанным. Ошибки — best-effort."""
