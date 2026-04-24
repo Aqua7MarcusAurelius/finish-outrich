@@ -27,7 +27,7 @@ export function EventLogPage() {
   const [range, setRange] = useState<string>("1h");
   const [filter, setFilter] = useState<EventFilters>({});
   const [followTail, setFollowTail] = useState(true);
-  const [selectedEvent, setSelectedEvent] = useState<number | null>(null);
+  const [selectedEvent, setSelectedEvent] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
   const { from, to, label } = useMemo(() => rangeToTimestamps(range), [range]);
@@ -39,15 +39,16 @@ export function EventLogPage() {
     account: filter.account, module: filter.module, type: filter.type, status: filter.status,
   });
 
-  // Merge: newest live events on top, older archive below — deduped by id
+  // Merge: newest live events on top, older archive below — deduped by id.
+  // Event ids are hex UUIDs (not sortable), so we order by `time` descending.
   const merged = useMemo(() => {
-    const map = new Map<number, typeof live[number]>();
+    const map = new Map<string, typeof live[number]>();
     for (const e of live)                 map.set(e.id, e);
     for (const e of listQ.data?.items ?? []) if (!map.has(e.id)) map.set(e.id, e);
-    return [...map.values()].sort((a, b) => b.id - a.id);
+    return [...map.values()].sort((a, b) => b.time.localeCompare(a.time));
   }, [live, listQ.data]);
 
-  const liveIds = useMemo(() => new Set(live.slice(0, 15).map((e) => e.id)), [live]);
+  const liveIds = useMemo(() => new Set<string>(live.slice(0, 15).map((e) => e.id)), [live]);
 
   // Follow tail: auto-snap to top when new events come in. User scroll disengages it.
   useEffect(() => {

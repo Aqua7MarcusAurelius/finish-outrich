@@ -262,10 +262,10 @@ export const api = {
   eventStats: (f: EventFilters) =>
     request<EventStats>(`/events/stats${qs({ ...f })}`),
 
-  getEvent: (id: number) =>
+  getEvent: (id: string) =>
     request<BusEvent>(`/events/${id}`),
 
-  eventChain: (id: number) =>
+  eventChain: (id: string) =>
     request<EventChain>(`/events/${id}/chain`),
 
   exportEventsUrl: (f: EventFilters, format: "csv" | "json") =>

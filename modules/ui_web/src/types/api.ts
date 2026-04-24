@@ -130,9 +130,10 @@ export interface Paginated<T> {
 
 // ── Events ──────────────────────────────────────────────────────────────
 
+// Event id / parent_id are 32-char hex strings (see core/bus.py), not ints.
 export interface BusEvent {
-  id: number;
-  parent_id: number | null;
+  id: string;
+  parent_id: string | null;
   time: string;
   account_id: number | null;
   account_name: string | null;
@@ -144,9 +145,9 @@ export interface BusEvent {
 }
 
 export interface EventChain {
-  ancestors: Pick<BusEvent, "id" | "module" | "type">[];
+  ancestors: Pick<BusEvent, "id" | "module" | "type" | "status">[];
   event: BusEvent;
-  descendants: Pick<BusEvent, "id" | "module" | "type">[];
+  descendants: Pick<BusEvent, "id" | "module" | "type" | "status">[];
 }
 
 export interface EventStats {

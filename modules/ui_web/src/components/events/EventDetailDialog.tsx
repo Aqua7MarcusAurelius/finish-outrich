@@ -6,7 +6,20 @@ import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { Copy } from "lucide-react";
 
-export function EventDetailDialog({ id, onClose, onOpen }: { id: number | null; onClose: () => void; onOpen: (id: number) => void }) {
+function shortId(id: string | null | undefined): string {
+  if (!id) return "";
+  return id.slice(0, 8);
+}
+
+export function EventDetailDialog({
+  id,
+  onClose,
+  onOpen,
+}: {
+  id: string | null;
+  onClose: () => void;
+  onOpen: (id: string) => void;
+}) {
   const chainQ = useQuery({ queryKey: ["event-chain", id], queryFn: () => api.eventChain(id!), enabled: id != null });
   const ev = chainQ.data?.event;
 
@@ -15,7 +28,7 @@ export function EventDetailDialog({ id, onClose, onOpen }: { id: number | null; 
       <DialogContent>
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
-            <span className="mono">Event #{id}</span>
+            <span className="mono" title={id ?? undefined}>Event #{shortId(id)}</span>
             {ev && <StatusDot status={ev.status} />}
             {ev && <ModulePill module={ev.module} />}
           </DialogTitle>
@@ -27,12 +40,24 @@ export function EventDetailDialog({ id, onClose, onOpen }: { id: number | null; 
         {ev && (
           <div className="flex flex-col gap-3 text-xs">
             <div className="grid grid-cols-[110px_1fr] gap-y-1">
-              <span className="text-muted-foreground">status</span><span className="mono">{ev.status}</span>
-              <span className="text-muted-foreground">time</span><span className="mono">{ev.time}</span>
-              <span className="text-muted-foreground">account</span><span className="mono">{ev.account_name || (ev.account_id != null ? `account_${ev.account_id}` : "—")}</span>
-              <span className="text-muted-foreground">type</span><span className="mono font-semibold">{ev.type}</span>
+              <span className="text-muted-foreground">status</span>
+              <span className="mono">{ev.status}</span>
+              <span className="text-muted-foreground">time</span>
+              <span className="mono">{ev.time}</span>
+              <span className="text-muted-foreground">account</span>
+              <span className="mono">{ev.account_name || (ev.account_id != null ? `account_${ev.account_id}` : "—")}</span>
+              <span className="text-muted-foreground">type</span>
+              <span className="mono font-semibold">{ev.type}</span>
+              <span className="text-muted-foreground">id</span>
+              <span className="mono break-all">{ev.id}</span>
               <span className="text-muted-foreground">parent</span>
-              <span className="mono">{ev.parent_id ? <button className="hover:underline" onClick={() => onOpen(ev.parent_id!)}>#{ev.parent_id}</button> : "—"}</span>
+              <span className="mono">
+                {ev.parent_id ? (
+                  <button className="break-all hover:underline" onClick={() => onOpen(ev.parent_id!)} title={ev.parent_id}>
+                    #{shortId(ev.parent_id)}
+                  </button>
+                ) : "—"}
+              </span>
             </div>
 
             {chainQ.data && (
@@ -40,23 +65,23 @@ export function EventDetailDialog({ id, onClose, onOpen }: { id: number | null; 
                 <div className="mb-1 text-[10px] uppercase text-muted-foreground">Chain (parent_id)</div>
                 <div className="flex flex-col gap-0.5">
                   {chainQ.data.ancestors.map((a) => (
-                    <button key={a.id} className="mono flex gap-2 text-left hover:underline" onClick={() => onOpen(a.id)}>
-                      <span className="w-12 text-muted-foreground">#{a.id}</span>
-                      <span className="w-32">{a.module}</span>
-                      <span>{a.type}</span>
+                    <button key={a.id} className="mono grid grid-cols-[80px_140px_1fr] gap-2 text-left hover:underline" onClick={() => onOpen(a.id)} title={a.id}>
+                      <span className="truncate text-muted-foreground">#{shortId(a.id)}</span>
+                      <span className="truncate">{a.module}</span>
+                      <span className="truncate">{a.type}</span>
                     </button>
                   ))}
-                  <div className="mono flex gap-2 bg-accent/50 p-0.5">
-                    <span className="w-12">#{ev.id}</span>
-                    <span className="w-32">{ev.module}</span>
-                    <span>{ev.type}</span>
-                    <span className="ml-auto">←</span>
+                  <div className="mono grid grid-cols-[80px_140px_1fr_20px] gap-2 bg-accent/50 p-0.5" title={ev.id}>
+                    <span className="truncate">#{shortId(ev.id)}</span>
+                    <span className="truncate">{ev.module}</span>
+                    <span className="truncate">{ev.type}</span>
+                    <span>←</span>
                   </div>
                   {chainQ.data.descendants.map((a) => (
-                    <button key={a.id} className="mono flex gap-2 text-left hover:underline" onClick={() => onOpen(a.id)}>
-                      <span className="w-12 text-muted-foreground">#{a.id}</span>
-                      <span className="w-32">{a.module}</span>
-                      <span>{a.type}</span>
+                    <button key={a.id} className="mono grid grid-cols-[80px_140px_1fr] gap-2 text-left hover:underline" onClick={() => onOpen(a.id)} title={a.id}>
+                      <span className="truncate text-muted-foreground">#{shortId(a.id)}</span>
+                      <span className="truncate">{a.module}</span>
+                      <span className="truncate">{a.type}</span>
                     </button>
                   ))}
                 </div>
