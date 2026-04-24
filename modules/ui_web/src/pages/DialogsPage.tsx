@@ -126,43 +126,47 @@ export function DialogsPage() {
           />
         </aside>
 
-        <section className="flex min-w-0 flex-1 flex-col">
-          {/* Высота h-12 совпадает с шапкой "Поиск по диалогам" слева —
-             нижняя линия бордера идёт сквозной без ступеньки. */}
-          <header className="flex h-12 shrink-0 items-center border-b border-border px-2">
-            <div className="flex max-w-[780px] items-center gap-3">
-              {dialogQ.data ? (
-                <>
-                  <div className="text-sm font-semibold">
-                    {dialogQ.data.first_name || ""} {dialogQ.data.last_name || ""}
-                  </div>
-                  <div className="mono text-xs text-muted-foreground">
-                    {dialogQ.data.username ? `@${dialogQ.data.username}` : "—"} · {dialogQ.data.phone ?? "—"} · dialog #{dialogQ.data.id}
-                  </div>
-                </>
-              ) : (
-                <div className="text-xs text-muted-foreground">выберите диалог</div>
-              )}
-            </div>
-          </header>
-          {/* Лента шириной 780px прижата к левому краю — пустое поле справа
-             свободно под будущие виджеты (профиль собеседника, лента
-             связанных событий шины).
-
-             flex-col-reverse: backend отдаёт сообщения в DESC (новые первыми),
-             в DOM они идут как пришли, но flex-col-reverse кладёт первый
-             элемент визуально в низ. Результат — старые сверху, новые снизу,
-             как в любом мессенджере. Скролл по умолчанию в самом низу потому
-             что scrollTop=0 в reverse-контейнере = крайнее нижнее положение. */}
-          <div className="flex-1 overflow-y-auto">
-            <div className="flex max-w-[780px] flex-col-reverse gap-2 p-3">
-              {messagesQ.isError && <ErrorBox title="Сообщения не загрузились" detail={String(messagesQ.error)} />}
-              {messagesQ.isLoading && <div className="text-xs text-muted-foreground">загрузка…</div>}
-              {(messagesQ.data?.items ?? []).map((m) => (
-                <MessageBubble key={m.id} m={m} />
-              ))}
+        {/* Правая область делится на две колонки:
+             1. чат — w-[780px], отделён от правого поля бордером;
+             2. место под будущий виджет (профиль / related events) — flex-1. */}
+        <section className="flex min-w-0 flex-1 flex-row">
+          <div className="flex w-[780px] shrink-0 flex-col border-r border-border">
+            {/* Высота h-12 совпадает с шапкой "Поиск по диалогам" слева —
+               нижняя линия бордера идёт сквозной без ступеньки. */}
+            <header className="flex h-12 shrink-0 items-center border-b border-border px-2">
+              <div className="flex items-center gap-3">
+                {dialogQ.data ? (
+                  <>
+                    <div className="text-sm font-semibold">
+                      {dialogQ.data.first_name || ""} {dialogQ.data.last_name || ""}
+                    </div>
+                    <div className="mono text-xs text-muted-foreground">
+                      {dialogQ.data.username ? `@${dialogQ.data.username}` : "—"} · {dialogQ.data.phone ?? "—"} · dialog #{dialogQ.data.id}
+                    </div>
+                  </>
+                ) : (
+                  <div className="text-xs text-muted-foreground">выберите диалог</div>
+                )}
+              </div>
+            </header>
+            {/* flex-col-reverse: backend отдаёт сообщения в DESC (новые первыми),
+               в DOM они идут как пришли, но flex-col-reverse кладёт первый
+               элемент визуально в низ. Результат — старые сверху, новые снизу,
+               как в любом мессенджере. Скролл по умолчанию в самом низу потому
+               что scrollTop=0 в reverse-контейнере = крайнее нижнее положение. */}
+            <div className="flex-1 overflow-y-auto">
+              <div className="flex flex-col-reverse gap-2 p-3">
+                {messagesQ.isError && <ErrorBox title="Сообщения не загрузились" detail={String(messagesQ.error)} />}
+                {messagesQ.isLoading && <div className="text-xs text-muted-foreground">загрузка…</div>}
+                {(messagesQ.data?.items ?? []).map((m) => (
+                  <MessageBubble key={m.id} m={m} />
+                ))}
+              </div>
             </div>
           </div>
+
+          {/* Правая пустая колонка под будущий виджет (пока placeholder). */}
+          <div className="min-w-0 flex-1" />
         </section>
       </div>
     </div>
