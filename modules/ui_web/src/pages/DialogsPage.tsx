@@ -7,11 +7,13 @@ import { DialogListItem } from "@/components/dialogs/DialogListItem";
 import { MessageBubble } from "@/components/dialogs/MessageBubble";
 import { ErrorBox } from "@/components/common/ErrorBox";
 import { useAccounts, useDialogProfile, useDialogs, useMessages } from "@/hooks/useAccounts";
-import { api } from "@/lib/api";
+import { api, describeApiError } from "@/lib/api";
+import { useToast } from "@/lib/toast";
 
 export function DialogsPage() {
   const navigate = useNavigate();
   const params = useParams<{ accountId?: string; dialogId?: string }>();
+  const toast = useToast();
 
   const accountsQ = useAccounts();
   const accounts = accountsQ.data ?? [];
@@ -58,8 +60,12 @@ export function DialogsPage() {
                 account={a}
                 selected={a.id === accountId}
                 onSelect={() => navigate(`/dialogs/${a.id}`)}
-                onStart={() => api.startWorker(a.id).then(() => accountsQ.refetch()).catch(() => {})}
-                onStop={() =>  api.stopWorker(a.id).then(() => accountsQ.refetch()).catch(() => {})}
+                onStart={() => api.startWorker(a.id)
+                  .then(() => { toast.success(`Воркер ${a.name || `#${a.id}`} запущен`); accountsQ.refetch(); })
+                  .catch((e) => { const d = describeApiError(e); toast.error(`Start: ${d.title}`, d.detail); })}
+                onStop={() => api.stopWorker(a.id)
+                  .then(() => { toast.success(`Воркер ${a.name || `#${a.id}`} остановлен`); accountsQ.refetch(); })
+                  .catch((e) => { const d = describeApiError(e); toast.error(`Stop: ${d.title}`, d.detail); })}
               />
             ))}
           </div>

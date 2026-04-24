@@ -21,6 +21,22 @@ export class ApiError extends Error {
   }
 }
 
+// Вытащить человекочитаемое сообщение из { error: { code, message } } shape,
+// который возвращают FastAPI-ручки проекта. Фолбэк — general .message.
+export function describeApiError(e: unknown): { title: string; detail?: string } {
+  if (e instanceof ApiError) {
+    const b = e.body as { error?: { code?: string; message?: string } } | string | null;
+    if (b && typeof b === "object" && b.error) {
+      return {
+        title: b.error.message || b.error.code || `HTTP ${e.status}`,
+        detail: b.error.code ? `${b.error.code} (HTTP ${e.status})` : `HTTP ${e.status}`,
+      };
+    }
+    return { title: `HTTP ${e.status}`, detail: typeof b === "string" ? b : undefined };
+  }
+  return { title: String(e) };
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...init,
