@@ -323,7 +323,7 @@ export const api = {
 
 // SSE helper: opens /events/stream with filters, reopens on filter change.
 export function openEventStream(
-  filters: Pick<EventFilters, "account" | "module" | "type" | "status">,
+  filters: Pick<EventFilters, "account" | "module" | "type" | "status" | "dialog_id">,
   onEvent: (e: BusEvent) => void,
   onError?: (ev: Event) => void,
 ): EventSource {

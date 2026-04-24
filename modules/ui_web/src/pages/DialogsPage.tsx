@@ -7,6 +7,7 @@ import { NewAccountCard } from "@/components/dialogs/NewAccountCard";
 import { NewAccountDialog } from "@/components/dialogs/NewAccountDialog";
 import { NewDialogButton } from "@/components/dialogs/NewDialogButton";
 import { NewDialogDialog } from "@/components/dialogs/NewDialogDialog";
+import { DialogEventsWidget } from "@/components/dialogs/DialogEventsWidget";
 import { DialogListItem } from "@/components/dialogs/DialogListItem";
 import { MessageBubble } from "@/components/dialogs/MessageBubble";
 import { ErrorBox } from "@/components/common/ErrorBox";
@@ -165,8 +166,10 @@ export function DialogsPage() {
             </div>
           </div>
 
-          {/* Правая пустая колонка под будущий виджет (пока placeholder). */}
-          <div className="min-w-0 flex-1" />
+          {/* Правая колонка — виджет потока событий по текущему диалогу. */}
+          <div className="min-w-0 flex-1">
+            <DialogEventsWidget dialogId={dialogId} />
+          </div>
         </section>
       </div>
     </div>

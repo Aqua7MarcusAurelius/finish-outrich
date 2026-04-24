@@ -163,6 +163,7 @@ export interface EventFilters {
   module?: BusModule;
   type?: string;
   status?: EventStatus;
+  dialog_id?: number;
   from?: string;
   to?: string;
   limit?: number;
