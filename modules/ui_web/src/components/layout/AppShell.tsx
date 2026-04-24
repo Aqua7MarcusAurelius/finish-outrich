@@ -22,7 +22,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="flex h-screen flex-col">
-      <header className="flex h-11 shrink-0 items-center gap-3 px-3 border-b border-border">
+      <header className="flex h-12 shrink-0 items-center gap-3 px-3 border-b border-border">
         <div className="flex items-center gap-2">
           <span className="mono text-xs text-muted-foreground">tgf</span>
           <span className="text-sm font-semibold">Control Panel</span>
