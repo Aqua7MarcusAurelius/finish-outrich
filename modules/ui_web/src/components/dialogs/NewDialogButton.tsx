@@ -1,8 +1,9 @@
 import { Plus } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-// Кнопка "+" под списком диалогов в левой колонке. Визуально — dashed
-// вариант DialogListItem, чтобы не путался с реальными диалогами.
+// Кнопка "+" прижата к низу левой колонки и занимает её полную ширину.
+// Лежит вне ScrollArea (см. DialogsPage), поэтому остаётся на месте при
+// прокрутке списка диалогов — работает как sticky footer секции.
 export function NewDialogButton({
   onClick,
   disabled,
@@ -18,11 +19,11 @@ export function NewDialogButton({
       disabled={disabled}
       title={disabled ? hint : "Запустить авто-диалог (AutoChat)"}
       className={cn(
-        "m-2 flex items-center justify-center gap-2 rounded-md border-dashed py-3 text-xs font-medium",
-        "hairline border-border text-muted-foreground transition-colors",
+        "flex w-full shrink-0 items-center justify-center gap-2 border-t border-border bg-background px-3 py-3 text-xs font-medium",
+        "text-muted-foreground transition-colors",
         disabled
           ? "cursor-not-allowed opacity-50"
-          : "hover:border-foreground/60 hover:text-foreground",
+          : "hover:bg-accent/60 hover:text-foreground",
       )}
     >
       <Plus className="h-4 w-4" />

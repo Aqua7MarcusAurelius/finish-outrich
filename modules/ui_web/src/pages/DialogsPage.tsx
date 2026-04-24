@@ -117,12 +117,13 @@ export function DialogsPage() {
                 onSelect={() => navigate(`/dialogs/${accountId}/${d.id}`)}
               />
             ))}
-            <NewDialogButton
-              onClick={() => setNewDlgOpen(true)}
-              disabled={accountId == null}
-              hint="Выбери аккаунт сверху"
-            />
           </ScrollArea>
+          {/* sticky footer: вне ScrollArea, остаётся видимым при прокрутке */}
+          <NewDialogButton
+            onClick={() => setNewDlgOpen(true)}
+            disabled={accountId == null}
+            hint="Выбери аккаунт сверху"
+          />
         </aside>
 
         <section className="flex min-w-0 flex-1 flex-col">
