@@ -304,7 +304,9 @@ async def build_conversation_context(
         when = t["date"]
         if isinstance(when, datetime):
             stamp = when.strftime("%Y-%m-%d %H:%M")
-            content = f"[{stamp}] {t['body']}"
+            # Timestamp в конце, с прозовым маркером — чтобы LLM не приняла
+            # его за часть формата сообщения и не скопировала в свой ответ.
+            content = f"{t['body']}\n(отправлено {stamp})"
         else:
             content = t["body"]
         out.append({"role": role, "content": content})
