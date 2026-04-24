@@ -102,6 +102,34 @@ class WorkerManager:
         self._slots: dict[int, _Slot] = {}
         self._lock = asyncio.Lock()
 
+    async def reconcile_on_boot(self) -> None:
+        """Сбросить stale-статусы в Redis при старте приложения.
+
+        После рестарта app-контейнера in-memory ``_slots`` пустой, но в
+        Redis ключи ``worker:{id}:status`` остались с прошлого запуска.
+        ``list_workers`` читает Redis и показывает воркеры как ``running``,
+        хотя таска нет. ``stop`` в этом состоянии возвращает
+        ``NOT_RUNNING`` (409), UI получает "kнопка не работает".
+
+        Лечение — один проход при инициализации: любой не-терминальный
+        статус при пустом slot превращается в ``stopped``. Воркеры в
+        этом проекте стартуются вручную через ``POST /workers/{id}/start``,
+        так что после reconcile пользователь видит честное ``stopped``.
+        """
+        pool = db.get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT id FROM accounts")
+
+        changed: list[int] = []
+        for r in rows:
+            acc_id = r["id"]
+            status = await self._get_status(acc_id)
+            if status in (STATUS_RUNNING, STATUS_STARTING, STATUS_STOPPING):
+                await self._set_status(acc_id, STATUS_STOPPED)
+                changed.append(acc_id)
+        if changed:
+            log.info("reconcile_on_boot: reset stale status for accounts=%s", changed)
+
     # ─── Публичные методы ──────────────────────────────────────────
 
     async def list_workers(self) -> list[dict[str, Any]]:

@@ -72,6 +72,10 @@ async def lifespan(app: FastAPI):
 
     app.state.auth_service = AuthService()
     app.state.worker_manager = WorkerManager()
+    # Redis хранит status=running между рестартами app-контейнера, но
+    # in-memory slot пустой — чистим до того как начнём принимать
+    # /workers/* запросы, иначе UI видит несуществующий воркер.
+    await app.state.worker_manager.reconcile_on_boot()
 
     # AutoChat: обращается к wrapper через worker_manager.get_wrapper.
     # Создаётся после WorkerManager, останавливается раньше него
