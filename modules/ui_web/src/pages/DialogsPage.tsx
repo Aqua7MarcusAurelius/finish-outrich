@@ -85,7 +85,7 @@ export function DialogsPage() {
       {/* ── Body: dialogs + messages ─────────────────────────────── */}
       <div className="flex min-h-0 flex-1">
         <aside className="flex w-[260px] shrink-0 flex-col border-r border-border">
-          <div className="border-b border-border p-2">
+          <div className="flex h-12 shrink-0 items-center border-b border-border px-2">
             <Input placeholder="Поиск по диалогам…" value={search} onChange={(e) => setSearch(e.target.value)} />
           </div>
           <ScrollArea className="flex-1">
@@ -106,8 +106,10 @@ export function DialogsPage() {
         </aside>
 
         <section className="flex min-w-0 flex-1 flex-col">
-          <header className="border-b border-border">
-            <div className="flex max-w-[780px] items-center gap-3 p-2">
+          {/* Высота h-12 совпадает с шапкой "Поиск по диалогам" слева —
+             нижняя линия бордера идёт сквозной без ступеньки. */}
+          <header className="flex h-12 shrink-0 items-center border-b border-border px-2">
+            <div className="flex max-w-[780px] items-center gap-3">
               {dialogQ.data ? (
                 <>
                   <div className="text-sm font-semibold">
