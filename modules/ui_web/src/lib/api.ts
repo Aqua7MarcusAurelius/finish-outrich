@@ -281,6 +281,21 @@ export const api = {
   authCancel: (session_id: string) =>
     request<void>(`/auth/${session_id}`, { method: "DELETE" }),
 
+  // ── autochat (создание авто-диалога) ────────────────────────────────
+  // POST /autochat/start запускает сессию: резолвит @username, генерирует
+  // первое сообщение по initial_prompt (через Opus 4.7 в OpenRouter),
+  // отправляет его и дальше ведёт переписку. Детали — docs/autochat.md.
+  autochatStart: (body: {
+    account_id: number;
+    username: string;
+    initial_prompt: string;
+    system_prompt?: string;
+  }) =>
+    request<{ session: { id: number; status: string; dialog_id: number | null; [k: string]: unknown } }>(
+      "/autochat/start",
+      { method: "POST", body: JSON.stringify({ system_prompt: "", ...body }) },
+    ),
+
   // ── events ──────────────────────────────────────────────────────────
   listEvents: async (f: EventFilters): Promise<Paginated<BusEvent>> => {
     const raw = await request<{ events: BusEvent[]; next_cursor: string | null }>(

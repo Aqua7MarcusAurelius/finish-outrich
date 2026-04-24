@@ -5,6 +5,8 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { AccountCard } from "@/components/dialogs/AccountCard";
 import { NewAccountCard } from "@/components/dialogs/NewAccountCard";
 import { NewAccountDialog } from "@/components/dialogs/NewAccountDialog";
+import { NewDialogButton } from "@/components/dialogs/NewDialogButton";
+import { NewDialogDialog } from "@/components/dialogs/NewDialogDialog";
 import { DialogListItem } from "@/components/dialogs/DialogListItem";
 import { MessageBubble } from "@/components/dialogs/MessageBubble";
 import { ErrorBox } from "@/components/common/ErrorBox";
@@ -31,6 +33,7 @@ export function DialogsPage() {
 
   const [search, setSearch] = useState("");
   const [newAccOpen, setNewAccOpen] = useState(false);
+  const [newDlgOpen, setNewDlgOpen] = useState(false);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -82,6 +85,18 @@ export function DialogsPage() {
         onCreated={() => accountsQ.refetch()}
       />
 
+      <NewDialogDialog
+        open={newDlgOpen}
+        accountId={accountId}
+        onClose={() => setNewDlgOpen(false)}
+        onCreated={() => {
+          // Новый диалог-row в history.dialogs появится после первого
+          // message.saved (~1-3 сек). Рефетчим с запасом, два тика.
+          accountsQ.refetch();
+          setTimeout(() => dialogsQ.refetch(), 2500);
+        }}
+      />
+
       {/* ── Body: dialogs + messages ─────────────────────────────── */}
       <div className="flex min-h-0 flex-1">
         <aside className="flex w-[260px] shrink-0 flex-col border-r border-border">
@@ -102,6 +117,11 @@ export function DialogsPage() {
                 onSelect={() => navigate(`/dialogs/${accountId}/${d.id}`)}
               />
             ))}
+            <NewDialogButton
+              onClick={() => setNewDlgOpen(true)}
+              disabled={accountId == null}
+              hint="Выбери аккаунт сверху"
+            />
           </ScrollArea>
         </aside>
 
