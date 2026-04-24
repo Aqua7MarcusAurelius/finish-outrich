@@ -29,8 +29,10 @@ export const STATUS_TOKEN: Record<EventStatus, string> = {
 };
 
 export const WORKER_STATUS_TOKEN: Record<WorkerStatus, string> = {
-  running: "status-success",
-  crashed: "status-error",
-  starting: "status-in_progress",
-  stopped: "status-stopped",
+  running:          "status-success",
+  crashed:          "status-error",
+  starting:         "status-in_progress",
+  stopping:         "status-in_progress",
+  stopped:          "status-stopped",
+  session_expired:  "status-error",
 };

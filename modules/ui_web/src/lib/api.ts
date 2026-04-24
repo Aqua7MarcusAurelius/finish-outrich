@@ -6,6 +6,7 @@ import type {
   EventChain,
   EventFilters,
   EventStats,
+  MediaItem,
   Message,
   MessageEdit,
   Paginated,
@@ -47,22 +48,196 @@ function qs(params: Record<string, unknown>): string {
   return `?${s.toString()}`;
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// Adapters — normalize backend response shapes into the contract shapes
+// the UI components consume. The backend predates the contract for some
+// endpoints (history/routes.py uses forward_from/reply_to_message_id etc.),
+// so we translate here instead of renaming fields in a hot shared module.
+// ──────────────────────────────────────────────────────────────────────
+
+type BackendDialog = {
+  id: number;
+  account_id: number;
+  first_name: string | null;
+  last_name: string | null;
+  username: string | null;
+  phone: string | null;
+  is_bot: boolean;
+  is_contact: boolean;
+  last_message: { date: string; text: string | null; is_outgoing: boolean } | null;
+};
+
+function adaptDialog(d: BackendDialog): DialogSummary {
+  const name = [d.first_name, d.last_name].filter(Boolean).join(" ").trim();
+  const title = name || d.username || "(без имени)";
+  return {
+    id: d.id,
+    account_id: d.account_id,
+    title,
+    username: d.username,
+    phone: d.phone,
+    is_bot: d.is_bot,
+    is_contact: d.is_contact,
+    last_message: d.last_message
+      ? {
+          text: d.last_message.text,
+          date: d.last_message.date,
+          type: d.last_message.text ? "text" : "media",
+        }
+      : null,
+  };
+}
+
+type BackendMedia = {
+  id: number;
+  type: MediaItem["type"];
+  mime_type: string | null;
+  duration: number | null;
+  width: number | null;
+  height: number | null;
+  file_size: number | null;
+  file_name: string | null;
+  storage_key: string | null;
+  transcription: string | null;
+  transcription_status: MediaItem["transcription_status"];
+  description: string | null;
+  description_status: MediaItem["description_status"];
+};
+
+function adaptMedia(m: BackendMedia): MediaItem {
+  return {
+    id: m.id,
+    type: m.type,
+    mime_type: m.mime_type,
+    duration: m.duration,
+    width: m.width,
+    height: m.height,
+    size_bytes: m.file_size,
+    file_name: m.file_name,
+    storage_key: m.storage_key,
+    preview_url: `/media/${m.id}/preview`,
+    transcription: m.transcription,
+    transcription_status: m.transcription_status ?? "none",
+    description: m.description,
+    description_status: m.description_status ?? "none",
+  };
+}
+
+type BackendMessage = {
+  id: number;
+  dialog_id: number;
+  telegram_message_id: number;
+  is_outgoing: boolean;
+  type: string;
+  date: string;
+  text: string | null;
+  reply_to_message_id: number | null;
+  reply_to_telegram_message_id: number | null;
+  forward_from: { user_id: number | null; username: string | null; name: string | null; chat_id: number | null; date: string } | null;
+  media_group_id: string | null;
+  edited_at: string | null;
+  deleted_at: string | null;
+  media: BackendMedia[];
+  reactions: { emoji: string | null; custom_emoji_id: string | null; is_outgoing: boolean; created_at: string; removed_at: string | null }[];
+};
+
+function adaptMessage(m: BackendMessage): Message {
+  // Group reactions by emoji/custom_emoji_id so the UI shows one pill per kind
+  // with a count — matches how Telegram displays them and the `Reaction`
+  // contract shape.
+  const counts = new Map<string, { emoji: string; count: number; is_outgoing: boolean; created_at: string }>();
+  for (const r of m.reactions) {
+    const key = r.emoji ?? `custom:${r.custom_emoji_id ?? ""}`;
+    const prev = counts.get(key);
+    if (prev) {
+      prev.count += 1;
+      if (r.is_outgoing) prev.is_outgoing = true;
+    } else {
+      counts.set(key, {
+        emoji: r.emoji ?? "❓",
+        count: 1,
+        is_outgoing: r.is_outgoing,
+        created_at: r.created_at,
+      });
+    }
+  }
+
+  return {
+    id: m.id,
+    telegram_message_id: m.telegram_message_id,
+    is_outgoing: m.is_outgoing,
+    date: m.date,
+    text: m.text,
+    type: m.type,
+    edited_at: m.edited_at,
+    deleted_at: m.deleted_at,
+    reply_to: m.reply_to_message_id
+      ? {
+          message_id: m.reply_to_message_id,
+          text_preview: null,
+          is_outgoing: false,
+        }
+      : null,
+    forward: m.forward_from
+      ? {
+          from_username: m.forward_from.username,
+          from_name: m.forward_from.name,
+          from_chat_title: null,
+          date: m.forward_from.date,
+        }
+      : null,
+    media_group_id: m.media_group_id,
+    media: (m.media ?? []).map(adaptMedia),
+    reactions: [...counts.values()].map((r) => ({
+      emoji: r.emoji,
+      count: r.count,
+      is_outgoing: r.is_outgoing,
+      created_at: r.created_at,
+      removed_at: null,
+    })),
+  };
+}
+
+// ──────────────────────────────────────────────────────────────────────
+
 export const api = {
   // ── accounts & dialogs ──────────────────────────────────────────────
   listAccounts: () =>
     request<Account[]>("/accounts"),
 
-  listDialogs: (accountId: number, cursor?: string) =>
-    request<Paginated<DialogSummary>>(`/accounts/${accountId}/dialogs${qs({ cursor })}`),
+  listDialogs: async (accountId: number): Promise<Paginated<DialogSummary>> => {
+    const raw = await request<{ dialogs: BackendDialog[] }>(`/accounts/${accountId}/dialogs`);
+    const items = (raw.dialogs ?? []).map(adaptDialog);
+    return { items, has_more: false };
+  },
 
   getDialog: (dialogId: number) =>
     request<DialogProfile>(`/dialogs/${dialogId}`),
 
-  listMessages: (dialogId: number, cursor?: string, limit = 50) =>
-    request<Paginated<Message>>(`/dialogs/${dialogId}/messages${qs({ cursor, limit })}`),
+  listMessages: async (dialogId: number, cursor?: string, limit = 50): Promise<Paginated<Message>> => {
+    const raw = await request<{ messages: BackendMessage[]; next_cursor: string | null }>(
+      `/dialogs/${dialogId}/messages${qs({ cursor, limit })}`,
+    );
+    const items = (raw.messages ?? []).map(adaptMessage);
+    return {
+      items,
+      next_cursor: raw.next_cursor ?? undefined,
+      has_more: !!raw.next_cursor,
+    };
+  },
 
-  listMessageEdits: (messageId: number) =>
-    request<MessageEdit[]>(`/messages/${messageId}/edits`),
+  listMessageEdits: async (messageId: number): Promise<MessageEdit[]> => {
+    const raw = await request<{ id: number; message_id: number; old_text: string | null; edited_at: string }[]>(
+      `/messages/${messageId}/edits`,
+    );
+    return raw.map((r) => ({
+      id: r.id,
+      message_id: r.message_id,
+      previous_text: r.old_text,
+      new_text: null,
+      edited_at: r.edited_at,
+    }));
+  },
 
   mediaPreviewUrl: (mediaId: number) => `/media/${mediaId}/preview`,
 
@@ -73,8 +248,16 @@ export const api = {
     request<void>(`/workers/${accountId}/stop`, { method: "POST" }),
 
   // ── events ──────────────────────────────────────────────────────────
-  listEvents: (f: EventFilters) =>
-    request<Paginated<BusEvent>>(`/events${qs({ ...f })}`),
+  listEvents: async (f: EventFilters): Promise<Paginated<BusEvent>> => {
+    const raw = await request<{ events: BusEvent[]; next_cursor: string | null }>(
+      `/events${qs({ ...f })}`,
+    );
+    return {
+      items: raw.events ?? [],
+      next_cursor: raw.next_cursor ?? undefined,
+      has_more: !!raw.next_cursor,
+    };
+  },
 
   eventStats: (f: EventFilters) =>
     request<EventStats>(`/events/stats${qs({ ...f })}`),

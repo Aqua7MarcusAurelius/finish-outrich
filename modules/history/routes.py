@@ -178,6 +178,52 @@ async def _fetch_reply_tg_ids(conn, internal_ids: list[int]) -> dict[int, int]:
     return {r["id"]: r["telegram_message_id"] for r in rows}
 
 
+async def _fetch_reactions_by_messages(conn, message_ids: list[int]) -> dict[int, list[dict]]:
+    """Активные реакции (removed_at IS NULL), сгруппированы по message_id."""
+    if not message_ids:
+        return {}
+    rows = await conn.fetch(
+        """
+        SELECT message_id, emoji, custom_emoji_id, is_outgoing, created_at, removed_at
+        FROM reactions
+        WHERE message_id = ANY($1::int[]) AND removed_at IS NULL
+        ORDER BY message_id, created_at
+        """,
+        message_ids,
+    )
+    out: dict[int, list[dict]] = {}
+    for r in rows:
+        out.setdefault(r["message_id"], []).append({
+            "emoji": r["emoji"],
+            "custom_emoji_id": r["custom_emoji_id"],
+            "is_outgoing": r["is_outgoing"],
+            "created_at": _iso(r["created_at"]),
+            "removed_at": _iso(r["removed_at"]),
+        })
+    return out
+
+
+async def _fetch_reply_previews(conn, internal_ids: list[int]) -> dict[int, dict]:
+    """По internal reply_to_message_id отдать текст/is_outgoing оригинала."""
+    if not internal_ids:
+        return {}
+    rows = await conn.fetch(
+        """
+        SELECT id, telegram_message_id, text, is_outgoing
+        FROM messages WHERE id = ANY($1::int[])
+        """,
+        internal_ids,
+    )
+    return {
+        r["id"]: {
+            "telegram_message_id": r["telegram_message_id"],
+            "text": r["text"],
+            "is_outgoing": r["is_outgoing"],
+        }
+        for r in rows
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────
 # GET /accounts/{id}/dialogs
 # ─────────────────────────────────────────────────────────────────────
@@ -325,12 +371,13 @@ async def list_dialog_messages(
 
         media_by_msg = await _fetch_media_by_messages(conn, msg_ids)
         reply_tg_map = await _fetch_reply_tg_ids(conn, reply_internal_ids)
+        reactions_by_msg = await _fetch_reactions_by_messages(conn, msg_ids)
 
     messages = [
         _message_to_dict(
             r,
             media=media_by_msg.get(r["id"], []),
-            reactions=[],  # TODO когда появится модуль реакций
+            reactions=reactions_by_msg.get(r["id"], []),
             reply_to_tg=reply_tg_map.get(r["reply_to_message_id"])
                         if r["reply_to_message_id"] else None,
         )
@@ -459,6 +506,7 @@ async def get_message(message_id: int):
             raise HTTPException(404, {"error": {"code": "MESSAGE_NOT_FOUND"}})
 
         media_by_msg = await _fetch_media_by_messages(conn, [row["id"]])
+        reactions_by_msg = await _fetch_reactions_by_messages(conn, [row["id"]])
         reply_tg = None
         if row["reply_to_message_id"]:
             r2 = await conn.fetchrow(
@@ -471,9 +519,42 @@ async def get_message(message_id: int):
     return _message_to_dict(
         row,
         media=media_by_msg.get(row["id"], []),
-        reactions=[],
+        reactions=reactions_by_msg.get(row["id"], []),
         reply_to_tg=reply_tg,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# GET /messages/{id}/edits — история правок
+# ─────────────────────────────────────────────────────────────────────
+
+@router.get("/messages/{message_id}/edits")
+async def list_message_edits(message_id: int):
+    pool = db.get_pool()
+    async with pool.acquire() as conn:
+        exists = await conn.fetchval(
+            "SELECT 1 FROM messages WHERE id = $1", message_id,
+        )
+        if not exists:
+            raise HTTPException(404, {"error": {"code": "MESSAGE_NOT_FOUND"}})
+        rows = await conn.fetch(
+            """
+            SELECT id, message_id, old_text, edited_at
+            FROM message_edits
+            WHERE message_id = $1
+            ORDER BY edited_at ASC, id ASC
+            """,
+            message_id,
+        )
+    return [
+        {
+            "id": r["id"],
+            "message_id": r["message_id"],
+            "old_text": r["old_text"],
+            "edited_at": _iso(r["edited_at"]),
+        }
+        for r in rows
+    ]
 
 
 # ─────────────────────────────────────────────────────────────────────

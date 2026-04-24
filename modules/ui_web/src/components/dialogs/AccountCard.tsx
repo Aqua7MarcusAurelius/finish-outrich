@@ -14,7 +14,7 @@ type Props = {
 };
 
 export function AccountCard({ account, selected, onSelect, onStart, onStop }: Props) {
-  const needsReauth = account.status === "crashed"; // TODO: replace with explicit "session_expired" when backend surfaces it
+  const needsReauth = account.status === "session_expired";
   return (
     <Card
       onClick={onSelect}

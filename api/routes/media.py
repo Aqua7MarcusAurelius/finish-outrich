@@ -99,6 +99,7 @@ def _safe_filename(mime: str | None, media_id: int, file_name: str | None) -> st
     return f"media_{media_id}.bin"
 
 
+@router.get("/media/{media_id}/preview")
 @router.get("/media/{media_id}/file")
 async def get_media_file(media_id: int):
     pool = db.get_pool()

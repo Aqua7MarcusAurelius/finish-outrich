@@ -12,7 +12,13 @@ export type BusModule =
   | "autochat";
 
 export type EventStatus = "success" | "error" | "in_progress";
-export type WorkerStatus = "running" | "crashed" | "starting" | "stopped";
+export type WorkerStatus =
+  | "running"
+  | "starting"
+  | "stopping"
+  | "stopped"
+  | "crashed"
+  | "session_expired";
 
 export type MediaType = "photo" | "video" | "voice" | "video_note" | "document" | "audio" | "sticker" | "animation";
 export type AsyncJobStatus = "none" | "pending" | "done" | "failed";

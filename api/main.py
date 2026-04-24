@@ -17,6 +17,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from api.routes.accounts import router as accounts_router
 from api.routes.events import router as events_router
 from api.routes.media import router as media_router
 from api.routes.system import router as system_router
@@ -184,6 +185,7 @@ app.include_router(system_router)
 app.include_router(events_router)
 app.include_router(auth_router)
 app.include_router(workers_router)
+app.include_router(accounts_router)
 app.include_router(history_router)
 app.include_router(media_router)
 app.include_router(autochat_router)
