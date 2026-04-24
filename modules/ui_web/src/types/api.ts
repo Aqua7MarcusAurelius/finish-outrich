@@ -2,13 +2,21 @@
 // contract explicitly says "all fields of table X" so the UI survives
 // additive schema changes on the backend.
 
+// Mirrors core/events.py::Module. Kept as a string-union of *known* modules
+// but components should tolerate unknown values (ModulePill has a fallback).
 export type BusModule =
-  | "telegram"
   | "history"
+  | "history_sync"
   | "transcription"
   | "description"
-  | "auth"
+  | "wrapper"
+  | "worker"
   | "worker_manager"
+  | "auth"
+  | "cleaner"
+  | "api"
+  | "system"
+  | "bus"
   | "autochat";
 
 export type EventStatus = "success" | "error" | "in_progress";

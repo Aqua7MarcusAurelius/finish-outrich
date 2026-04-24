@@ -29,15 +29,23 @@ export default {
         popover:     { DEFAULT: "hsl(var(--popover))",     foreground: "hsl(var(--popover-foreground))" },
 
         // Bus module colors (see docs/ui/web_ui_overview_v1.md "Цветовая разметка модулей").
-        // Consumed via `bg-module-telegram` / `text-module-history` etc.
+        // Consumed via `bg-module-wrapper` / `text-module-history` etc.
+        // Keep in sync with core/events.py::Module.
         module: {
-          telegram:       "hsl(var(--module-telegram))",
+          wrapper:        "hsl(var(--module-wrapper))",
           history:        "hsl(var(--module-history))",
+          history_sync:   "hsl(var(--module-history-sync))",
           transcription:  "hsl(var(--module-transcription))",
           description:    "hsl(var(--module-description))",
           auth:           "hsl(var(--module-auth))",
+          worker:         "hsl(var(--module-worker))",
           worker_manager: "hsl(var(--module-worker-manager))",
+          cleaner:        "hsl(var(--module-cleaner))",
+          api:            "hsl(var(--module-api))",
+          system:         "hsl(var(--module-system))",
+          bus:            "hsl(var(--module-bus))",
           autochat:       "hsl(var(--module-autochat))",
+          unknown:        "hsl(var(--module-unknown))",
         },
 
         // Status colors — success/error/in_progress/stopped.
