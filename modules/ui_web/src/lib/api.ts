@@ -263,6 +263,24 @@ export const api = {
   stopWorker: (accountId: number) =>
     request<void>(`/workers/${accountId}/stop`, { method: "POST" }),
 
+  // ── auth (добавление нового аккаунта) ───────────────────────────────
+  // Возвращаемые поля — modules/auth/service.py: PHASE_CODE_SENT /
+  // PHASE_2FA_REQUIRED / PHASE_DONE. `done` несёт account_id.
+  authStart: (body: { phone: string; name: string; proxy_primary: string; proxy_fallback: string }) =>
+    request<{ session_id: string; status: "code_sent" }>("/auth/start", {
+      method: "POST", body: JSON.stringify(body),
+    }),
+  authCode: (session_id: string, code: string) =>
+    request<{ status: "2fa_required" | "done"; account_id?: number }>("/auth/code", {
+      method: "POST", body: JSON.stringify({ session_id, code }),
+    }),
+  auth2fa: (session_id: string, password: string) =>
+    request<{ status: "done"; account_id?: number }>("/auth/2fa", {
+      method: "POST", body: JSON.stringify({ session_id, password }),
+    }),
+  authCancel: (session_id: string) =>
+    request<void>(`/auth/${session_id}`, { method: "DELETE" }),
+
   // ── events ──────────────────────────────────────────────────────────
   listEvents: async (f: EventFilters): Promise<Paginated<BusEvent>> => {
     const raw = await request<{ events: BusEvent[]; next_cursor: string | null }>(

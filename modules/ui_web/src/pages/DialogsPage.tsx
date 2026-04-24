@@ -3,6 +3,8 @@ import { useNavigate, useParams } from "react-router-dom";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { AccountCard } from "@/components/dialogs/AccountCard";
+import { NewAccountCard } from "@/components/dialogs/NewAccountCard";
+import { NewAccountDialog } from "@/components/dialogs/NewAccountDialog";
 import { DialogListItem } from "@/components/dialogs/DialogListItem";
 import { MessageBubble } from "@/components/dialogs/MessageBubble";
 import { ErrorBox } from "@/components/common/ErrorBox";
@@ -28,6 +30,7 @@ export function DialogsPage() {
   const dialogQ = useDialogProfile(dialogId);
 
   const [search, setSearch] = useState("");
+  const [newAccOpen, setNewAccOpen] = useState(false);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -68,9 +71,16 @@ export function DialogsPage() {
                   .catch((e) => { const d = describeApiError(e); toast.error(`Stop: ${d.title}`, d.detail); })}
               />
             ))}
+            <NewAccountCard onClick={() => setNewAccOpen(true)} />
           </div>
         </ScrollArea>
       </div>
+
+      <NewAccountDialog
+        open={newAccOpen}
+        onClose={() => setNewAccOpen(false)}
+        onCreated={() => accountsQ.refetch()}
+      />
 
       {/* ── Body: dialogs + messages ─────────────────────────────── */}
       <div className="flex min-h-0 flex-1">
