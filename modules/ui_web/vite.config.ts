@@ -23,12 +23,18 @@ export default defineConfig(({ mode }) => {
       // без polling Vite не видит изменения в src/**.
       watch: { usePolling: true, interval: 300 },
       proxy: {
-        "/api":    { target: apiTarget, changeOrigin: true, rewrite: p => p.replace(/^\/api/, "") },
-        "/media":  { target: apiTarget, changeOrigin: true },
-        "/events": { target: apiTarget, changeOrigin: true },
+        // Каждый префикс должен соответствовать реальному роутеру в api/main.py.
+        // Если ручка существует, но префикса тут нет — Vite отдаёт 404 на
+        // запрос (особенно POST/DELETE), потому что считает его SPA-путём.
+        "/api":      { target: apiTarget, changeOrigin: true, rewrite: p => p.replace(/^\/api/, "") },
+        "/media":    { target: apiTarget, changeOrigin: true },
+        "/events":   { target: apiTarget, changeOrigin: true },
         "/accounts": { target: apiTarget, changeOrigin: true },
         "/dialogs":  { target: apiTarget, changeOrigin: true },
         "/messages": { target: apiTarget, changeOrigin: true },
+        "/workers":  { target: apiTarget, changeOrigin: true },
+        "/auth":     { target: apiTarget, changeOrigin: true },
+        "/autochat": { target: apiTarget, changeOrigin: true },
         "/system":   { target: apiTarget, changeOrigin: true },
       },
     },
