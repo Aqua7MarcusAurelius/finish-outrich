@@ -41,6 +41,23 @@ export interface Account {
   last_event_at: string | null;
 }
 
+// Per-worker AutoChat промт-конфиг (account_prompts).
+// Источник правды: docs/autochat.md → раздел "Per-worker промты".
+// Все 8 reply-полей пустые на момент генерации = блок автоответа.
+export interface WorkerPrompts {
+  account_id: number;
+  fabula: string;
+  bio: string;
+  style: string;
+  forbidden: string;
+  length_hint: string;
+  goals: string;
+  format_reply: string;
+  examples: string;
+  initial_system: string;
+  updated_at: string | null;
+}
+
 export interface DialogSummary {
   id: number;
   account_id: number;

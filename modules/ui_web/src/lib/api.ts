@@ -10,6 +10,7 @@ import type {
   Message,
   MessageEdit,
   Paginated,
+  WorkerPrompts,
 } from "@/types/api";
 
 // All requests are same-origin — the Vite dev server proxies to FastAPI.
@@ -262,6 +263,18 @@ export const api = {
     request<void>(`/workers/${accountId}/start`, { method: "POST" }),
   stopWorker: (accountId: number) =>
     request<void>(`/workers/${accountId}/stop`, { method: "POST" }),
+
+  // ── per-worker prompts (AutoChat) ───────────────────────────────────
+  // 8 структурированных полей для reply + одно initial_system. Если строки
+  // в БД ещё нет, GET отдаёт дефолты для forbidden/format_reply (overlay,
+  // не персистится автоматически). Все 8 reply-полей пустые на момент
+  // генерации = блок автоответа (см. session.py::_generate_and_enqueue).
+  getWorkerPrompts: (accountId: number) =>
+    request<WorkerPrompts>(`/accounts/${accountId}/prompts`),
+  saveWorkerPrompts: (accountId: number, body: Omit<WorkerPrompts, "account_id" | "updated_at">) =>
+    request<WorkerPrompts>(`/accounts/${accountId}/prompts`, {
+      method: "PUT", body: JSON.stringify(body),
+    }),
 
   // ── auth (добавление нового аккаунта) ───────────────────────────────
   // Возвращаемые поля — modules/auth/service.py: PHASE_CODE_SENT /

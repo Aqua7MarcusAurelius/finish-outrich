@@ -74,6 +74,9 @@ class EventType:
     AUTOCHAT_SEGMENT_SENT = "autochat.segment_sent"
     AUTOCHAT_SESSION_STOPPED = "autochat.session_stopped"
     AUTOCHAT_SESSION_ERROR = "autochat.session_error"
+    # Сгенерировать ответ нечем — у воркера пустой reply_system промт.
+    # Сессия не валится, ждёт пока пользователь заполнит промт в UI.
+    AUTOCHAT_GENERATION_SKIPPED = "autochat.generation_skipped"
 
     # Тайпинг собеседника — публикует враппер, слушает AutoChat
     DIALOG_TYPING_OBSERVED = "dialog.typing_observed"

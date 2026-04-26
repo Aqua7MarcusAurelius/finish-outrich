@@ -2,7 +2,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { StatusDot } from "@/components/common/StatusDot";
 import { cn } from "@/lib/utils";
-import { Play, Square, RefreshCw } from "lucide-react";
+import { Play, Square, RefreshCw, FileText } from "lucide-react";
 import type { Account } from "@/types/api";
 
 type Props = {
@@ -11,9 +11,10 @@ type Props = {
   onSelect: () => void;
   onStart?: () => void;
   onStop?: () => void;
+  onEditPrompt?: () => void;
 };
 
-export function AccountCard({ account, selected, onSelect, onStart, onStop }: Props) {
+export function AccountCard({ account, selected, onSelect, onStart, onStop, onEditPrompt }: Props) {
   const needsReauth = account.status === "session_expired";
   return (
     <Card
@@ -31,7 +32,15 @@ export function AccountCard({ account, selected, onSelect, onStart, onStop }: Pr
         <div className="mono text-xs text-muted-foreground">{account.phone}</div>
         <div className="mt-1 flex items-center justify-between">
           <span className="text-xs text-muted-foreground">{account.dialogs_count} диалогов</span>
-          <div className="flex gap-1">
+          <div className="flex flex-col items-end gap-1">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={(e) => { e.stopPropagation(); onEditPrompt?.(); }}
+              title="Редактор промта воркера"
+            >
+              <FileText className="h-3 w-3" /> Промт
+            </Button>
             {account.status === "running" ? (
               <Button size="sm" variant="outline" onClick={(e) => { e.stopPropagation(); onStop?.(); }}>
                 <Square className="h-3 w-3" /> Stop

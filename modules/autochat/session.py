@@ -32,6 +32,7 @@ from .generation import (
     build_conversation_context,
     parse_segments,
 )
+from .prompts import load_for_account, render_reply_system
 
 log = logging.getLogger(__name__)
 
@@ -511,6 +512,31 @@ class AutoChatSession:
             )
             return
 
+        # Гейт по per-worker промту: если все 8 reply-секций пустые —
+        # автоответ не генерируем. Сессия остаётся живой; следующий bump
+        # снова попробует, и как только оператор заполнит хоть одно поле
+        # в редакторе — ответы пойдут.
+        worker_prompts = await load_for_account(self.account_id)
+        if not worker_prompts.has_any_reply_field():
+            log.info(
+                "autochat session %s: skip generation, all reply prompt fields empty (account %s)",
+                self.id, self.account_id,
+            )
+            await bus.publish(
+                module=Module.AUTOCHAT,
+                type=EventType.AUTOCHAT_GENERATION_SKIPPED,
+                status=Status.ERROR,
+                account_id=self.account_id,
+                data={
+                    "session_id": self.id,
+                    "reason": "no_prompt",
+                    "message": "У воркера все поля reply-промта пустые — заполни хотя бы одно в редакторе.",
+                },
+            )
+            return
+
+        rendered_template = render_reply_system(worker_prompts)
+
         pool = db.get_pool()
         async with pool.acquire() as conn:
             messages = await build_conversation_context(
@@ -518,6 +544,7 @@ class AutoChatSession:
                 dialog_id=self.dialog_id,
                 system_prompt=self.system_prompt,
                 now=_now(),
+                prompt_override=rendered_template,
             )
 
         req_event = await bus.publish(

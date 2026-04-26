@@ -1,9 +1,12 @@
 """
 Сборка контекста для Opus 4.7 и парсинг сегментированного ответа.
 
-Промты НЕ захардкожены в коде — берутся из файлов `prompts/*.md`:
-  prompts/autochat_reply_system.md    — для ответов в активном диалоге
-  prompts/autochat_initial_system.md  — для первого сообщения
+ИСТОЧНИК ПРОМТОВ:
+  • основной — таблица `account_prompts` (per-worker, см. prompts.py).
+    Передаётся в build_*() через параметр `prompt_override`.
+  • fallback — файлы `prompts/autochat_*.md` (только если override пустой;
+    используется как последний рубеж для совместимости/тестов, не для
+    продакшна — пустой override блокируется ВЫЩЕ, в session.py / service.py).
 
 Файлы читаются при каждой генерации — правишь файл, следующий запрос
 использует новый текст без рестарта.
@@ -22,7 +25,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -101,124 +104,152 @@ def _render(template: str, values: dict[str, str]) -> str:
     return _PLACEHOLDER_RE.sub(_replace, template)
 
 
-def _has_placeholder(template: str, key: str) -> bool:
-    return f"{{{key}}}" in template
-
-
 # ─────────────────────────────────────────────────────────────────────
-# Форматирование истории и медиа
+# Форматирование истории — спека: docs/history_format_spec.md
 # ─────────────────────────────────────────────────────────────────────
 
-def _media_as_text(media_row: dict[str, Any]) -> str | None:
-    """Вложение → текстовая пометка для LLM. None если описать нечего."""
-    mtype = media_row.get("type") or ""
-    duration = media_row.get("duration")
-    transcription = (media_row.get("transcription") or "").strip()
-    description = (media_row.get("description") or "").strip()
-    t_status = media_row.get("transcription_status") or "none"
-    d_status = media_row.get("description_status") or "none"
+# Подписи блоков по типу media.type. Типы вне таблицы пропускаются.
+_MEDIA_LABELS: dict[str, str] = {
+    "voice":      "Voice",
+    "audio":      "Audio",
+    "video_note": "VideoNote",
+    "video":      "Video",
+    "photo":      "Photo",
+    "sticker":    "Sticker",
+    "gif":        "GIF",
+    "document":   "Document",
+}
 
-    def _fail_text(kind: str) -> str:
-        return f"[{kind}: не удалось распознать]"
+# День недели по datetime.weekday(): 0=Monday … 6=Sunday.
+_RU_WEEKDAYS = (
+    "Понедельник", "Вторник", "Среда", "Четверг",
+    "Пятница", "Суббота", "Воскресенье",
+)
 
-    if mtype in ("voice", "audio", "video_note") and mtype != "video":
-        if transcription:
-            head = "голос" if mtype in ("voice", "video_note") else "аудио"
-            dur = f" {duration}с" if duration else ""
-            return f"[{head}{dur}: «{transcription}»]"
-        if t_status == "failed":
-            return _fail_text("голос" if mtype in ("voice", "video_note") else "аудио")
-        if t_status == "pending":
-            return "[голос: расшифровывается…]"
-        return "[голос: пусто]"
 
-    if mtype == "video":
-        parts: list[str] = []
-        if description:
-            parts.append(f"«{description}»")
-        elif d_status == "failed":
-            return _fail_text("видео")
-        elif d_status == "pending":
-            parts.append("описание готовится…")
-        if transcription:
-            parts.append(f"звук: «{transcription}»")
-        elif t_status == "failed":
-            parts.append("звук: не удалось")
-        dur = f" {duration}с" if duration else ""
-        body = "; ".join(parts) if parts else "без описания"
-        return f"[видео{dur}: {body}]"
+def _value_or_failed(text: str | None, status: str | None) -> str | None:
+    """
+    Подполе вложения — что печатать.
 
-    if mtype in ("photo", "sticker", "gif"):
-        label = {"photo": "фото", "sticker": "стикер", "gif": "gif"}[mtype]
-        if description:
-            return f"[{label}: «{description}»]"
-        if d_status == "failed":
-            return _fail_text(label)
-        if d_status == "pending":
-            return f"[{label}: описывается…]"
-        return f"[{label}: без описания]"
-
-    if mtype == "document":
-        mime = media_row.get("mime_type") or "file"
-        if description:
-            return f"[документ {mime}: «{description}»]"
-        if d_status == "failed":
-            return _fail_text("документ")
-        return f"[документ {mime}]"
-
+    • Есть непустой текст → печатаем его.
+    • Нет текста, статус failed → "(failed)".
+    • Иначе → None (подполе вообще не печатается;
+      "pending" в истории не бывает, см. правило 5 спеки).
+    """
+    if text and text.strip():
+        return text.strip()
+    if status == "failed":
+        return "(failed)"
     return None
 
 
-def _format_message_body(
-    text: str | None,
-    media_rows: list[dict[str, Any]],
-) -> str:
-    """Одно сообщение (текст + media) → одна строка для LLM."""
-    parts: list[str] = []
-    clean_text = (text or "").strip()
-    if clean_text:
-        parts.append(clean_text)
+def _format_attachment_block(
+    media_row: dict[str, Any], label: str, index_in_type: int,
+) -> str | None:
+    """
+    Один блок вложения с подполями (с двухпробельным отступом).
+    None — если ни одно подполе не должно печататься
+    (см. правило 10 в спеке: пустое вложение пропускается целиком).
+    """
+    mtype = media_row.get("type") or ""
+    sub_lines: list[str] = []
+
+    # Description применима к: video, video_note, photo, sticker, gif, document.
+    if mtype in ("video", "video_note", "photo", "sticker", "gif", "document"):
+        d = _value_or_failed(
+            media_row.get("description"),
+            media_row.get("description_status"),
+        )
+        if d is not None:
+            sub_lines.append(f"  Description: {d}")
+
+    # Transcription применима к: voice, audio, video_note, video.
+    if mtype in ("voice", "audio", "video_note", "video"):
+        t = _value_or_failed(
+            media_row.get("transcription"),
+            media_row.get("transcription_status"),
+        )
+        if t is not None:
+            sub_lines.append(f"  Transcription: {t}")
+
+    if not sub_lines:
+        return None
+    return f"{label} {index_in_type}:\n" + "\n".join(sub_lines)
+
+
+def _format_message_block(turn: dict[str, Any]) -> str:
+    """
+    Один блок-сообщение по спеке. Многострочный, без хвостовой пустой строки —
+    разделители между блоками добавляет _format_history_text.
+    """
+    when = turn.get("date")
+    if isinstance(when, datetime):
+        # Все даты в БД — TIMESTAMPTZ, приходят tz-aware. Приводим к UTC.
+        n = when.astimezone(timezone.utc) if when.tzinfo else when
+        date_s = n.strftime("%d.%m.%Y")
+        time_s = n.strftime("%H:%M:%S")
+        weekday_s = _RU_WEEKDAYS[n.weekday()]
+    else:
+        date_s = "—"
+        time_s = "—"
+        weekday_s = "—"
+
+    author = "Ты" if turn.get("is_outgoing") else "Собеседник"
+
+    lines: list[str] = [
+        f"Author: {author}",
+        f"Date: {date_s}",
+        f"Weekday: {weekday_s}",
+        f"Time: {time_s}",
+    ]
+
+    text = (turn.get("text") or "").strip()
+    media_rows = turn.get("media") or []
+
+    # Считаем индексы внутри типа отдельно (правило 9): два фото и видео =
+    # Photo 1, Photo 2, Video 1. Незнакомые типы пропускаем.
+    type_counters: dict[str, int] = {}
+    attachment_blocks: list[str] = []
     for m in media_rows:
-        tag = _media_as_text(m)
-        if tag:
-            parts.append(tag)
-    if not parts:
-        return "[пустое сообщение]"
-    return "\n".join(parts)
+        label = _MEDIA_LABELS.get(m.get("type") or "")
+        if label is None:
+            continue
+        type_counters[label] = type_counters.get(label, 0) + 1
+        block = _format_attachment_block(m, label, type_counters[label])
+        if block is not None:
+            attachment_blocks.append(block)
+
+    if not text and not attachment_blocks:
+        # Правило: ни текста, ни usable вложений → Text: (empty), не пропускать.
+        lines.append("Text: (empty)")
+    else:
+        if text:
+            lines.append(f"Text: {text}")
+        lines.extend(attachment_blocks)
+
+    return "\n".join(lines)
 
 
 def _format_history_text(turns: list[dict[str, Any]]) -> str:
     """
-    Превратить историю в plaintext для подстановки в {conversation_history}.
-
-    Формат:
-        (2026-04-22 14:23) Ты: привет
-        (2026-04-22 14:24) Собеседник: привет, как дела?
-        (2026-04-22 14:25) Ты: норм, работаю
+    История целиком — блоки разделены одной пустой строкой.
     """
     if not turns:
         return "(история пустая — это начало разговора)"
-    lines: list[str] = []
-    for t in turns:
-        when = t["date"]
-        if isinstance(when, datetime):
-            stamp = when.strftime("%Y-%m-%d %H:%M")
-        else:
-            stamp = str(when)[:16]
-        who = "Ты" if t["is_outgoing"] else "Собеседник"
-        body = t["body"]
-        lines.append(f"({stamp}) {who}: {body}")
-    return "\n".join(lines)
+    return "\n\n".join(_format_message_block(t) for t in turns)
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Загрузка истории из БД (общая для обоих режимов)
+# Загрузка истории из БД
 # ─────────────────────────────────────────────────────────────────────
 
 async def _load_turns(conn: Any, dialog_id: int, limit: int) -> list[dict[str, Any]]:
     """
-    Тянем последние N non-deleted сообщений + их media, формируем
-    список {is_outgoing, date, body}. Хронологический порядок (старые→новые).
+    Тянем последние N non-deleted сообщений + их media. Возвращаем сырые
+    поля (text, media) — форматирование делает _format_message_block по
+    спеке docs/history_format_spec.md.
+
+    Хронологический порядок: старые → новые.
     """
     msg_rows = await conn.fetch(
         """
@@ -247,7 +278,8 @@ async def _load_turns(conn: Any, dialog_id: int, limit: int) -> list[dict[str, A
         turns.append({
             "is_outgoing": bool(r["is_outgoing"]),
             "date": r["date"],
-            "body": _format_message_body(r["text"], media_by_msg.get(r["id"], [])),
+            "text": r["text"],
+            "media": media_by_msg.get(r["id"], []),
         })
     return turns
 
@@ -263,57 +295,45 @@ async def build_conversation_context(
     system_prompt: str,
     now: datetime,
     max_messages: int = CONTEXT_MAX_MESSAGES,
+    prompt_override: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     Собрать messages для chat_completion.
 
-    Поведение зависит от файла prompts/autochat_reply_system.md:
-      • Если в нём есть `{conversation_history}` — история подставляется
-        текстом в system-промт, в messages идёт только [system, user:"..."]
-        с нейтральной просьбой ответить.
-      • Иначе — стандарт: [system, user, assistant, user, ...] через роли.
+    Источник шаблона:
+      • prompt_override (per-worker rendered template из prompts.py) если
+        задан и не пустой;
+      • иначе fallback из файла prompts/autochat_reply_system.md.
+
+    Историю всегда подставляем текстом в system-промт по плейсхолдеру
+    {conversation_history} в формате docs/history_format_spec.md.
+    Если в шаблоне нет этого плейсхолдера (legacy fallback) — история не
+    попадёт в промт; в нормальном потоке render_reply_system() всегда
+    добавляет секцию "# История переписки" с плейсхолдером.
+
+    Возвращаемые messages всегда: [system, user:"Ответь сейчас."].
     """
-    template = _read_prompt_file(REPLY_PROMPT_FILE, _REPLY_FALLBACK)
-    current_time = now.strftime("%Y-%m-%d %H:%M")
+    if prompt_override and prompt_override.strip():
+        template = prompt_override.strip() + "\n"
+    else:
+        template = _read_prompt_file(REPLY_PROMPT_FILE, _REPLY_FALLBACK)
+
+    # current_time — единый формат с историей (DD.MM.YYYY HH:MM:SS UTC).
+    n = now.astimezone(timezone.utc) if now.tzinfo else now
+    current_time = n.strftime("%d.%m.%Y %H:%M:%S")
 
     turns = await _load_turns(conn, dialog_id, max_messages)
+    history_text = _format_history_text(turns)
 
-    if _has_placeholder(template, "conversation_history"):
-        # Режим A: всё в system, роли не используем
-        history_text = _format_history_text(turns)
-        system_content = _render(template, {
-            "current_time": current_time,
-            "user_system_prompt": (system_prompt or "").strip(),
-            "conversation_history": history_text,
-        })
-        return [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": "Ответь сейчас."},
-        ]
-
-    # Режим B: роль-based history
     system_content = _render(template, {
         "current_time": current_time,
         "user_system_prompt": (system_prompt or "").strip(),
+        "conversation_history": history_text,
     })
-    out: list[dict[str, Any]] = [
+    return [
         {"role": "system", "content": system_content},
+        {"role": "user", "content": "Ответь сейчас."},
     ]
-    for t in turns:
-        role = "assistant" if t["is_outgoing"] else "user"
-        when = t["date"]
-        if isinstance(when, datetime):
-            stamp = when.strftime("%Y-%m-%d %H:%M")
-            # Timestamp в конце, с прозовым маркером — чтобы LLM не приняла
-            # его за часть формата сообщения и не скопировала в свой ответ.
-            content = f"{t['body']}\n(отправлено {stamp})"
-        else:
-            content = t["body"]
-        out.append({"role": role, "content": content})
-    if not turns:
-        # Диалога ещё нет — пусть LLM что-то скажет.
-        out.append({"role": "user", "content": "Поздоровайся или продолжи разговор."})
-    return out
 
 
 def build_initial_messages(
@@ -321,12 +341,21 @@ def build_initial_messages(
     system_prompt: str,
     initial_prompt: str,
     now: datetime,
+    prompt_override: str | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Messages для первого сообщения. Файл — prompts/autochat_initial_system.md.
-    Все три плейсхолдера: current_time, user_system_prompt, user_initial_prompt.
+    Messages для первого сообщения.
+
+    Источник шаблона:
+      • prompt_override (per-worker initial_system из БД) если задан;
+      • иначе fallback из файла prompts/autochat_initial_system.md.
+
+    Плейсхолдеры: current_time, user_system_prompt, user_initial_prompt.
     """
-    template = _read_prompt_file(INITIAL_PROMPT_FILE, _INITIAL_FALLBACK)
+    if prompt_override and prompt_override.strip():
+        template = _strip_comments(prompt_override).strip() + "\n"
+    else:
+        template = _read_prompt_file(INITIAL_PROMPT_FILE, _INITIAL_FALLBACK)
     system_content = _render(template, {
         "current_time": now.strftime("%Y-%m-%d %H:%M"),
         "user_system_prompt": (system_prompt or "").strip(),

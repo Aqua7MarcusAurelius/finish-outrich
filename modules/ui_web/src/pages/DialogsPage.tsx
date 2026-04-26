@@ -73,6 +73,7 @@ export function DialogsPage() {
                 onStop={() => api.stopWorker(a.id)
                   .then(() => { toast.success(`Воркер ${a.name || `#${a.id}`} остановлен`); accountsQ.refetch(); })
                   .catch((e) => { const d = describeApiError(e); toast.error(`Stop: ${d.title}`, d.detail); })}
+                onEditPrompt={() => navigate(`/workers/${a.id}/prompt`)}
               />
             ))}
             <NewAccountCard onClick={() => setNewAccOpen(true)} />

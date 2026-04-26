@@ -69,3 +69,9 @@ class SessionExpired(AutoChatError):
     code = "SESSION_EXPIRED"
     message = "Сессия Telegram протухла — нужна переавторизация"
     status_code = 410
+
+
+class PromptNotConfigured(AutoChatError):
+    code = "PROMPT_NOT_CONFIGURED"
+    message = "У воркера не задан initial_system промт — заполни его в редакторе на карточке аккаунта"
+    status_code = 409
