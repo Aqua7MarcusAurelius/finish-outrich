@@ -40,6 +40,9 @@ class EventType:
     MESSAGE_UPDATED = "message.updated"
     MESSAGE_REACTED = "message.reacted"
 
+    # ── Диалоги ──────────────────────────────────────────────────────
+    DIALOG_DELETED = "dialog.deleted"
+
     # ── Медиа ────────────────────────────────────────────────────────
     TRANSCRIPTION_STARTED = "transcription.started"
     TRANSCRIPTION_DONE = "transcription.done"

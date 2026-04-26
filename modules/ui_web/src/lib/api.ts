@@ -231,6 +231,12 @@ export const api = {
   getDialog: (dialogId: number) =>
     request<DialogProfile>(`/dialogs/${dialogId}`),
 
+  // Полное жёсткое удаление диалога: останавливается активная autochat-
+  // сессия (если есть), удаляются MinIO-файлы media, каскадом сносятся
+  // messages/media/reactions/edits. После — собеседник для системы новый.
+  deleteDialog: (dialogId: number) =>
+    request<void>(`/dialogs/${dialogId}`, { method: "DELETE" }),
+
   listMessages: async (dialogId: number, cursor?: string, limit = 50): Promise<Paginated<Message>> => {
     const raw = await request<{ messages: BackendMessage[]; next_cursor: string | null }>(
       `/dialogs/${dialogId}/messages${qs({ cursor, limit })}`,

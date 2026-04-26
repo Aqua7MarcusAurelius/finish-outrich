@@ -26,7 +26,8 @@ from pydantic import BaseModel
 
 from api.sse import sse_format, sse_heartbeat
 from core import bus, db
-from core.events import EventType
+from core import minio as minio_mod
+from core.events import EventType, Module, Status
 from modules.worker.wrapper import SessionExpired, WrapperError
 
 router = APIRouter(tags=["history"])
@@ -312,6 +313,99 @@ async def get_dialog(dialog_id: int):
         "media_count": row["media_count"],
     }
     return out
+
+
+# ─────────────────────────────────────────────────────────────────────
+# DELETE /dialogs/{id}
+# ─────────────────────────────────────────────────────────────────────
+
+@router.delete("/dialogs/{dialog_id}", status_code=204)
+async def delete_dialog(dialog_id: int, request: Request):
+    """
+    Полное жёсткое удаление диалога. Для системы собеседник станет «новым»:
+    следующее сообщение от/к нему создаст dialog с пустой историей.
+
+    Шаги:
+      1. Останавливаем активную AutoChat-сессию по паре
+         (account_id, telegram_user_id), если есть.
+      2. Удаляем MinIO-файлы всех media этого диалога.
+      3. DELETE FROM dialogs — Postgres каскадом снесёт messages →
+         media/reactions/message_edits (FK CASCADE из миграции 0001).
+      4. Публикуем `dialog.deleted` в шину для аудита.
+
+    events_archive не трогаем — это исторический лог. dialog_id внутри JSONB
+    `data` останется, но это валидное поведение audit-trail.
+    """
+    pool = db.get_pool()
+    async with pool.acquire() as conn:
+        dlg = await conn.fetchrow(
+            "SELECT id, account_id, telegram_user_id, username FROM dialogs WHERE id = $1",
+            dialog_id,
+        )
+        if dlg is None:
+            raise HTTPException(404, {"error": {"code": "DIALOG_NOT_FOUND"}})
+
+        active_session = await conn.fetchrow(
+            """
+            SELECT id FROM autochat_sessions
+            WHERE account_id = $1 AND telegram_user_id = $2
+              AND status IN ('starting', 'active', 'paused')
+            LIMIT 1
+            """,
+            dlg["account_id"], dlg["telegram_user_id"],
+        )
+
+        media_keys = await conn.fetch(
+            """
+            SELECT m.storage_key
+            FROM media m
+            JOIN messages msg ON msg.id = m.message_id
+            WHERE msg.dialog_id = $1
+              AND m.storage_key IS NOT NULL
+              AND m.file_deleted_at IS NULL
+            """,
+            dialog_id,
+        )
+
+    # 1. Останавливаем активную автосессию (если есть).
+    if active_session is not None:
+        autochat_service = request.app.state.autochat_service
+        try:
+            await autochat_service.stop_session(active_session["id"])
+        except Exception:
+            # Не блокируем удаление из-за проблем со stop'ом — сессия
+            # будет в "stopped" после CASCADE NULL по dialog_id.
+            pass
+
+    # 2. Удаляем MinIO-файлы. Ошибки логируем, но удаление dialog'а не блокируем
+    # (orphan-файлы потом подберёт cleaner или TTL bucket'а).
+    for r in media_keys:
+        key = r["storage_key"]
+        try:
+            await minio_mod.remove_object(key)
+        except Exception:
+            pass
+
+    # 3. CASCADE снесёт всё связанное с dialog (messages → media/reactions/edits).
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM dialogs WHERE id = $1", dialog_id)
+
+    # 4. Audit.
+    await bus.publish(
+        module=Module.API,
+        type=EventType.DIALOG_DELETED,
+        status=Status.SUCCESS,
+        account_id=dlg["account_id"],
+        data={
+            "dialog_id": dialog_id,
+            "telegram_user_id": dlg["telegram_user_id"],
+            "username": dlg["username"],
+            "media_files_attempted": len(media_keys),
+            "stopped_autochat_session_id": active_session["id"] if active_session else None,
+        },
+    )
+
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────

@@ -1,12 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { X } from "lucide-react";
 import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { AccountCard } from "@/components/dialogs/AccountCard";
 import { NewAccountCard } from "@/components/dialogs/NewAccountCard";
 import { NewAccountDialog } from "@/components/dialogs/NewAccountDialog";
 import { NewDialogButton } from "@/components/dialogs/NewDialogButton";
 import { NewDialogDialog } from "@/components/dialogs/NewDialogDialog";
+import { DeleteDialogConfirm } from "@/components/dialogs/DeleteDialogConfirm";
 import { DialogEventsWidget } from "@/components/dialogs/DialogEventsWidget";
 import { DialogListItem } from "@/components/dialogs/DialogListItem";
 import { MessageBubble } from "@/components/dialogs/MessageBubble";
@@ -35,6 +38,26 @@ export function DialogsPage() {
   const [search, setSearch] = useState("");
   const [newAccOpen, setNewAccOpen] = useState(false);
   const [newDlgOpen, setNewDlgOpen] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+
+  async function confirmDelete() {
+    if (dialogId == null) return;
+    setDeleteBusy(true);
+    try {
+      await api.deleteDialog(dialogId);
+      toast.success("Диалог удалён");
+      setDeleteOpen(false);
+      // Сбрасываем выбранный диалог и обновляем список диалогов аккаунта
+      dialogsQ.refetch();
+      navigate(`/dialogs/${accountId ?? ""}`);
+    } catch (e) {
+      const d = describeApiError(e);
+      toast.error(`Удаление: ${d.title}`, d.detail);
+    } finally {
+      setDeleteBusy(false);
+    }
+  }
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -99,6 +122,19 @@ export function DialogsPage() {
         }}
       />
 
+      <DeleteDialogConfirm
+        open={deleteOpen}
+        dialogTitle={
+          dialogQ.data
+            ? `${dialogQ.data.first_name || ""} ${dialogQ.data.last_name || ""}`.trim() ||
+              (dialogQ.data.username ? `@${dialogQ.data.username}` : `dialog #${dialogQ.data.id}`)
+            : ""
+        }
+        busy={deleteBusy}
+        onConfirm={confirmDelete}
+        onCancel={() => setDeleteOpen(false)}
+      />
+
       {/* ── Body: dialogs + messages ─────────────────────────────── */}
       <div className="flex min-h-0 flex-1">
         <aside className="flex w-[260px] shrink-0 flex-col border-r border-border">
@@ -135,7 +171,7 @@ export function DialogsPage() {
           <div className="flex w-[780px] shrink-0 flex-col border-r border-border">
             {/* Высота h-12 совпадает с шапкой "Поиск по диалогам" слева —
                нижняя линия бордера идёт сквозной без ступеньки. */}
-            <header className="flex h-12 shrink-0 items-center border-b border-border px-2">
+            <header className="flex h-12 shrink-0 items-center justify-between border-b border-border px-2">
               <div className="flex items-center gap-3">
                 {dialogQ.data ? (
                   <>
@@ -150,6 +186,17 @@ export function DialogsPage() {
                   <div className="text-xs text-muted-foreground">выберите диалог</div>
                 )}
               </div>
+              {dialogQ.data && (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => setDeleteOpen(true)}
+                  title="Удалить диалог (необратимо)"
+                  className="h-7 w-7 text-destructive hover:bg-destructive/10 hover:text-destructive"
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+              )}
             </header>
             {/* flex-col-reverse: backend отдаёт сообщения в DESC (новые первыми),
                в DOM они идут как пришли, но flex-col-reverse кладёт первый
