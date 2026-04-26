@@ -27,7 +27,10 @@ from core import redis as redis_mod
 from core.config import settings
 from modules.auth.routes import router as auth_router
 from modules.auth.service import AuthService
-from modules.autochat.routes import router as autochat_router
+from modules.autochat.routes import (
+    dialog_autochat_router,
+    router as autochat_router,
+)
 from modules.autochat.service import AutoChatService
 from modules.history.cleaner import Cleaner
 from modules.history.routes import router as history_router
@@ -193,3 +196,4 @@ app.include_router(accounts_router)
 app.include_router(history_router)
 app.include_router(media_router)
 app.include_router(autochat_router)
+app.include_router(dialog_autochat_router)

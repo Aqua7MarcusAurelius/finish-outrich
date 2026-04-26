@@ -75,3 +75,9 @@ class PromptNotConfigured(AutoChatError):
     code = "PROMPT_NOT_CONFIGURED"
     message = "У воркера не задан initial_system промт — заполни его в редакторе на карточке аккаунта"
     status_code = 409
+
+
+class DialogNotFound(AutoChatError):
+    code = "DIALOG_NOT_FOUND"
+    message = "Диалог не найден"
+    status_code = 404

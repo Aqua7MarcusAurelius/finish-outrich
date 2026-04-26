@@ -237,6 +237,24 @@ export const api = {
   deleteDialog: (dialogId: number) =>
     request<void>(`/dialogs/${dialogId}`, { method: "DELETE" }),
 
+  // Toggle автодиалога для существующего диалога. POST включает (без
+  // отправки initial — просто active-сессия ждёт входящих), DELETE гасит
+  // активную сессию. GET возвращает текущее состояние.
+  getDialogAutochat: (dialogId: number) =>
+    request<{ active: boolean; session_id: number | null; status: string | null }>(
+      `/dialogs/${dialogId}/autochat`,
+    ),
+  enableDialogAutochat: (dialogId: number) =>
+    request<{ session: { id: number; status: string; [k: string]: unknown } }>(
+      `/dialogs/${dialogId}/autochat`,
+      { method: "POST" },
+    ),
+  disableDialogAutochat: (dialogId: number) =>
+    request<{ session: { id: number; status: string; [k: string]: unknown } }>(
+      `/dialogs/${dialogId}/autochat`,
+      { method: "DELETE" },
+    ),
+
   listMessages: async (dialogId: number, cursor?: string, limit = 50): Promise<Paginated<Message>> => {
     const raw = await request<{ messages: BackendMessage[]; next_cursor: string | null }>(
       `/dialogs/${dialogId}/messages${qs({ cursor, limit })}`,

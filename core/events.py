@@ -80,6 +80,9 @@ class EventType:
     # Сгенерировать ответ нечем — у воркера пустой reply_system промт.
     # Сессия не валится, ждёт пока пользователь заполнит промт в UI.
     AUTOCHAT_GENERATION_SKIPPED = "autochat.generation_skipped"
+    # LLM решила что цели разговора достигнуты — поставила маркер
+    # <finishdialog/>. После отправки последнего сегмента сессия гасится.
+    AUTOCHAT_FINISHED_BY_LLM = "autochat.finished_by_llm"
 
     # Тайпинг собеседника — публикует враппер, слушает AutoChat
     DIALOG_TYPING_OBSERVED = "dialog.typing_observed"

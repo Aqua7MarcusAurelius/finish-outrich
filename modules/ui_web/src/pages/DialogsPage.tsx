@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { X } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
+import { X, Bot } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -40,6 +41,37 @@ export function DialogsPage() {
   const [newDlgOpen, setNewDlgOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteBusy, setDeleteBusy] = useState(false);
+  const [autochatBusy, setAutochatBusy] = useState(false);
+
+  // Polling статуса автодиалога каждые 5с — чтобы кнопка вживую отражала
+  // ситуацию (например, LLM сама поставила <finishdialog/> и сессия
+  // погасла). enabled только когда выбран диалог.
+  const autochatQ = useQuery({
+    queryKey: ["dialog-autochat", dialogId],
+    queryFn: () => api.getDialogAutochat(dialogId!),
+    enabled: dialogId != null,
+    refetchInterval: 5_000,
+  });
+
+  async function toggleAutochat() {
+    if (dialogId == null || autochatQ.data == null) return;
+    setAutochatBusy(true);
+    try {
+      if (autochatQ.data.active) {
+        await api.disableDialogAutochat(dialogId);
+        toast.success("Автодиалог выключен");
+      } else {
+        await api.enableDialogAutochat(dialogId);
+        toast.success("Автодиалог включён");
+      }
+      autochatQ.refetch();
+    } catch (e) {
+      const d = describeApiError(e);
+      toast.error(`Автодиалог: ${d.title}`, d.detail);
+    } finally {
+      setAutochatBusy(false);
+    }
+  }
 
   async function confirmDelete() {
     if (dialogId == null) return;
@@ -187,15 +219,39 @@ export function DialogsPage() {
                 )}
               </div>
               {dialogQ.data && (
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  onClick={() => setDeleteOpen(true)}
-                  title="Удалить диалог (необратимо)"
-                  className="h-7 w-7 text-destructive hover:bg-destructive/10 hover:text-destructive"
-                >
-                  <X className="h-4 w-4" />
-                </Button>
+                <div className="flex items-center gap-1">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={toggleAutochat}
+                    disabled={autochatBusy || autochatQ.isLoading}
+                    title={
+                      autochatQ.data?.active
+                        ? "Автодиалог запущен — клик чтобы выключить"
+                        : "Автодиалог выключен — клик чтобы включить (просто начнёт отвечать на новые входящие)"
+                    }
+                    className="h-7 gap-1.5 px-2 text-[11px]"
+                  >
+                    <span
+                      className={
+                        autochatQ.data?.active
+                          ? "h-1.5 w-1.5 rounded-full bg-status-success"
+                          : "h-1.5 w-1.5 rounded-full bg-muted-foreground"
+                      }
+                    />
+                    <Bot className="h-3 w-3" />
+                    Авто: {autochatQ.data?.active ? "ВКЛ" : "ВЫКЛ"}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => setDeleteOpen(true)}
+                    title="Удалить диалог (необратимо)"
+                    className="h-7 w-7 text-destructive hover:bg-destructive/10 hover:text-destructive"
+                  >
+                    <X className="h-4 w-4" />
+                  </Button>
+                </div>
               )}
             </header>
             {/* flex-col-reverse: backend отдаёт сообщения в DESC (новые первыми),

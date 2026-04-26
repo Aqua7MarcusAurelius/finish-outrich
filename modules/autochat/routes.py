@@ -89,3 +89,42 @@ async def autochat_stop(session_id: int, request: Request):
         return {"session": session}
     except AutoChatError as e:
         return _err(e)
+
+
+# ─── Toggle для существующего диалога ─────────────────────────────────
+# Эти endpoint'ы дёргают AutoChatService напрямую. Регистрируются на
+# отдельном роутере без префикса /autochat — чтобы UI обращался
+# по естественному RESTful URL: /dialogs/{id}/autochat.
+
+dialog_autochat_router = APIRouter(tags=["autochat"])
+
+
+@dialog_autochat_router.get("/dialogs/{dialog_id}/autochat")
+async def autochat_dialog_status(dialog_id: int, request: Request):
+    service = _service(request)
+    try:
+        return await service.status_for_dialog(dialog_id)
+    except AutoChatError as e:
+        return _err(e)
+
+
+@dialog_autochat_router.post("/dialogs/{dialog_id}/autochat")
+async def autochat_dialog_enable(dialog_id: int, request: Request):
+    """Включить автодиалог для существующего диалога — без отправки initial."""
+    service = _service(request)
+    try:
+        session = await service.enable_for_dialog(dialog_id)
+        return {"session": session}
+    except AutoChatError as e:
+        return _err(e)
+
+
+@dialog_autochat_router.delete("/dialogs/{dialog_id}/autochat")
+async def autochat_dialog_disable(dialog_id: int, request: Request):
+    """Выключить активную автодиалог-сессию для диалога."""
+    service = _service(request)
+    try:
+        session = await service.disable_for_dialog(dialog_id)
+        return {"session": session}
+    except AutoChatError as e:
+        return _err(e)

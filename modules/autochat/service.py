@@ -32,6 +32,7 @@ from modules.worker.wrapper import (
 
 from .errors import (
     CannotWrite,
+    DialogNotFound,
     GenerationFailed,
     PromptNotConfigured,
     SessionAlreadyActive,
@@ -146,7 +147,11 @@ class AutoChatService:
             data = dict(row)
             data["in_chat"] = False  # форсим сброс на рестарте
             try:
-                session = AutoChatSession(row=data, get_wrapper=self._get_wrapper)
+                session = AutoChatSession(
+                    row=data,
+                    get_wrapper=self._get_wrapper,
+                    on_finished_by_llm=self._on_session_finished_by_llm,
+                )
                 async with self._lock:
                     self._sessions_by_id[session.id] = session
                     self._by_tg_user[(session.account_id, session.telegram_user_id)] = session.id
@@ -457,6 +462,7 @@ class AutoChatService:
         session = AutoChatSession(
             row=dict(final_row),
             get_wrapper=self._get_wrapper,
+            on_finished_by_llm=self._on_session_finished_by_llm,
         )
         async with self._lock:
             self._sessions_by_id[session_id] = session
@@ -535,6 +541,166 @@ class AutoChatService:
         if row is None:
             raise SessionNotFound()
         return _row_to_dict(row)
+
+    # ─────────────────────────────────────────────────────────────────
+    # API: toggle для существующего диалога (без отправки initial)
+    # ─────────────────────────────────────────────────────────────────
+
+    async def status_for_dialog(self, dialog_id: int) -> dict[str, Any]:
+        """
+        Текущее состояние autochat по диалогу: есть ли активная сессия.
+        Возвращает {active, session_id, status}.
+        """
+        pool = db.get_pool()
+        async with pool.acquire() as conn:
+            dlg = await conn.fetchrow(
+                "SELECT account_id, telegram_user_id FROM dialogs WHERE id = $1",
+                dialog_id,
+            )
+            if dlg is None:
+                raise DialogNotFound()
+            row = await conn.fetchrow(
+                """
+                SELECT id, status FROM autochat_sessions
+                WHERE account_id = $1 AND telegram_user_id = $2
+                  AND status IN ('starting', 'active', 'paused')
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                dlg["account_id"], dlg["telegram_user_id"],
+            )
+        return {
+            "active": row is not None,
+            "session_id": row["id"] if row else None,
+            "status": row["status"] if row else None,
+        }
+
+    async def enable_for_dialog(self, dialog_id: int) -> dict[str, Any]:
+        """
+        Включить autochat для существующего диалога. В отличие от
+        `create_session`: НЕ ходит в LLM, НЕ отправляет первое сообщение,
+        не требует @username (берёт telegram_user_id напрямую из dialogs).
+
+        Сессия создаётся сразу со статусом active и просто ждёт входящих.
+        Если активная сессия уже есть → SessionAlreadyActive.
+        """
+        pool = db.get_pool()
+        async with pool.acquire() as conn:
+            dlg = await conn.fetchrow(
+                """
+                SELECT account_id, telegram_user_id, username
+                FROM dialogs WHERE id = $1
+                """,
+                dialog_id,
+            )
+        if dlg is None:
+            raise DialogNotFound()
+
+        account_id = int(dlg["account_id"])
+        telegram_user_id = int(dlg["telegram_user_id"])
+
+        wrapper = self._get_wrapper(account_id)
+        if wrapper is None:
+            raise WorkerNotRunning()
+
+        async with pool.acquire() as conn:
+            existing = await conn.fetchrow(
+                """
+                SELECT id FROM autochat_sessions
+                WHERE account_id = $1 AND telegram_user_id = $2
+                  AND status IN ('starting', 'active', 'paused')
+                LIMIT 1
+                """,
+                account_id, telegram_user_id,
+            )
+        if existing is not None:
+            raise SessionAlreadyActive()
+
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO autochat_sessions (
+                    account_id, dialog_id, telegram_user_id, target_username,
+                    system_prompt, initial_prompt, status,
+                    last_any_message_at
+                ) VALUES ($1, $2, $3, $4, '', '', 'active', NOW())
+                ON CONFLICT (account_id, telegram_user_id)
+                    WHERE status IN ('active','paused','starting')
+                    DO NOTHING
+                RETURNING *
+                """,
+                account_id, dialog_id, telegram_user_id, (dlg["username"] or ""),
+            )
+        if row is None:
+            # Гонка с другим вызовом create/enable
+            raise SessionAlreadyActive()
+
+        session = AutoChatSession(
+            row=dict(row),
+            get_wrapper=self._get_wrapper,
+            on_finished_by_llm=self._on_session_finished_by_llm,
+        )
+        async with self._lock:
+            self._sessions_by_id[session.id] = session
+            self._by_tg_user[(account_id, telegram_user_id)] = session.id
+            self._by_dialog[(account_id, dialog_id)] = session.id
+        await session.start()
+
+        await bus.publish(
+            module=Module.AUTOCHAT,
+            type=EventType.AUTOCHAT_STARTED,
+            status=Status.SUCCESS,
+            account_id=account_id,
+            data={
+                "session_id": session.id,
+                "dialog_id": dialog_id,
+                "telegram_user_id": telegram_user_id,
+                "resumed": True,  # отличаем от "+ Новый авто-диалог"
+            },
+        )
+
+        return _row_to_dict(row)
+
+    async def disable_for_dialog(self, dialog_id: int) -> dict[str, Any]:
+        """
+        Выключить autochat для диалога. Если активной сессии нет —
+        SessionNotFound.
+        """
+        pool = db.get_pool()
+        async with pool.acquire() as conn:
+            dlg = await conn.fetchrow(
+                "SELECT account_id, telegram_user_id FROM dialogs WHERE id = $1",
+                dialog_id,
+            )
+            if dlg is None:
+                raise DialogNotFound()
+            existing = await conn.fetchrow(
+                """
+                SELECT id FROM autochat_sessions
+                WHERE account_id = $1 AND telegram_user_id = $2
+                  AND status IN ('starting', 'active', 'paused')
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                dlg["account_id"], dlg["telegram_user_id"],
+            )
+        if existing is None:
+            raise SessionNotFound()
+        return await self.stop_session(existing["id"])
+
+    async def _on_session_finished_by_llm(self, session_id: int) -> None:
+        """
+        Callback от AutoChatSession когда LLM поставила <finishdialog/>
+        и последний сегмент уже отправлен. Стопит сессию через стандартный
+        flow stop_session — индексы чистятся, БД обновляется, событие
+        autochat.session_stopped публикуется.
+        """
+        try:
+            await self.stop_session(session_id)
+        except Exception:
+            log.exception(
+                "autochat: finish-by-llm handler failed for session %s", session_id,
+            )
 
     # ─────────────────────────────────────────────────────────────────
     # Вспомогательные запросы

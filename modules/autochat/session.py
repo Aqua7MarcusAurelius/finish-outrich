@@ -30,6 +30,7 @@ from core.openrouter import OpenRouterError, chat_completion
 from .errors import SessionExpired as AutoSessionExpired
 from .generation import (
     build_conversation_context,
+    extract_finish_marker,
     parse_segments,
 )
 from .prompts import load_for_account, render_reply_system
@@ -97,6 +98,7 @@ class AutoChatSession:
         *,
         row: dict[str, Any],
         get_wrapper: Callable[[int], Any],
+        on_finished_by_llm: Callable[[int], Any] | None = None,
     ):
         # Основные поля из БД
         self.id: int = row["id"]
@@ -107,6 +109,10 @@ class AutoChatSession:
         self.system_prompt: str = row["system_prompt"]
 
         self._get_wrapper = get_wrapper
+        # Callback в AutoChatService — вызывается когда LLM поставила
+        # <finishdialog/> и последний сегмент уже отправлен. Сервис
+        # делает stop_session и чистит свои индексы.
+        self._on_finished_by_llm = on_finished_by_llm
 
         # Текущее состояние (синхронизируется с БД на ключевых точках)
         self.in_chat: bool = bool(row.get("in_chat", False))
@@ -562,9 +568,14 @@ class AutoChatSession:
         retries = await _get_setting_int("autochat.openrouter_retries")
         response = await _call_llm_with_retries(messages, retries=retries)
 
-        segments = parse_segments(response)
+        # <finishdialog/> вырезаем ДО parse_segments — иначе маркер
+        # может попасть в конец последнего <msg> или сесть отдельным
+        # сегментом и улететь в Telegram.
+        response_clean, finish_requested = extract_finish_marker(response)
+        segments = parse_segments(response_clean)
         log.info(
-            "autochat session %s: LLM answered %d segments", self.id, len(segments),
+            "autochat session %s: LLM answered %d segments (finish=%s)",
+            self.id, len(segments), finish_requested,
         )
 
         await bus.publish(
@@ -576,12 +587,28 @@ class AutoChatSession:
             data={
                 "session_id": self.id,
                 "segments_count": len(segments),
+                "finish_requested": finish_requested,
             },
         )
 
         total = len(segments)
         for i, seg in enumerate(segments, 1):
-            await self._send_queue.put({"index": i, "total": total, "text": seg, "parent_id": parent_id})
+            item = {"index": i, "total": total, "text": seg, "parent_id": parent_id}
+            # Финиш триггерим после отправки ПОСЛЕДНЕГО сегмента — чтобы
+            # прощальный реплай уехал, а потом сессия погасла.
+            if finish_requested and i == total:
+                item["finish_after"] = True
+            await self._send_queue.put(item)
+
+        # Edge: LLM прислала только маркер без сегментов. Гасим сразу.
+        if finish_requested and total == 0:
+            log.info(
+                "autochat session %s: finish requested but no segments — stopping immediately",
+                self.id,
+            )
+            await self._publish_finished_by_llm(parent_id)
+            if self._on_finished_by_llm is not None:
+                asyncio.create_task(self._on_finished_by_llm(self.id))
 
     # ─────────────────────────────────────────────────────────────────
     # sender_loop — отправка сегментов с имитацией печати
@@ -699,6 +726,15 @@ class AutoChatSession:
         if index < total:
             await asyncio.sleep(random.uniform(1.0, 3.0))
 
+        # Финиш по сигналу LLM — после отправки последнего сегмента.
+        # Делаем в фоновой таске, чтобы sender_loop успел вернуться из
+        # _send_segment до того как service.stop_session начнёт его
+        # отменять (иначе будет ждать самого себя).
+        if item.get("finish_after"):
+            await self._publish_finished_by_llm(parent_id)
+            if self._on_finished_by_llm is not None:
+                asyncio.create_task(self._on_finished_by_llm(self.id))
+
     # ─────────────────────────────────────────────────────────────────
     # Сервисные запросы к БД
     # ─────────────────────────────────────────────────────────────────
@@ -746,6 +782,24 @@ class AutoChatSession:
         except Exception:
             log.debug(
                 "autochat session %s: mark_read failed (non-fatal)", self.id,
+            )
+
+    # ─── Финиш по сигналу LLM ────────────────────────────────────────
+
+    async def _publish_finished_by_llm(self, parent_id: str | None) -> None:
+        """Публикует событие autochat.finished_by_llm. Сам stop делает callback."""
+        try:
+            await bus.publish(
+                module=Module.AUTOCHAT,
+                type=EventType.AUTOCHAT_FINISHED_BY_LLM,
+                status=Status.SUCCESS,
+                parent_id=parent_id,
+                account_id=self.account_id,
+                data={"session_id": self.id},
+            )
+        except Exception:
+            log.exception(
+                "autochat session %s: publish finished_by_llm failed", self.id,
             )
 
     # ─── Фатальные ошибки ────────────────────────────────────────────

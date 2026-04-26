@@ -375,6 +375,27 @@ def build_initial_messages(
 
 _MSG_TAG_RE = re.compile(r"<msg>(.*?)</msg>", re.DOTALL | re.IGNORECASE)
 
+# Маркер завершения диалога. LLM ставит его когда поняла что все цели
+# разговора достигнуты. Принимаем варианты `<finishdialog/>`,
+# `<finishdialog>`, `< finishdialog />` (на случай если модель добавит
+# пробелы). Регистр игнорируется.
+_FINISH_MARKER_RE = re.compile(r"<\s*finishdialog\s*/?\s*>", re.IGNORECASE)
+
+
+def extract_finish_marker(response: str) -> tuple[str, bool]:
+    """
+    Ищет маркер <finishdialog/> в ответе LLM.
+
+    Возвращает (text_без_маркера, found). Все вхождения маркера
+    вырезаются — он чисто служебный и не должен попасть ни в один
+    отправляемый сегмент.
+    """
+    if not response:
+        return response or "", False
+    found = bool(_FINISH_MARKER_RE.search(response))
+    cleaned = _FINISH_MARKER_RE.sub("", response)
+    return cleaned, found
+
 
 def parse_segments(response: str) -> list[str]:
     """
