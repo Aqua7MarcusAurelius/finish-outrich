@@ -338,8 +338,6 @@ async def build_conversation_context(
 
 def build_initial_messages(
     *,
-    system_prompt: str,
-    initial_prompt: str,
     now: datetime,
     prompt_override: str | None = None,
 ) -> list[dict[str, Any]]:
@@ -350,16 +348,20 @@ def build_initial_messages(
       • prompt_override (per-worker initial_system из БД) если задан;
       • иначе fallback из файла prompts/autochat_initial_system.md.
 
-    Плейсхолдеры: current_time, user_system_prompt, user_initial_prompt.
+    Активный плейсхолдер: {current_time} (DD.MM.YYYY HH:MM:SS UTC).
+    Устаревшие {user_system_prompt} и {user_initial_prompt} (если оператор
+    их зачем-то оставил в шаблоне) тихо подставляются пустой строкой —
+    per-session inputs убраны вместе с упрощением "+ Новый авто-диалог".
     """
     if prompt_override and prompt_override.strip():
         template = _strip_comments(prompt_override).strip() + "\n"
     else:
         template = _read_prompt_file(INITIAL_PROMPT_FILE, _INITIAL_FALLBACK)
+    n = now.astimezone(timezone.utc) if now.tzinfo else now
     system_content = _render(template, {
-        "current_time": now.strftime("%Y-%m-%d %H:%M"),
-        "user_system_prompt": (system_prompt or "").strip(),
-        "user_initial_prompt": (initial_prompt or "").strip() or "Напиши дружелюбное первое сообщение.",
+        "current_time": n.strftime("%d.%m.%Y %H:%M:%S"),
+        "user_system_prompt": "",
+        "user_initial_prompt": "",
     })
     return [
         {"role": "system", "content": system_content},

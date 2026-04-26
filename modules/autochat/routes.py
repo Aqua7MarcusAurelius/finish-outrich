@@ -36,25 +36,24 @@ def _err(e: AutoChatError) -> JSONResponse:
 class StartIn(BaseModel):
     account_id: int
     username: str = Field(min_length=1, max_length=64)
-    # Может быть пустым — если персонаж уже описан в
-    # prompts/autochat_*_system.md. В этом случае поле используется
-    # как "заметка оператора под сессию" и просто подставляется
-    # в плейсхолдер {user_system_prompt}.
-    system_prompt: str = Field(default="", max_length=20000)
-    initial_prompt: str = Field(min_length=1, max_length=10000)
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────
 
 @router.post("/start")
 async def autochat_start(payload: StartIn, request: Request):
+    """
+    Запускает авто-диалог. Никаких per-session промтов / задач для первого
+    сообщения — всё берётся из per-worker `account_prompts.initial_system`
+    (см. modules/autochat/prompts.py + страница /workers/{id}/prompt).
+
+    Body: {account_id, username}.
+    """
     service = _service(request)
     try:
         session = await service.create_session(
             account_id=payload.account_id,
             username=payload.username,
-            system_prompt=payload.system_prompt,
-            initial_prompt=payload.initial_prompt,
         )
         return {"session": session}
     except AutoChatError as e:

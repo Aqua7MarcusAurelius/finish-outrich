@@ -283,20 +283,21 @@ class AutoChatService:
         *,
         account_id: int,
         username: str,
-        system_prompt: str,
-        initial_prompt: str,
     ) -> dict[str, Any]:
         """
         Синхронный флоу:
           1) проверка воркера;
-          2) resolve @username → telegram_user_id;
-          3) проверка "нет активной сессии на пару";
-          4) LLM: initial сообщение;
-          5) INSERT сессии (starting);
-          6) wrapper.send_message + publish message.received;
-          7) UPDATE status=active, regist indexes, session.start();
-          8) publish autochat.started + autochat.initial_sent;
-          9) возврат row.
+          2) гейт по per-worker initial_system промту;
+          3) resolve @username → telegram_user_id;
+          4) проверка "нет активной сессии на пару";
+          5) LLM: initial сообщение (используется per-worker initial_system);
+          6) INSERT сессии (starting);
+          7) wrapper.send_message + publish message.received;
+          8) UPDATE status=active, regist indexes, session.start();
+          9) publish autochat.started + autochat.initial_sent;
+         10) возврат row.
+
+        Никаких per-session промтов / задач — всё из account_prompts.
         """
         wrapper = self._get_wrapper(account_id)
         if wrapper is None:
@@ -341,8 +342,6 @@ class AutoChatService:
 
         # LLM: initial. Шаблон — per-worker initial_system из БД (см. гейт выше).
         initial_messages = build_initial_messages(
-            system_prompt=system_prompt,
-            initial_prompt=initial_prompt,
             now=_now(),
             prompt_override=worker_prompts.initial_system,
         )
@@ -356,7 +355,9 @@ class AutoChatService:
         if not initial_text:
             raise GenerationFailed("LLM вернул пустое первое сообщение")
 
-        # INSERT сессии (starting — на случай если send провалится)
+        # INSERT сессии (starting — на случай если send провалится).
+        # system_prompt/initial_prompt колонки оставлены в схеме как NOT NULL,
+        # пишем пустые строки — per-session inputs убраны после 9.x.
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
@@ -364,14 +365,13 @@ class AutoChatService:
                     account_id, telegram_user_id, target_username,
                     system_prompt, initial_prompt, initial_sent_text,
                     status
-                ) VALUES ($1, $2, $3, $4, $5, $6, 'starting')
+                ) VALUES ($1, $2, $3, '', '', $4, 'starting')
                 ON CONFLICT (account_id, telegram_user_id)
                     WHERE status IN ('active','paused','starting')
                     DO NOTHING
                 RETURNING *
                 """,
-                account_id, telegram_user_id, cleaned_username,
-                system_prompt, initial_prompt, initial_text,
+                account_id, telegram_user_id, cleaned_username, initial_text,
             )
         if row is None:
             # Гонка — другой запрос успел вставить такую же пару первым

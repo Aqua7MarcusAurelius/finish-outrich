@@ -311,17 +311,13 @@ export const api = {
 
   // ── autochat (создание авто-диалога) ────────────────────────────────
   // POST /autochat/start запускает сессию: резолвит @username, генерирует
-  // первое сообщение по initial_prompt (через Opus 4.7 в OpenRouter),
-  // отправляет его и дальше ведёт переписку. Детали — docs/autochat.md.
-  autochatStart: (body: {
-    account_id: number;
-    username: string;
-    initial_prompt: string;
-    system_prompt?: string;
-  }) =>
+  // первое сообщение по per-worker initial_system из account_prompts
+  // (через Opus 4.7 в OpenRouter), отправляет его и дальше ведёт
+  // переписку. Per-session inputs убраны — body = {account_id, username}.
+  autochatStart: (body: { account_id: number; username: string }) =>
     request<{ session: { id: number; status: string; dialog_id: number | null; [k: string]: unknown } }>(
       "/autochat/start",
-      { method: "POST", body: JSON.stringify({ system_prompt: "", ...body }) },
+      { method: "POST", body: JSON.stringify(body) },
     ),
 
   // ── events ──────────────────────────────────────────────────────────
