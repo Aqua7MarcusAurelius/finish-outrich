@@ -276,6 +276,21 @@ export const api = {
       method: "PUT", body: JSON.stringify(body),
     }),
 
+  // Превью того, что уйдёт в chat_completion. LLM НЕ вызывается, токены не
+  // тратятся. Принимает текущие значения полей (можно несохранённые) +
+  // опц. dialog_id (источник истории) + опц. user_system_prompt (заметка
+  // про собеседника). Без dialog_id — placeholder вместо истории.
+  previewWorkerPrompts: (accountId: number, body: {
+    fabula: string; bio: string; style: string; forbidden: string;
+    length_hint: string; goals: string; format_reply: string; examples: string;
+    dialog_id?: number | null;
+    user_system_prompt?: string;
+  }) =>
+    request<{ system: string; user: string; dialog_id: number | null }>(
+      `/accounts/${accountId}/prompts/preview`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+
   // ── auth (добавление нового аккаунта) ───────────────────────────────
   // Возвращаемые поля — modules/auth/service.py: PHASE_CODE_SENT /
   // PHASE_2FA_REQUIRED / PHASE_DONE. `done` несёт account_id.

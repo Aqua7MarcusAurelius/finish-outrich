@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useParams, Link } from "react-router-dom";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, Eye } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { ErrorBox } from "@/components/common/ErrorBox";
+import { PromptPreviewDialog } from "@/components/dialogs/PromptPreviewDialog";
 import { api, describeApiError } from "@/lib/api";
 import { useToast } from "@/lib/toast";
 import { useAccounts } from "@/hooks/useAccounts";
@@ -69,6 +70,7 @@ export function WorkerPromptPage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [previewOpen, setPreviewOpen] = useState(false);
 
   useEffect(() => {
     if (accountId == null) return;
@@ -204,6 +206,10 @@ export function WorkerPromptPage() {
       {/* Sticky футер */}
       {!loading && !loadError && (
         <div className="flex h-14 shrink-0 items-center justify-end gap-2 border-t border-border px-4">
+          <Button variant="outline" size="sm" onClick={() => setPreviewOpen(true)} disabled={saving} title="Превью того, что уйдёт в LLM (без вызова модели)">
+            <Eye className="h-3 w-3" /> Что уйдёт в LLM
+          </Button>
+          <div className="flex-1" />
           <Button variant="ghost" size="sm" onClick={() => navigate(`/dialogs/${accountId}`)} disabled={saving}>
             Отмена
           </Button>
@@ -211,6 +217,24 @@ export function WorkerPromptPage() {
             {saving ? "Сохраняем…" : "Сохранить"}
           </Button>
         </div>
+      )}
+
+      {accountId != null && (
+        <PromptPreviewDialog
+          open={previewOpen}
+          accountId={accountId}
+          form={{
+            fabula: form.fabula,
+            bio: form.bio,
+            style: form.style,
+            forbidden: form.forbidden,
+            length_hint: form.length_hint,
+            goals: form.goals,
+            format_reply: form.format_reply,
+            examples: form.examples,
+          }}
+          onClose={() => setPreviewOpen(false)}
+        />
       )}
     </div>
   );
