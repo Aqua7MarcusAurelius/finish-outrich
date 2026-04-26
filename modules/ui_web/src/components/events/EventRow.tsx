@@ -1,7 +1,7 @@
 import { cn } from "@/lib/utils";
 import { ModulePill } from "@/components/common/ModulePill";
 import { StatusDot } from "@/components/common/StatusDot";
-import type { BusEvent } from "@/types/api";
+import type { BusEvent, EventFilters } from "@/types/api";
 
 function fmt(iso: string) {
   const d = new Date(iso);
@@ -17,7 +17,7 @@ type Props = {
   ev: BusEvent;
   isNew?: boolean;
   onOpen?: (id: string) => void;
-  onQuickFilter?: (patch: { account?: number; module?: string; type?: string; status?: string }) => void;
+  onQuickFilter?: (patch: Partial<EventFilters>) => void;
 };
 
 // Column layout:

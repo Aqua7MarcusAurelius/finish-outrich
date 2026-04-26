@@ -20,3 +20,10 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Node / TypeScript build artefacts
+node_modules/
+*.tsbuildinfo
+modules/ui_web/dist/
+modules/ui_web/vite.config.d.ts
+modules/ui_web/vite.config.js

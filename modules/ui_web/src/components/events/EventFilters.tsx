@@ -4,8 +4,11 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import type { EventFilters } from "@/types/api";
 import { X } from "lucide-react";
 
+// Не все модули из BusModule имеют смысл в фильтре — выбираем те что
+// реально публикуют события которые оператор хочет фильтровать.
 const MODULES: (EventFilters["module"])[] = [
-  "telegram", "history", "transcription", "description", "auth", "worker_manager", "autochat",
+  "wrapper", "history", "history_sync", "transcription", "description",
+  "auth", "worker_manager", "autochat", "api", "cleaner",
 ];
 
 const STATUSES: (EventFilters["status"])[] = ["success", "error", "in_progress"];
