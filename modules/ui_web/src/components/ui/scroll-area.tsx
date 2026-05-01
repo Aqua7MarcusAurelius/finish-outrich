@@ -2,21 +2,35 @@ import * as React from "react";
 import * as ScrollAreaPrimitive from "@radix-ui/react-scroll-area";
 import { cn } from "@/lib/utils";
 
+type Orientation = "vertical" | "horizontal" | "both";
+
+type ScrollAreaProps =
+  React.ComponentPropsWithoutRef<typeof ScrollAreaPrimitive.Root> & {
+    /**
+     * Какие scrollbar'ы рендерить. По умолчанию `"vertical"` —
+     * совпадает с поведением до 9.7. Для горизонтальных рядов
+     * (например ряд аккаунтов) — `"horizontal"` или `"both"`.
+     */
+    orientation?: Orientation;
+  };
+
 export const ScrollArea = React.forwardRef<
   React.ElementRef<typeof ScrollAreaPrimitive.Root>,
-  React.ComponentPropsWithoutRef<typeof ScrollAreaPrimitive.Root>
->(({ className, children, ...props }, ref) => (
-  <ScrollAreaPrimitive.Root ref={ref} className={cn("relative overflow-hidden", className)} {...props}>
-    <ScrollAreaPrimitive.Viewport className="h-full w-full rounded-[inherit]">
-      {children}
-    </ScrollAreaPrimitive.Viewport>
-    {/* Радикс показывает scrollbar только когда реально есть overflow,
-       так что рендерить оба axes по умолчанию безопасно. */}
-    <ScrollBar orientation="vertical" />
-    <ScrollBar orientation="horizontal" />
-    <ScrollAreaPrimitive.Corner />
-  </ScrollAreaPrimitive.Root>
-));
+  ScrollAreaProps
+>(({ className, orientation = "vertical", children, ...props }, ref) => {
+  const showVertical = orientation === "vertical" || orientation === "both";
+  const showHorizontal = orientation === "horizontal" || orientation === "both";
+  return (
+    <ScrollAreaPrimitive.Root ref={ref} className={cn("relative overflow-hidden", className)} {...props}>
+      <ScrollAreaPrimitive.Viewport className="h-full w-full rounded-[inherit]">
+        {children}
+      </ScrollAreaPrimitive.Viewport>
+      {showVertical && <ScrollBar orientation="vertical" />}
+      {showHorizontal && <ScrollBar orientation="horizontal" />}
+      <ScrollAreaPrimitive.Corner />
+    </ScrollAreaPrimitive.Root>
+  );
+});
 ScrollArea.displayName = "ScrollArea";
 
 export const ScrollBar = React.forwardRef<

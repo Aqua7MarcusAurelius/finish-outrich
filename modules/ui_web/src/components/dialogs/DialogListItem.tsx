@@ -130,15 +130,13 @@ export function DialogListItem({
           <button
             type="button"
             onClick={(e) => e.stopPropagation()}
-            title="Статус оператора (только для удобства)"
+            title={`Статус: ${opt.label}`}
             className={cn(
-              "flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium hairline border-border/60",
+              "flex shrink-0 items-center gap-0.5 rounded-full p-1 hairline border-border/60",
               "hover:bg-background",
-              effective === null ? "text-muted-foreground" : "text-foreground",
             )}
           >
-            <span className={cn("h-1.5 w-1.5 rounded-full", opt.dotClass)} />
-            <span>{opt.label}</span>
+            <span className={cn("h-2 w-2 rounded-full", opt.dotClass)} />
             <ChevronDown className="h-3 w-3 opacity-60" />
           </button>
         </DropdownMenuTrigger>

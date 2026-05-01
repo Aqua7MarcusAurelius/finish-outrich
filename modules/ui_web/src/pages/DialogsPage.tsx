@@ -115,7 +115,7 @@ export function DialogsPage() {
          когда воркеров много. */}
       <div className="flex items-stretch border-b border-border">
         <div className="min-w-0 flex-1">
-          <ScrollArea className="w-full">
+          <ScrollArea className="w-full" orientation="horizontal">
             <div className="flex gap-2 p-2 pb-3">
               {accountsQ.isError && (
                 <ErrorBox title="Не удалось загрузить аккаунты" detail={String(accountsQ.error)} />
