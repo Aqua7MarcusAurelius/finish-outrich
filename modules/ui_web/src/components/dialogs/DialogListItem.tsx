@@ -94,13 +94,13 @@ export function DialogListItem({
   return (
     <div
       className={cn(
-        "flex w-full items-start gap-2 px-2 py-2 hairline border-transparent border-b border-b-border/50",
+        "relative w-full hairline border-transparent border-b border-b-border/50",
         selected ? "bg-accent" : "hover:bg-accent/60",
       )}
     >
       <button
         onClick={onSelect}
-        className="flex flex-1 min-w-0 items-start gap-2 text-left"
+        className="flex w-full items-start gap-2 px-2 py-2 pr-10 text-left"
       >
         <div
           className={cn(
@@ -125,46 +125,51 @@ export function DialogListItem({
         </div>
       </button>
 
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <button
-            type="button"
-            onClick={(e) => e.stopPropagation()}
-            title={`Статус: ${opt.label}`}
-            className={cn(
-              "flex shrink-0 items-center gap-0.5 rounded-full p-1 hairline border-border/60",
-              "hover:bg-background",
-            )}
-          >
-            <span className={cn("h-2 w-2 rounded-full", opt.dotClass)} />
-            <ChevronDown className="h-3 w-3 opacity-60" />
-          </button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="min-w-[160px]">
-          <DropdownMenuLabel>Статус диалога</DropdownMenuLabel>
-          <DropdownMenuSeparator />
-          {STATUS_OPTIONS.map((o) => (
-            <DropdownMenuItem
-              key={o.label}
-              onSelect={() => setStatus(o.value)}
-              className="gap-2"
+      {/* Pill в правом верхнем углу строки. Абсолютным позиционированием —
+         чтобы flex-математика длинной истории/имени не вытесняла её за
+         край 320px-aside и не плодила горизонтальный скролл. */}
+      <div className="absolute right-1.5 top-1.5">
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              onClick={(e) => e.stopPropagation()}
+              title={`Статус: ${opt.label}`}
+              className={cn(
+                "flex items-center gap-0.5 rounded-full bg-background/80 p-1 hairline border-border/60",
+                "hover:bg-background",
+              )}
             >
-              <span className={cn("h-2 w-2 rounded-full", o.dotClass)} />
-              <span className="flex-1">{o.label}</span>
-              {effective === o.value && <Check className="h-3 w-3" />}
+              <span className={cn("h-2 w-2 rounded-full", opt.dotClass)} />
+              <ChevronDown className="h-3 w-3 opacity-60" />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="min-w-[160px]">
+            <DropdownMenuLabel>Статус диалога</DropdownMenuLabel>
+            <DropdownMenuSeparator />
+            {STATUS_OPTIONS.map((o) => (
+              <DropdownMenuItem
+                key={o.label}
+                onSelect={() => setStatus(o.value)}
+                className="gap-2"
+              >
+                <span className={cn("h-2 w-2 rounded-full", o.dotClass)} />
+                <span className="flex-1">{o.label}</span>
+                {effective === o.value && <Check className="h-3 w-3" />}
+              </DropdownMenuItem>
+            ))}
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              onSelect={() => setStatus(null)}
+              className="gap-2 text-muted-foreground"
+            >
+              <span className={cn("h-2 w-2 rounded-full", NO_STATUS.dotClass)} />
+              <span className="flex-1">{NO_STATUS.label}</span>
+              {effective === null && <Check className="h-3 w-3" />}
             </DropdownMenuItem>
-          ))}
-          <DropdownMenuSeparator />
-          <DropdownMenuItem
-            onSelect={() => setStatus(null)}
-            className="gap-2 text-muted-foreground"
-          >
-            <span className={cn("h-2 w-2 rounded-full", NO_STATUS.dotClass)} />
-            <span className="flex-1">{NO_STATUS.label}</span>
-            {effective === null && <Check className="h-3 w-3" />}
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
     </div>
   );
 }
