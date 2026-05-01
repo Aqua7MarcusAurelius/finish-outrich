@@ -61,6 +61,9 @@ def _dialog_to_dict(row: Any) -> dict[str, Any]:
         "contact_first_name": row["contact_first_name"],
         "contact_last_name": row["contact_last_name"],
         "is_bot": row["is_bot"],
+        # Чисто визуальный статус оператора (UI-only). Допустимые значения
+        # определены на фронте: talking/waiting/done/failed. None = «без статуса».
+        "user_status": row["user_status"] if "user_status" in row.keys() else None,
         "created_at": _iso(row["created_at"]),
         "updated_at": _iso(row["updated_at"]),
     }
@@ -406,6 +409,42 @@ async def delete_dialog(dialog_id: int, request: Request):
     )
 
     return None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# PATCH /dialogs/{id}/status — пометка оператора (UI-only)
+# ─────────────────────────────────────────────────────────────────────
+
+class DialogStatusBody(BaseModel):
+    # None = «снять статус». На фронте допустимы 4 значения, но бэк
+    # принимает любую короткую строку — это операторская заметка,
+    # никакой логикой не используется.
+    status: Optional[str] = None
+
+
+@router.patch("/dialogs/{dialog_id}/status")
+async def patch_dialog_user_status(dialog_id: int, body: DialogStatusBody):
+    value = body.status
+    if value is not None:
+        value = value.strip()
+        if not value:
+            value = None
+        elif len(value) > 32:
+            raise HTTPException(400, {"error": {"code": "STATUS_TOO_LONG"}})
+
+    pool = db.get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE dialogs SET user_status = $2, updated_at = NOW()
+            WHERE id = $1
+            RETURNING id, user_status
+            """,
+            dialog_id, value,
+        )
+    if row is None:
+        raise HTTPException(404, {"error": {"code": "DIALOG_NOT_FOUND"}})
+    return {"id": row["id"], "user_status": row["user_status"]}
 
 
 # ─────────────────────────────────────────────────────────────────────

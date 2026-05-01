@@ -13,6 +13,7 @@ import { NewDialogDialog } from "@/components/dialogs/NewDialogDialog";
 import { DeleteDialogConfirm } from "@/components/dialogs/DeleteDialogConfirm";
 import { DialogEventsWidget } from "@/components/dialogs/DialogEventsWidget";
 import { DialogListItem } from "@/components/dialogs/DialogListItem";
+import { AllWorkersDropdown } from "@/components/dialogs/AllWorkersDropdown";
 import { MessageBubble } from "@/components/dialogs/MessageBubble";
 import { ErrorBox } from "@/components/common/ErrorBox";
 import { useAccounts, useDialogProfile, useDialogs, useMessages } from "@/hooks/useAccounts";
@@ -108,32 +109,44 @@ export function DialogsPage() {
 
   return (
     <div className="flex h-full flex-col">
-      {/* ── Accounts row ─────────────────────────────────────────── */}
-      <div className="border-b border-border">
-        <ScrollArea className="w-full">
-          <div className="flex gap-2 p-2">
-            {accountsQ.isError && (
-              <ErrorBox title="Не удалось загрузить аккаунты" detail={String(accountsQ.error)} />
-            )}
-            {accountsQ.isLoading && <div className="text-xs text-muted-foreground">загрузка…</div>}
-            {accounts.map((a) => (
-              <AccountCard
-                key={a.id}
-                account={a}
-                selected={a.id === accountId}
-                onSelect={() => navigate(`/dialogs/${a.id}`)}
-                onStart={() => api.startWorker(a.id)
-                  .then(() => { toast.success(`Воркер ${a.name || `#${a.id}`} запущен`); accountsQ.refetch(); })
-                  .catch((e) => { const d = describeApiError(e); toast.error(`Start: ${d.title}`, d.detail); })}
-                onStop={() => api.stopWorker(a.id)
-                  .then(() => { toast.success(`Воркер ${a.name || `#${a.id}`} остановлен`); accountsQ.refetch(); })
-                  .catch((e) => { const d = describeApiError(e); toast.error(`Stop: ${d.title}`, d.detail); })}
-                onEditPrompt={() => navigate(`/workers/${a.id}/prompt`)}
-              />
-            ))}
-            <NewAccountCard onClick={() => setNewAccOpen(true)} />
-          </div>
-        </ScrollArea>
+      {/* ── Accounts row ─────────────────────────────────────────────
+         Карточки воркеров в горизонтальном скролле. Справа — кнопка
+         «всё списком» (выпадающий dropdown) для быстрой навигации
+         когда воркеров много. */}
+      <div className="flex items-stretch border-b border-border">
+        <div className="min-w-0 flex-1">
+          <ScrollArea className="w-full">
+            <div className="flex gap-2 p-2 pb-3">
+              {accountsQ.isError && (
+                <ErrorBox title="Не удалось загрузить аккаунты" detail={String(accountsQ.error)} />
+              )}
+              {accountsQ.isLoading && <div className="text-xs text-muted-foreground">загрузка…</div>}
+              {accounts.map((a) => (
+                <AccountCard
+                  key={a.id}
+                  account={a}
+                  selected={a.id === accountId}
+                  onSelect={() => navigate(`/dialogs/${a.id}`)}
+                  onStart={() => api.startWorker(a.id)
+                    .then(() => { toast.success(`Воркер ${a.name || `#${a.id}`} запущен`); accountsQ.refetch(); })
+                    .catch((e) => { const d = describeApiError(e); toast.error(`Start: ${d.title}`, d.detail); })}
+                  onStop={() => api.stopWorker(a.id)
+                    .then(() => { toast.success(`Воркер ${a.name || `#${a.id}`} остановлен`); accountsQ.refetch(); })
+                    .catch((e) => { const d = describeApiError(e); toast.error(`Stop: ${d.title}`, d.detail); })}
+                  onEditPrompt={() => navigate(`/workers/${a.id}/prompt`)}
+                />
+              ))}
+              <NewAccountCard onClick={() => setNewAccOpen(true)} />
+            </div>
+          </ScrollArea>
+        </div>
+        <div className="flex shrink-0 items-center px-2">
+          <AllWorkersDropdown
+            accounts={accounts}
+            currentAccountId={accountId}
+            onPick={(id) => navigate(`/dialogs/${id}`)}
+          />
+        </div>
       </div>
 
       <NewAccountDialog
@@ -169,7 +182,7 @@ export function DialogsPage() {
 
       {/* ── Body: dialogs + messages ─────────────────────────────── */}
       <div className="flex min-h-0 flex-1">
-        <aside className="flex w-[260px] shrink-0 flex-col border-r border-border">
+        <aside className="flex w-[320px] shrink-0 flex-col border-r border-border">
           <div className="flex h-12 shrink-0 items-center border-b border-border px-2">
             <Input placeholder="Поиск по диалогам…" value={search} onChange={(e) => setSearch(e.target.value)} />
           </div>
@@ -185,6 +198,7 @@ export function DialogsPage() {
                 dialog={d}
                 selected={d.id === dialogId}
                 onSelect={() => navigate(`/dialogs/${accountId}/${d.id}`)}
+                onStatusChange={() => dialogsQ.refetch()}
               />
             ))}
           </ScrollArea>

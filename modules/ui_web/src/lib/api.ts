@@ -81,12 +81,17 @@ type BackendDialog = {
   phone: string | null;
   is_bot: boolean;
   is_contact: boolean;
+  user_status: string | null;
   last_message: { date: string; text: string | null; is_outgoing: boolean } | null;
 };
 
 function adaptDialog(d: BackendDialog): DialogSummary {
   const name = [d.first_name, d.last_name].filter(Boolean).join(" ").trim();
   const title = name || d.username || "(без имени)";
+  const status = (d.user_status === "talking" || d.user_status === "waiting" ||
+                  d.user_status === "done"    || d.user_status === "failed")
+                  ? d.user_status
+                  : null;
   return {
     id: d.id,
     account_id: d.account_id,
@@ -95,6 +100,7 @@ function adaptDialog(d: BackendDialog): DialogSummary {
     phone: d.phone,
     is_bot: d.is_bot,
     is_contact: d.is_contact,
+    user_status: status,
     last_message: d.last_message
       ? {
           text: d.last_message.text,
@@ -236,6 +242,14 @@ export const api = {
   // messages/media/reactions/edits. После — собеседник для системы новый.
   deleteDialog: (dialogId: number) =>
     request<void>(`/dialogs/${dialogId}`, { method: "DELETE" }),
+
+  // Чисто визуальный статус оператора. Хранится в dialogs.user_status,
+  // никакой логикой не используется. null = «без статуса».
+  setDialogStatus: (dialogId: number, status: "talking" | "waiting" | "done" | "failed" | null) =>
+    request<{ id: number; user_status: string | null }>(
+      `/dialogs/${dialogId}/status`,
+      { method: "PATCH", body: JSON.stringify({ status }) },
+    ),
 
   // Toggle автодиалога для существующего диалога. POST включает (без
   // отправки initial — просто active-сессия ждёт входящих), DELETE гасит

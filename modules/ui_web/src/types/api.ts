@@ -53,6 +53,10 @@ export interface WorkerPrompts {
   updated_at: string | null;
 }
 
+// Чисто визуальный статус оператора. Бэк хранит как nullable text,
+// фронт показывает 4 значения + "без статуса".
+export type DialogUserStatus = "talking" | "waiting" | "done" | "failed" | null;
+
 export interface DialogSummary {
   id: number;
   account_id: number;
@@ -61,6 +65,7 @@ export interface DialogSummary {
   phone: string | null;
   is_bot: boolean;
   is_contact: boolean;
+  user_status: DialogUserStatus;
   last_message: { text: string | null; date: string; type: string } | null;
 }
 
