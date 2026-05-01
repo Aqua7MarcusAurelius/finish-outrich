@@ -41,8 +41,8 @@ type StatusOption = {
 
 const STATUS_OPTIONS: StatusOption[] = [
   { value: "talking", label: "Общаемся",  dotClass: "bg-status-success" },
-  { value: "waiting", label: "Ждём ответ", dotClass: "bg-status-warning" },
-  { value: "done",    label: "Готово",    dotClass: "bg-muted-foreground" },
+  { value: "waiting", label: "Ждём ответ", dotClass: "bg-status-in_progress" },
+  { value: "done",    label: "Готово",    dotClass: "bg-status-stopped" },
   { value: "failed",  label: "Провал",    dotClass: "bg-status-error" },
 ];
 
