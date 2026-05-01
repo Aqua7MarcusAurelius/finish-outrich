@@ -128,7 +128,7 @@ export function DialogListItem({
       {/* Pill в правом верхнем углу строки. Абсолютным позиционированием —
          чтобы flex-математика длинной истории/имени не вытесняла её за
          край 320px-aside и не плодила горизонтальный скролл. */}
-      <div className="absolute right-1.5 top-1.5">
+      <div className="absolute right-1.5 top-1.5 z-10">
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <button
@@ -136,12 +136,17 @@ export function DialogListItem({
               onClick={(e) => e.stopPropagation()}
               title={`Статус: ${opt.label}`}
               className={cn(
-                "flex items-center gap-0.5 rounded-full bg-background/80 p-1 hairline border-border/60",
-                "hover:bg-background",
+                "flex items-center gap-1 rounded-full border border-border bg-secondary px-1.5 py-0.5",
+                "text-foreground hover:bg-background",
               )}
             >
-              <span className={cn("h-2 w-2 rounded-full", opt.dotClass)} />
-              <ChevronDown className="h-3 w-3 opacity-60" />
+              <span
+                className={cn(
+                  "h-2.5 w-2.5 rounded-full ring-1 ring-border",
+                  effective === null ? "bg-transparent" : opt.dotClass,
+                )}
+              />
+              <ChevronDown className="h-3 w-3 opacity-80" />
             </button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="min-w-[160px]">
