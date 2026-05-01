@@ -2,29 +2,34 @@
 Сборка контекста для Opus 4.7 и парсинг сегментированного ответа.
 
 ИСТОЧНИК ПРОМТОВ:
-  • основной — таблица `account_prompts` (per-worker, см. prompts.py).
-    Передаётся в build_*() через параметр `prompt_override`.
-  • fallback — файлы `prompts/autochat_*.md` (только если override пустой;
-    используется как последний рубеж для совместимости/тестов, не для
-    продакшна — пустой override блокируется ВЫЩЕ, в session.py / service.py).
+  Per-worker `account_prompts.initial_template` / `reply_template` —
+  свободный текст оператора. Подставляется в LLM как system-промт с
+  заменой плейсхолдеров (см. ниже).
 
-Файлы читаются при каждой генерации — правишь файл, следующий запрос
-использует новый текст без рестарта.
+  Файлы `prompts/autochat_*.md` остаются как hardcoded fallback на
+  случай битой схемы — в нормальном потоке гейт в session.py /
+  service.py не пускает пустой шаблон до этого фолбэка.
 
-Поддерживаемые плейсхолдеры:
-  {current_time}          — текущее UTC-время "YYYY-MM-DD HH:MM"
-  {user_system_prompt}    — из /autochat/start (или autochat_sessions.system_prompt)
-  {user_initial_prompt}   — только в initial-промте
-  {conversation_history}  — (опционально) вся история текстом. Если плейсхолдер
-                            есть — история ПЕРЕСТАЁТ идти role-messages в LLM,
-                            а подставляется текстом в system.
+ПОДДЕРЖИВАЕМЫЕ ПЛЕЙСХОЛДЕРЫ (общие для initial и reply):
+  {current_time}      — текущее UTC-время "DD.MM.YYYY HH:MM:SS"
+  {worker_name}       — имя нашего воркера
+  {partner_username}  — @username собеседника (без @, может быть пусто)
+  {partner_name}      — отображаемое имя собеседника (first + last)
+  {partner_bio}       — Telegram-bio собеседника (может быть пусто)
 
-См. docs/autochat.md → раздел "Редактирование промтов".
+ТОЛЬКО В REPLY (требуют существующего диалога с историей):
+  {conversation_history}  — вся история по docs/history_format_spec.md
+  {messages_count}        — сколько сообщений в диалоге
+  {days_since_first}      — сколько дней с первого сообщения
+
+Незнакомые ключи оставляются как есть — оператор сразу видит опечатку
+в превью.
 """
 from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -46,25 +51,23 @@ PROMPTS_DIR = _PROJECT_ROOT / "prompts"
 REPLY_PROMPT_FILE = PROMPTS_DIR / "autochat_reply_system.md"
 INITIAL_PROMPT_FILE = PROMPTS_DIR / "autochat_initial_system.md"
 
-# Fallback — если файла нет или не читается. Минимальный рабочий промт,
-# система не сломается, но пользователь увидит скучный дефолт.
+# Fallback — если в БД пусто И гейт обошли. Минимально рабочий промт,
+# чтобы система не сломалась. В нормальной работе сюда не попадаем.
 _REPLY_FALLBACK = (
-    "Ты живой человек в переписке. {user_system_prompt}\n\n"
+    "Ты живой человек в переписке.\n\n"
     "Отвечай короткими сообщениями в тегах <msg>...</msg>. 1–4 сегмента.\n"
     "Без markdown.\n\n"
     "Текущее время: {current_time}"
 )
 _INITIAL_FALLBACK = (
-    "Напиши короткое дружелюбное первое сообщение в Telegram.\n\n"
-    "{user_system_prompt}\n\n"
-    "Задача: {user_initial_prompt}\n\n"
+    "Напиши короткое дружелюбное первое сообщение в Telegram.\n"
     "Одно живое сообщение, без приветствий-шаблонов, без markdown, "
     "без <msg>-тегов. Текущее время: {current_time}"
 )
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Работа с файлами промтов
+# Подстановка плейсхолдеров
 # ─────────────────────────────────────────────────────────────────────
 
 _COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
@@ -72,18 +75,16 @@ _PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
 
 
 def _strip_comments(text: str) -> str:
-    """Убирает <!-- ... --> комментарии из промта."""
+    """Убирает <!-- ... --> из промта (для заметок оператора в шаблоне)."""
     return _COMMENT_RE.sub("", text)
 
 
 def _read_prompt_file(path: Path, fallback: str) -> str:
-    """Прочитать файл промта. При отсутствии / ошибке — fallback + warning."""
+    """Прочитать файл-фолбэк. Используется только если БД пуста."""
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        log.warning(
-            "autochat: prompt file not found (%s), using fallback", path,
-        )
+        log.warning("autochat: prompt file not found (%s), using fallback", path)
         return fallback
     except Exception:
         log.exception("autochat: failed to read prompt file %s", path)
@@ -93,15 +94,122 @@ def _read_prompt_file(path: Path, fallback: str) -> str:
 
 def _render(template: str, values: dict[str, str]) -> str:
     """
-    Подставить {key} → values[key]. Если ключа нет в values — оставляем
-    {key} как есть (лучше заметно в UI, чем молча съедать).
+    Подставить {key} → values[key]. Незнакомый ключ оставляем как есть —
+    лучше заметно в превью оператору, чем тихо съедать.
     """
     def _replace(m: re.Match) -> str:
         key = m.group(1)
         if key in values:
             return values[key]
-        return m.group(0)  # оставляем как есть
+        return m.group(0)
     return _PLACEHOLDER_RE.sub(_replace, template)
+
+
+@dataclass(frozen=True)
+class PartnerInfo:
+    """Данные собеседника для подстановки в плейсхолдеры."""
+    username: str = ""
+    name: str = ""
+    bio: str = ""
+
+    @classmethod
+    def from_dialog_row(cls, row: Any | None) -> "PartnerInfo":
+        if row is None:
+            return cls()
+        name = " ".join(
+            p for p in (row["first_name"], row["last_name"]) if p
+        ).strip()
+        return cls(
+            username=(row["username"] or "").lstrip("@"),
+            name=name,
+            bio=(row["bio"] or "").strip(),
+        )
+
+    @classmethod
+    def from_resolved_profile(cls, username: str, profile: dict[str, Any]) -> "PartnerInfo":
+        """profile — то что отдаёт wrapper.resolve_username()."""
+        first = profile.get("first_name") or ""
+        last = profile.get("last_name") or ""
+        name = " ".join(p for p in (first, last) if p).strip()
+        return cls(
+            username=(username or "").lstrip("@"),
+            name=name,
+            bio=(profile.get("bio") or "").strip(),
+        )
+
+
+def _build_placeholders(
+    *,
+    now: datetime,
+    worker_name: str,
+    partner: PartnerInfo,
+    conversation_history: str | None = None,
+    messages_count: int | None = None,
+    days_since_first: int | None = None,
+) -> dict[str, str]:
+    n = now.astimezone(timezone.utc) if now.tzinfo else now
+    out: dict[str, str] = {
+        "current_time": n.strftime("%d.%m.%Y %H:%M:%S"),
+        "worker_name": worker_name or "",
+        "partner_username": partner.username,
+        "partner_name": partner.name,
+        "partner_bio": partner.bio,
+    }
+    # Reply-only ключи. Всегда добавляем когда заданы — иначе оставляем
+    # _render оставлять {key} литералом, оператор увидит опечатку.
+    if conversation_history is not None:
+        out["conversation_history"] = conversation_history
+    if messages_count is not None:
+        out["messages_count"] = str(messages_count)
+    if days_since_first is not None:
+        out["days_since_first"] = str(days_since_first)
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Загрузка данных из БД для плейсхолдеров
+# ─────────────────────────────────────────────────────────────────────
+
+async def _load_worker_name(conn: Any, account_id: int) -> str:
+    row = await conn.fetchrow(
+        "SELECT name FROM accounts WHERE id = $1", account_id,
+    )
+    return (row["name"] or "") if row else ""
+
+
+async def _load_partner_info_for_dialog(
+    conn: Any, dialog_id: int,
+) -> PartnerInfo:
+    row = await conn.fetchrow(
+        """
+        SELECT username, first_name, last_name, bio
+        FROM dialogs WHERE id = $1
+        """,
+        dialog_id,
+    )
+    return PartnerInfo.from_dialog_row(row)
+
+
+async def _load_message_stats(
+    conn: Any, dialog_id: int,
+) -> tuple[int, int]:
+    """Возвращает (messages_count, days_since_first). (0, 0) если сообщений нет."""
+    row = await conn.fetchrow(
+        """
+        SELECT COUNT(*)::int AS cnt, MIN(date) AS first_date
+        FROM messages
+        WHERE dialog_id = $1 AND deleted_at IS NULL
+        """,
+        dialog_id,
+    )
+    if row is None:
+        return 0, 0
+    cnt = int(row["cnt"] or 0)
+    first_date = row["first_date"]
+    if first_date is None:
+        return 0, 0
+    delta = datetime.now(timezone.utc) - first_date
+    return cnt, max(0, delta.days)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -178,13 +286,9 @@ def _format_attachment_block(
 
 
 def _format_message_block(turn: dict[str, Any]) -> str:
-    """
-    Один блок-сообщение по спеке. Многострочный, без хвостовой пустой строки —
-    разделители между блоками добавляет _format_history_text.
-    """
+    """Один блок-сообщение по спеке."""
     when = turn.get("date")
     if isinstance(when, datetime):
-        # Все даты в БД — TIMESTAMPTZ, приходят tz-aware. Приводим к UTC.
         n = when.astimezone(timezone.utc) if when.tzinfo else when
         date_s = n.strftime("%d.%m.%Y")
         time_s = n.strftime("%H:%M:%S")
@@ -206,8 +310,6 @@ def _format_message_block(turn: dict[str, Any]) -> str:
     text = (turn.get("text") or "").strip()
     media_rows = turn.get("media") or []
 
-    # Считаем индексы внутри типа отдельно (правило 9): два фото и видео =
-    # Photo 1, Photo 2, Video 1. Незнакомые типы пропускаем.
     type_counters: dict[str, int] = {}
     attachment_blocks: list[str] = []
     for m in media_rows:
@@ -220,7 +322,6 @@ def _format_message_block(turn: dict[str, Any]) -> str:
             attachment_blocks.append(block)
 
     if not text and not attachment_blocks:
-        # Правило: ни текста, ни usable вложений → Text: (empty), не пропускать.
         lines.append("Text: (empty)")
     else:
         if text:
@@ -231,9 +332,7 @@ def _format_message_block(turn: dict[str, Any]) -> str:
 
 
 def _format_history_text(turns: list[dict[str, Any]]) -> str:
-    """
-    История целиком — блоки разделены одной пустой строкой.
-    """
+    """История целиком — блоки разделены одной пустой строкой."""
     if not turns:
         return "(история пустая — это начало разговора)"
     return "\n\n".join(_format_message_block(t) for t in turns)
@@ -246,8 +345,7 @@ def _format_history_text(turns: list[dict[str, Any]]) -> str:
 async def _load_turns(conn: Any, dialog_id: int, limit: int) -> list[dict[str, Any]]:
     """
     Тянем последние N non-deleted сообщений + их media. Возвращаем сырые
-    поля (text, media) — форматирование делает _format_message_block по
-    спеке docs/history_format_spec.md.
+    поля (text, media) — форматирование делает _format_message_block.
 
     Хронологический порядок: старые → новые.
     """
@@ -274,7 +372,7 @@ async def _load_turns(conn: Any, dialog_id: int, limit: int) -> list[dict[str, A
         media_by_msg.setdefault(r["message_id"], []).append(dict(r))
 
     turns: list[dict[str, Any]] = []
-    for r in reversed(msg_rows):  # старые → новые
+    for r in reversed(msg_rows):
         turns.append({
             "is_outgoing": bool(r["is_outgoing"]),
             "date": r["date"],
@@ -291,78 +389,122 @@ async def _load_turns(conn: Any, dialog_id: int, limit: int) -> list[dict[str, A
 async def build_conversation_context(
     conn: Any,
     *,
+    account_id: int,
     dialog_id: int,
-    system_prompt: str,
     now: datetime,
     max_messages: int = CONTEXT_MAX_MESSAGES,
     prompt_override: str | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Собрать messages для chat_completion.
+    Собрать messages для chat_completion (reply-режим).
 
     Источник шаблона:
-      • prompt_override (per-worker rendered template из prompts.py) если
-        задан и не пустой;
+      • prompt_override (per-worker reply_template из БД) если задан;
       • иначе fallback из файла prompts/autochat_reply_system.md.
-
-    Историю всегда подставляем текстом в system-промт по плейсхолдеру
-    {conversation_history} в формате docs/history_format_spec.md.
-    Если в шаблоне нет этого плейсхолдера (legacy fallback) — история не
-    попадёт в промт; в нормальном потоке render_reply_system() всегда
-    добавляет секцию "# История переписки" с плейсхолдером.
 
     Возвращаемые messages всегда: [system, user:"Ответь сейчас."].
     """
     if prompt_override and prompt_override.strip():
-        template = prompt_override.strip() + "\n"
+        template = _strip_comments(prompt_override).strip() + "\n"
     else:
         template = _read_prompt_file(REPLY_PROMPT_FILE, _REPLY_FALLBACK)
 
-    # current_time — единый формат с историей (DD.MM.YYYY HH:MM:SS UTC).
-    n = now.astimezone(timezone.utc) if now.tzinfo else now
-    current_time = n.strftime("%d.%m.%Y %H:%M:%S")
-
+    worker_name = await _load_worker_name(conn, account_id)
+    partner = await _load_partner_info_for_dialog(conn, dialog_id)
     turns = await _load_turns(conn, dialog_id, max_messages)
     history_text = _format_history_text(turns)
+    msg_count, days_since = await _load_message_stats(conn, dialog_id)
 
-    system_content = _render(template, {
-        "current_time": current_time,
-        "user_system_prompt": (system_prompt or "").strip(),
-        "conversation_history": history_text,
-    })
+    placeholders = _build_placeholders(
+        now=now,
+        worker_name=worker_name,
+        partner=partner,
+        conversation_history=history_text,
+        messages_count=msg_count,
+        days_since_first=days_since,
+    )
+    system_content = _render(template, placeholders)
     return [
         {"role": "system", "content": system_content},
         {"role": "user", "content": "Ответь сейчас."},
     ]
 
 
+async def render_preview_text(
+    conn: Any,
+    *,
+    template: str,
+    account_id: int,
+    dialog_id: int | None,
+    now: datetime,
+    max_messages: int = CONTEXT_MAX_MESSAGES,
+) -> str:
+    """
+    Собрать system-текст для превью на странице редактора промта.
+
+    Не вызывает LLM — просто подставляет реальные значения плейсхолдеров.
+    Если `dialog_id` задан — берёт партнёра/историю/статистику из этого
+    диалога. Если нет — partner_* пустые, conversation_history с маркером
+    «история не выбрана», stats не подставляются (плейсхолдеры останутся
+    литералом — оператор увидит что в живом запуске они подставятся).
+    """
+    template_clean = _strip_comments(template).strip() + "\n" if template.strip() else ""
+    if not template_clean:
+        return ""
+
+    worker_name = await _load_worker_name(conn, account_id)
+
+    if dialog_id is None:
+        placeholders = _build_placeholders(
+            now=now,
+            worker_name=worker_name,
+            partner=PartnerInfo(),
+            conversation_history=
+                "(история не выбрана — выбери диалог сверху чтобы увидеть с реальными данными)",
+        )
+    else:
+        partner = await _load_partner_info_for_dialog(conn, dialog_id)
+        turns = await _load_turns(conn, dialog_id, max_messages)
+        history_text = _format_history_text(turns)
+        msg_count, days_since = await _load_message_stats(conn, dialog_id)
+        placeholders = _build_placeholders(
+            now=now,
+            worker_name=worker_name,
+            partner=partner,
+            conversation_history=history_text,
+            messages_count=msg_count,
+            days_since_first=days_since,
+        )
+
+    return _render(template_clean, placeholders)
+
+
 def build_initial_messages(
     *,
+    worker_name: str,
+    partner: PartnerInfo,
     now: datetime,
     prompt_override: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     Messages для первого сообщения.
 
-    Источник шаблона:
-      • prompt_override (per-worker initial_system из БД) если задан;
-      • иначе fallback из файла prompts/autochat_initial_system.md.
-
-    Активный плейсхолдер: {current_time} (DD.MM.YYYY HH:MM:SS UTC).
-    Устаревшие {user_system_prompt} и {user_initial_prompt} (если оператор
-    их зачем-то оставил в шаблоне) тихо подставляются пустой строкой —
-    per-session inputs убраны вместе с упрощением "+ Новый авто-диалог".
+    История ещё пустая (диалога нет), reply-only плейсхолдеры
+    (`conversation_history`/`messages_count`/`days_since_first`) НЕ
+    подставляются — если оператор их написал в шаблоне, останутся
+    литералом, видно в превью.
     """
     if prompt_override and prompt_override.strip():
         template = _strip_comments(prompt_override).strip() + "\n"
     else:
         template = _read_prompt_file(INITIAL_PROMPT_FILE, _INITIAL_FALLBACK)
-    n = now.astimezone(timezone.utc) if now.tzinfo else now
-    system_content = _render(template, {
-        "current_time": n.strftime("%d.%m.%Y %H:%M:%S"),
-        "user_system_prompt": "",
-        "user_initial_prompt": "",
-    })
+
+    placeholders = _build_placeholders(
+        now=now,
+        worker_name=worker_name,
+        partner=partner,
+    )
+    system_content = _render(template, placeholders)
     return [
         {"role": "system", "content": system_content},
         {"role": "user", "content": "Напиши первое сообщение."},

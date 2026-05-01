@@ -289,28 +289,28 @@ export const api = {
     request<void>(`/workers/${accountId}/stop`, { method: "POST" }),
 
   // ── per-worker prompts (AutoChat) ───────────────────────────────────
-  // 8 структурированных полей для reply + одно initial_system. Если строки
-  // в БД ещё нет, GET отдаёт дефолты для forbidden/format_reply (overlay,
-  // не персистится автоматически). Все 8 reply-полей пустые на момент
-  // генерации = блок автоответа (см. session.py::_generate_and_enqueue).
+  // Два свободных текста: initial_template и reply_template. Внутри —
+  // плейсхолдеры {current_time}, {worker_name}, {partner_*},
+  // {conversation_history}, {messages_count}, {days_since_first}.
+  // Если строки в БД нет — оба пустые. Пустой template блокирует
+  // соответствующий путь (см. session.py / service.py).
   getWorkerPrompts: (accountId: number) =>
     request<WorkerPrompts>(`/accounts/${accountId}/prompts`),
-  saveWorkerPrompts: (accountId: number, body: Omit<WorkerPrompts, "account_id" | "updated_at">) =>
+  saveWorkerPrompts: (accountId: number, body: { initial_template: string; reply_template: string }) =>
     request<WorkerPrompts>(`/accounts/${accountId}/prompts`, {
       method: "PUT", body: JSON.stringify(body),
     }),
 
-  // Превью того, что уйдёт в chat_completion. LLM НЕ вызывается, токены не
-  // тратятся. Принимает текущие значения полей (можно несохранённые) +
-  // опц. dialog_id (источник истории) + опц. user_system_prompt (заметка
-  // про собеседника). Без dialog_id — placeholder вместо истории.
+  // Превью того, что уйдёт в chat_completion. LLM НЕ вызывается.
+  // Принимает текущие (несохранённые) тексты + опц. dialog_id —
+  // источник партнёра/истории/статистики. Без dialog_id partner_*
+  // пустые, conversation_history с маркером.
   previewWorkerPrompts: (accountId: number, body: {
-    fabula: string; bio: string; style: string; forbidden: string;
-    length_hint: string; goals: string; format_reply: string; examples: string;
+    initial_template: string;
+    reply_template: string;
     dialog_id?: number | null;
-    user_system_prompt?: string;
   }) =>
-    request<{ system: string; user: string; dialog_id: number | null }>(
+    request<{ initial: string; reply: string; dialog_id: number | null }>(
       `/accounts/${accountId}/prompts/preview`,
       { method: "POST", body: JSON.stringify(body) },
     ),

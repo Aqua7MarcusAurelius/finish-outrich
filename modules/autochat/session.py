@@ -33,7 +33,7 @@ from .generation import (
     extract_finish_marker,
     parse_segments,
 )
-from .prompts import load_for_account, render_reply_system
+from .prompts import load_for_account
 
 log = logging.getLogger(__name__)
 
@@ -518,14 +518,13 @@ class AutoChatSession:
             )
             return
 
-        # Гейт по per-worker промту: если все 8 reply-секций пустые —
-        # автоответ не генерируем. Сессия остаётся живой; следующий bump
-        # снова попробует, и как только оператор заполнит хоть одно поле
-        # в редакторе — ответы пойдут.
+        # Гейт по per-worker reply_template: если пусто — автоответ не
+        # генерируем. Сессия остаётся живой; следующий bump попробует
+        # снова, и как только оператор заполнит шаблон — ответы пойдут.
         worker_prompts = await load_for_account(self.account_id)
-        if not worker_prompts.has_any_reply_field():
+        if not worker_prompts.has_reply():
             log.info(
-                "autochat session %s: skip generation, all reply prompt fields empty (account %s)",
+                "autochat session %s: skip generation, reply_template empty (account %s)",
                 self.id, self.account_id,
             )
             await bus.publish(
@@ -536,21 +535,19 @@ class AutoChatSession:
                 data={
                     "session_id": self.id,
                     "reason": "no_prompt",
-                    "message": "У воркера все поля reply-промта пустые — заполни хотя бы одно в редакторе.",
+                    "message": "У воркера пустой reply-промт — заполни в редакторе.",
                 },
             )
             return
-
-        rendered_template = render_reply_system(worker_prompts)
 
         pool = db.get_pool()
         async with pool.acquire() as conn:
             messages = await build_conversation_context(
                 conn,
+                account_id=self.account_id,
                 dialog_id=self.dialog_id,
-                system_prompt=self.system_prompt,
                 now=_now(),
-                prompt_override=rendered_template,
+                prompt_override=worker_prompts.reply_template,
             )
 
         req_event = await bus.publish(

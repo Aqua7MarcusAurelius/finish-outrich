@@ -22,13 +22,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from core import db
-from modules.autochat.generation import _render, build_conversation_context
-from modules.autochat.prompts import (
-    DEFAULT_FORBIDDEN,
-    DEFAULT_FORMAT_REPLY,
-    WorkerPrompts,
-    render_reply_system,
-)
+from modules.autochat.generation import render_preview_text
 
 router = APIRouter(tags=["accounts"])
 
@@ -96,19 +90,12 @@ async def list_accounts(request: Request) -> list[dict[str, Any]]:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Per-worker промты для AutoChat
+# Per-worker промты для AutoChat (free-form templates)
 # ─────────────────────────────────────────────────────────────────────
 
 class PromptsIn(BaseModel):
-    fabula: str = Field(default="", max_length=20000)
-    bio: str = Field(default="", max_length=20000)
-    style: str = Field(default="", max_length=20000)
-    forbidden: str = Field(default="", max_length=20000)
-    length_hint: str = Field(default="", max_length=5000)
-    goals: str = Field(default="", max_length=20000)
-    format_reply: str = Field(default="", max_length=20000)
-    examples: str = Field(default="", max_length=20000)
-    initial_system: str = Field(default="", max_length=20000)
+    initial_template: str = Field(default="", max_length=50000)
+    reply_template: str = Field(default="", max_length=50000)
 
 
 def _account_not_found() -> JSONResponse:
@@ -121,15 +108,8 @@ def _account_not_found() -> JSONResponse:
 def _row_to_prompts_dict(account_id: int, row) -> dict[str, Any]:
     return {
         "account_id": account_id,
-        "fabula": row["fabula"],
-        "bio": row["bio"],
-        "style": row["style"],
-        "forbidden": row["forbidden"],
-        "length_hint": row["length_hint"],
-        "goals": row["goals"],
-        "format_reply": row["format_reply"],
-        "examples": row["examples"],
-        "initial_system": row["initial_system"],
+        "initial_template": row["initial_template"],
+        "reply_template": row["reply_template"],
         "updated_at": _iso(row["updated_at"]),
     }
 
@@ -137,13 +117,11 @@ def _row_to_prompts_dict(account_id: int, row) -> dict[str, Any]:
 @router.get("/accounts/{account_id}/prompts")
 async def get_account_prompts(account_id: int):
     """
-    Возвращает per-worker промт-конфиг.
+    Возвращает per-worker промт-конфиг (два свободных текста).
 
-    Если строки в `account_prompts` ещё нет — отдаём дефолт-overlay для
-    `forbidden` и `format_reply` (чтобы оператор не забыл про <msg>-теги
-    и базовые запреты при первом редактировании). Остальные поля пустые.
-    Этот overlay применяется ТОЛЬКО при отсутствии строки; после первого
-    PUT возвращаем то что в БД, без подмесов.
+    Если строки в `account_prompts` ещё нет — оба поля пустые,
+    `updated_at = null`. Никаких overlay-дефолтов: оператор сам пишет
+    что хочет, дефолт-каркас сейчас не предусмотрен.
     """
     pool = db.get_pool()
     async with pool.acquire() as conn:
@@ -152,8 +130,7 @@ async def get_account_prompts(account_id: int):
             return _account_not_found()
         row = await conn.fetchrow(
             """
-            SELECT fabula, bio, style, forbidden, length_hint, goals,
-                   format_reply, examples, initial_system, updated_at
+            SELECT initial_template, reply_template, updated_at
             FROM account_prompts WHERE account_id = $1
             """,
             account_id,
@@ -161,15 +138,8 @@ async def get_account_prompts(account_id: int):
     if row is None:
         return {
             "account_id": account_id,
-            "fabula": "",
-            "bio": "",
-            "style": "",
-            "forbidden": DEFAULT_FORBIDDEN,
-            "length_hint": "",
-            "goals": "",
-            "format_reply": DEFAULT_FORMAT_REPLY,
-            "examples": "",
-            "initial_system": "",
+            "initial_template": "",
+            "reply_template": "",
             "updated_at": None,
         }
     return _row_to_prompts_dict(account_id, row)
@@ -185,27 +155,15 @@ async def put_account_prompts(account_id: int, payload: PromptsIn):
         row = await conn.fetchrow(
             """
             INSERT INTO account_prompts (
-                account_id, fabula, bio, style, forbidden, length_hint,
-                goals, format_reply, examples, initial_system, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+                account_id, initial_template, reply_template, updated_at
+            ) VALUES ($1, $2, $3, NOW())
             ON CONFLICT (account_id) DO UPDATE SET
-                fabula = EXCLUDED.fabula,
-                bio = EXCLUDED.bio,
-                style = EXCLUDED.style,
-                forbidden = EXCLUDED.forbidden,
-                length_hint = EXCLUDED.length_hint,
-                goals = EXCLUDED.goals,
-                format_reply = EXCLUDED.format_reply,
-                examples = EXCLUDED.examples,
-                initial_system = EXCLUDED.initial_system,
+                initial_template = EXCLUDED.initial_template,
+                reply_template = EXCLUDED.reply_template,
                 updated_at = NOW()
-            RETURNING fabula, bio, style, forbidden, length_hint,
-                      goals, format_reply, examples, initial_system, updated_at
+            RETURNING initial_template, reply_template, updated_at
             """,
-            account_id,
-            payload.fabula, payload.bio, payload.style, payload.forbidden,
-            payload.length_hint, payload.goals, payload.format_reply,
-            payload.examples, payload.initial_system,
+            account_id, payload.initial_template, payload.reply_template,
         )
     return _row_to_prompts_dict(account_id, row)
 
@@ -215,38 +173,30 @@ async def put_account_prompts(account_id: int, payload: PromptsIn):
 # ─────────────────────────────────────────────────────────────────────
 
 class PreviewIn(BaseModel):
-    fabula: str = ""
-    bio: str = ""
-    style: str = ""
-    forbidden: str = ""
-    length_hint: str = ""
-    goals: str = ""
-    format_reply: str = ""
-    examples: str = ""
-    # Опционально — какой диалог использовать как источник истории.
-    # None → подставляем плейсхолдер-маркер вместо реальной истории.
+    initial_template: str = Field(default="", max_length=50000)
+    reply_template: str = Field(default="", max_length=50000)
+    # Опционально — какой диалог использовать как источник истории
+    # и данных собеседника. None → плейсхолдеры partner_* пустые,
+    # conversation_history с маркером.
     dialog_id: int | None = None
-    # Заметка про собеседника (то что обычно лежит в autochat_sessions.system_prompt).
-    user_system_prompt: str = ""
 
 
 @router.post("/accounts/{account_id}/prompts/preview")
 async def preview_prompts(account_id: int, payload: PreviewIn):
     """
-    Собирает system+user-промт ровно как уйдёт в chat_completion, но НЕ
-    вызывает LLM. Используется редактором промта чтобы оператор видел
-    итог без сохранения и без реального прогона.
+    Собирает initial и reply system-промты ровно как уйдут в LLM, но
+    БЕЗ вызова LLM. Используется редактором промта.
 
-    Если dialog_id указан — подставляется живая история из БД по спеке
-    docs/history_format_spec.md. Если нет — placeholder-текст вместо
-    {conversation_history}.
+    Если dialog_id указан — подставляются партнёр/история/статистика
+    из этого диалога. Если нет — partner_* пустые, conversation_history
+    с placeholder-маркером, messages_count/days_since_first останутся
+    литералом (видно что в живом запуске они подставятся).
     """
     pool = db.get_pool()
     async with pool.acquire() as conn:
         acc = await conn.fetchval("SELECT id FROM accounts WHERE id = $1", account_id)
         if acc is None:
             return _account_not_found()
-
         if payload.dialog_id is not None:
             dlg = await conn.fetchrow(
                 "SELECT id FROM dialogs WHERE id = $1 AND account_id = $2",
@@ -261,42 +211,25 @@ async def preview_prompts(account_id: int, payload: PreviewIn):
                     }},
                 )
 
-    prompts = WorkerPrompts(
-        fabula=payload.fabula,
-        bio=payload.bio,
-        style=payload.style,
-        forbidden=payload.forbidden,
-        length_hint=payload.length_hint,
-        goals=payload.goals,
-        format_reply=payload.format_reply,
-        examples=payload.examples,
-    )
-    template = render_reply_system(prompts)
     now = datetime.now(timezone.utc)
-    current_time = now.strftime("%d.%m.%Y %H:%M:%S")
-
-    if payload.dialog_id is not None:
-        async with pool.acquire() as conn:
-            messages = await build_conversation_context(
-                conn,
-                dialog_id=payload.dialog_id,
-                system_prompt=payload.user_system_prompt,
-                now=now,
-                prompt_override=template,
-            )
-        system_text = messages[0]["content"]
-        user_text = messages[1]["content"]
-    else:
-        system_text = _render(template, {
-            "current_time": current_time,
-            "user_system_prompt": payload.user_system_prompt or "",
-            "conversation_history":
-                "(история не выбрана — выбери диалог сверху чтобы увидеть с реальными данными)",
-        })
-        user_text = "Ответь сейчас."
+    async with pool.acquire() as conn:
+        initial_text = await render_preview_text(
+            conn,
+            template=payload.initial_template,
+            account_id=account_id,
+            dialog_id=payload.dialog_id,
+            now=now,
+        )
+        reply_text = await render_preview_text(
+            conn,
+            template=payload.reply_template,
+            account_id=account_id,
+            dialog_id=payload.dialog_id,
+            now=now,
+        )
 
     return {
-        "system": system_text,
-        "user": user_text,
+        "initial": initial_text,
+        "reply": reply_text,
         "dialog_id": payload.dialog_id,
     }

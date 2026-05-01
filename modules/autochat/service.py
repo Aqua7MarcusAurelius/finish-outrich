@@ -42,7 +42,11 @@ from .errors import (
     UsernameUnavailableError,
     WorkerNotRunning,
 )
-from .generation import build_initial_messages, sanitize_initial_response
+from .generation import (
+    PartnerInfo,
+    build_initial_messages,
+    sanitize_initial_response,
+)
 from .prompts import load_for_account
 from .session import AutoChatSession, _call_llm_with_retries, _get_setting_int, _now
 
@@ -330,7 +334,8 @@ class AutoChatService:
         telegram_user_id = int(profile["telegram_user_id"])
         cleaned_username = (username or "").strip().lstrip("@")
 
-        # Проверка уникальности до запроса в LLM — сэкономит на резолве дубля
+        # Проверка уникальности до запроса в LLM + загрузка имени воркера
+        # для плейсхолдера {worker_name}. Один acquire на оба запроса.
         pool = db.get_pool()
         async with pool.acquire() as conn:
             exists = await conn.fetchrow(
@@ -342,13 +347,21 @@ class AutoChatService:
                 """,
                 account_id, telegram_user_id,
             )
-        if exists:
-            raise SessionAlreadyActive()
+            if exists:
+                raise SessionAlreadyActive()
+            acc_name_row = await conn.fetchrow(
+                "SELECT name FROM accounts WHERE id = $1", account_id,
+            )
 
-        # LLM: initial. Шаблон — per-worker initial_system из БД (см. гейт выше).
+        worker_name = (acc_name_row["name"] if acc_name_row else "") or ""
+        partner = PartnerInfo.from_resolved_profile(cleaned_username, profile)
+
+        # LLM: initial. Шаблон — per-worker initial_template из БД.
         initial_messages = build_initial_messages(
+            worker_name=worker_name,
+            partner=partner,
             now=_now(),
-            prompt_override=worker_prompts.initial_system,
+            prompt_override=worker_prompts.initial_template,
         )
         try:
             retries = await _get_setting_int("autochat.openrouter_retries")

@@ -42,19 +42,14 @@ export interface Account {
 }
 
 // Per-worker AutoChat промт-конфиг (account_prompts).
-// Источник правды: docs/autochat.md → раздел "Per-worker промты".
-// Все 8 reply-полей пустые на момент генерации = блок автоответа.
+// Два свободных текста; в каждом доступны плейсхолдеры — система
+// подставляет реальные значения при генерации (см. generation.py).
+// Пустой reply_template блокирует генерацию ответов; пустой
+// initial_template блокирует POST /autochat/start.
 export interface WorkerPrompts {
   account_id: number;
-  fabula: string;
-  bio: string;
-  style: string;
-  forbidden: string;
-  length_hint: string;
-  goals: string;
-  format_reply: string;
-  examples: string;
-  initial_system: string;
+  initial_template: string;
+  reply_template: string;
   updated_at: string | null;
 }
 
