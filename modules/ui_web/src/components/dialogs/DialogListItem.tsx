@@ -100,7 +100,7 @@ export function DialogListItem({
     >
       <button
         onClick={onSelect}
-        className="flex w-full items-start gap-2 px-2 py-2 pr-10 text-left"
+        className="flex w-full items-start gap-2 px-2 py-2 pr-14 text-left"
       >
         <div
           className={cn(
@@ -125,10 +125,11 @@ export function DialogListItem({
         </div>
       </button>
 
-      {/* Pill в правом верхнем углу строки. Абсолютным позиционированием —
-         чтобы flex-математика длинной истории/имени не вытесняла её за
-         край 320px-aside и не плодила горизонтальный скролл. */}
-      <div className="absolute right-1.5 top-1.5 z-10">
+      {/* Pill — абсолютно позиционирована от левого края строки на
+         ~280px. Right-based позиционирование иногда уезжало за
+         viewport из-за scrollbar/Radix display:table — left-based
+         предсказуемо в видимой зоне 320px-aside. */}
+      <div className="absolute left-[270px] top-1.5 z-10">
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <button
