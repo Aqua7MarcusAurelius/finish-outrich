@@ -274,7 +274,7 @@ Multi-stage build или отдельный `Dockerfile.dev`, либо `docker-c
 
 ## Известные долги из отчётов этапов
 
-Из [docs/fixes/transcription_issues.md](./fixes/transcription_issues.md) и отчётов:
+Из отчётов этапов:
 
 - OpenRouter retry без backoff — busy-loop на одном событии блокирует батч (пересекается с п. 4).
 - Неограниченные retries: если admin выставит `retries=100`, сделается 101 попытка подряд. Нужен cap на 5.
