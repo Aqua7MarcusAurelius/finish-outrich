@@ -339,16 +339,18 @@ body {
 /* ─── Строка сообщения ───────────────────────────────────────────── */
 .row {
     display: flex;
-    align-items: flex-end;
-    gap: 8px;
-    margin: 4px 0;
+    align-items: flex-start;       /* аватарка — на уровне верха первого пузыря */
+    gap: 10px;
+    margin: 0;
 }
 .row.in  { justify-content: flex-start; }
 .row.out { justify-content: flex-end; }
 
-/* Сжимаем повторные подряд от того же отправителя */
-.row + .row.same      { margin-top: 2px; }
-.row.same .avatar     { visibility: hidden; }
+/* Дефолтный отступ между разными авторами — крупный */
+.row + .row              { margin-top: 18px; }
+/* Сжимаем подряд идущие сообщения одного автора */
+.row + .row.same         { margin-top: 3px; }
+.row.same .avatar        { visibility: hidden; }
 
 .avatar {
     flex: none;
@@ -366,10 +368,10 @@ body {
 
 /* ─── Пузырь ─────────────────────────────────────────────────────── */
 .bubble {
-    max-width: 70%;
-    padding: 7px 12px 5px;
-    border-radius: 16px;
-    position: relative;
+    max-width: 72%;
+    padding: 9px 14px 7px;
+    border-radius: 20px;           /* полностью округлая капсула */
+    line-height: 1.5;
     word-wrap: break-word;
     overflow-wrap: anywhere;
     white-space: pre-wrap;
@@ -377,35 +379,11 @@ body {
 .row.in  .bubble {
     background: #f1f4f8;
     color: #14202d;
-    border-bottom-left-radius: 4px;
 }
 .row.out .bubble {
     background: linear-gradient(135deg, #6cb4f5, #4a9eef);
     color: #fff;
-    border-bottom-right-radius: 4px;
 }
-/* Хвостики у нижнего угла пузыря, направлены к аватарке */
-.row.in .bubble::before {
-    content: "";
-    position: absolute;
-    left: -6px; bottom: 0;
-    width: 0; height: 0;
-    border-style: solid;
-    border-width: 0 8px 8px 0;
-    border-color: transparent #f1f4f8 transparent transparent;
-}
-.row.out .bubble::before {
-    content: "";
-    position: absolute;
-    right: -6px; bottom: 0;
-    width: 0; height: 0;
-    border-style: solid;
-    border-width: 0 0 8px 8px;
-    border-color: transparent transparent transparent #4a9eef;
-}
-
-/* В цепочке "тех же" сообщений хвост не рисуем у промежуточных */
-.row.same .bubble::before { display: none; }
 
 .bubble .time {
     display: inline-block;
