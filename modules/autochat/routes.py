@@ -91,6 +91,29 @@ async def autochat_stop(session_id: int, request: Request):
         return _err(e)
 
 
+# Ручная (re)генерация HTML-отчёта. Изначально отчёт создаётся
+# автоматически в _on_session_finished_by_llm — этот эндпоинт нужен
+# для двух кейсов:
+#   1) дебаг / проверка дизайна на реально существующей сессии без
+#      ожидания пока LLM сама поставит <finishdialog/>;
+#   2) ручная перегенерация уже существующего отчёта после правок шаблона.
+# Работает на сессии в любом статусе. ON CONFLICT в INSERT гарантирует
+# идемпотентность — повторный вызов перезаписывает запись и файл.
+@router.post("/sessions/{session_id}/build-report")
+async def autochat_build_report(session_id: int):
+    from .report import save_report_for_session
+    key = await save_report_for_session(session_id)
+    if key is None:
+        return JSONResponse(
+            status_code=500,
+            content={"error": {
+                "code": "REPORT_BUILD_FAILED",
+                "message": "see autochat.report_failed in event bus for details",
+            }},
+        )
+    return {"session_id": session_id, "minio_key": key}
+
+
 # ─── Toggle для существующего диалога ─────────────────────────────────
 # Эти endpoint'ы дёргают AutoChatService напрямую. Регистрируются на
 # отдельном роутере без префикса /autochat — чтобы UI обращался
