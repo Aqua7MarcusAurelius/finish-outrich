@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     MINIO_ROOT_USER: str = ""
     MINIO_ROOT_PASSWORD: str = ""
     MINIO_BUCKET: str = "tgframework"
+    # Отдельный бакет для HTML-отчётов автодиалогов, завершённых LLM
+    # маркером <finishdialog/>. Хранятся долго (в отличие от медиа в
+    # MINIO_BUCKET, где TTL 3 дня) — отдельный бакет нужен чтобы у них
+    # не пересекались политики lifecycle.
+    MINIO_REPORTS_BUCKET: str = "autochat-reports"
 
     # Telegram API (общие креды для всех аккаунтов, берутся с my.telegram.org)
     TELEGRAM_API_ID: int = 0

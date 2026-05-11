@@ -83,6 +83,9 @@ class EventType:
     # LLM решила что цели разговора достигнуты — поставила маркер
     # <finishdialog/>. После отправки последнего сегмента сессия гасится.
     AUTOCHAT_FINISHED_BY_LLM = "autochat.finished_by_llm"
+    # HTML-отчёт по сессии успешно/неуспешно сохранён в MinIO.
+    AUTOCHAT_REPORT_SAVED = "autochat.report_saved"
+    AUTOCHAT_REPORT_FAILED = "autochat.report_failed"
 
     # Тайпинг собеседника — публикует враппер, слушает AutoChat
     DIALOG_TYPING_OBSERVED = "dialog.typing_observed"
