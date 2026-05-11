@@ -2,9 +2,9 @@
 HTML-отчёт по автодиалогу, завершённому LLM (`<finishdialog/>`).
 
 Single-file HTML с встроенным CSS — открывается в браузере и читается
-как переписка (пузыри: наши справа, собеседника слева). Заливается
-в MinIO-бакет settings.MINIO_REPORTS_BUCKET, ссылка пишется в новую
-таблицу autochat_reports.
+как переписка (пузыри в стиле Telegram, инициалы-аватарки, цитаты на
+ответы). Заливается в MinIO-бакет settings.MINIO_REPORTS_BUCKET, ссылка
+пишется в новую таблицу autochat_reports.
 
 Точка входа — save_report_for_session(session_id). Вызывается из
 AutoChatService._on_session_finished_by_llm. Best-effort: ошибки
@@ -65,8 +65,9 @@ async def _load_session_context(session_id: int) -> dict[str, Any] | None:
 
 async def _load_messages(dialog_id: int) -> list[dict[str, Any]]:
     """
-    Все сообщения диалога по дате. Берём только то, что нужно для рендера
-    переписки — text, направление, время, тип. Медиа выводим как плейсхолдер.
+    Все сообщения диалога по дате. Для каждого тянем поля reply_* из
+    цитируемого сообщения (LEFT JOIN messages на самого себя) — чтобы
+    в HTML отрисовать цитату-полоску внутри пузыря.
     """
     pool = db.get_pool()
     async with pool.acquire() as conn:
@@ -78,8 +79,14 @@ async def _load_messages(dialog_id: int) -> list[dict[str, Any]]:
                 m.type,
                 m.date,
                 m.text,
-                EXISTS (SELECT 1 FROM media WHERE message_id = m.id) AS has_media
+                EXISTS (SELECT 1 FROM media WHERE message_id = m.id) AS has_media,
+                p.id          AS reply_id,
+                p.text        AS reply_text,
+                p.is_outgoing AS reply_is_outgoing,
+                p.type        AS reply_type,
+                EXISTS (SELECT 1 FROM media WHERE message_id = p.id) AS reply_has_media
             FROM messages m
+            LEFT JOIN messages p ON p.id = m.reply_to_message_id
             WHERE m.dialog_id = $1
               AND m.deleted_at IS NULL
             ORDER BY m.date ASC, m.id ASC
@@ -107,15 +114,37 @@ def _format_duration(start: datetime, end: datetime) -> str:
 
 
 def _format_dt(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def _format_time(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%H:%M")
 
 
+_MONTHS_RU = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
+
+
 def _format_date_sep(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%d.%m.%Y")
+    """'11 мая 2026' — для плашки-разделителя дней."""
+    d = dt.astimezone(timezone.utc)
+    return f"{d.day} {_MONTHS_RU[d.month - 1]} {d.year}"
+
+
+def _media_placeholder(msg_type: str) -> str:
+    """Короткий ярлычок для сообщений без текста."""
+    return {
+        "photo": "[фото]",
+        "video": "[видео]",
+        "voice": "[голосовое]",
+        "audio": "[аудио]",
+        "sticker": "[стикер]",
+        "animation": "[GIF]",
+        "video_note": "[кружок]",
+        "document": "[документ]",
+    }.get(msg_type, "[медиа]")
 
 
 def _partner_display(ctx: dict[str, Any]) -> str:
@@ -131,135 +160,374 @@ def _partner_display(ctx: dict[str, Any]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Рендер HTML
+# Аватарки: инициалы + стабильный цвет
+# ─────────────────────────────────────────────────────────────────────
+
+# 12 пастельных цветов — достаточно отличимых для двух собеседников,
+# но не вырвиглазных в долгом отчёте.
+_AVATAR_PALETTE = [
+    "#e57373", "#f06292", "#ba68c8", "#9575cd",
+    "#7986cb", "#64b5f6", "#4fc3f7", "#4db6ac",
+    "#81c784", "#aed581", "#ffb74d", "#a1887f",
+]
+
+
+def _stable_color(seed: str) -> str:
+    """Цвет аватарки — стабильный хэш по строке (per-process не плавает)."""
+    if not seed:
+        return _AVATAR_PALETTE[0]
+    total = sum(ord(c) for c in seed)
+    return _AVATAR_PALETTE[total % len(_AVATAR_PALETTE)]
+
+
+def _initials(*parts: str | None) -> str:
+    """Первые буквы из 1-2 непустых частей: 'Иван Петров' → 'ИП'."""
+    chunks = [p.strip()[0] for p in parts if p and p.strip()]
+    if not chunks:
+        return "?"
+    return "".join(chunks[:2]).upper()
+
+
+def _partner_initials(ctx: dict[str, Any]) -> str:
+    first = ctx.get("partner_first_name") or ""
+    last = ctx.get("partner_last_name") or ""
+    if first or last:
+        return _initials(first, last)
+    uname = ctx.get("partner_username") or ctx.get("target_username") or ""
+    if uname:
+        return _initials(uname)
+    return "?"
+
+
+def _partner_seed(ctx: dict[str, Any]) -> str:
+    return (
+        (ctx.get("partner_username") or "")
+        + (ctx.get("partner_first_name") or "")
+        + (ctx.get("partner_last_name") or "")
+        + str(ctx.get("telegram_user_id") or "")
+    )
+
+
+def _worker_initials(ctx: dict[str, Any]) -> str:
+    name = ctx.get("worker_name") or ""
+    if name:
+        # 'Worker One' → 'WO', 'worker' → 'W'
+        parts = name.split()
+        return _initials(*parts) if len(parts) > 1 else _initials(parts[0])
+    phone = ctx.get("worker_phone") or ""
+    return _initials(phone or "?")
+
+
+def _worker_seed(ctx: dict[str, Any]) -> str:
+    return (ctx.get("worker_name") or "") + str(ctx.get("account_id") or "")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# CSS — встроенный, файл самодостаточный
 # ─────────────────────────────────────────────────────────────────────
 
 _CSS = """
 * { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
 body {
-    margin: 0;
-    background: #f0f2f5;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    color: #111;
+    background:
+        radial-gradient(circle at 20% 10%, rgba(99,179,237,0.18), transparent 40%),
+        radial-gradient(circle at 80% 80%, rgba(186,104,200,0.16), transparent 40%),
+        #eef2f7;
+    background-attachment: fixed;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: #14202d;
+    -webkit-font-smoothing: antialiased;
+    font-size: 14px;
+    line-height: 1.45;
 }
-.wrap { max-width: 760px; margin: 0 auto; padding: 24px 16px 64px; }
+.wrap { max-width: 820px; margin: 0 auto; padding: 28px 16px 56px; }
+
+/* ─── Header ─────────────────────────────────────────────────────── */
 .header {
-    background: #fff;
-    border-radius: 12px;
-    padding: 20px 24px;
-    margin-bottom: 16px;
-    box-shadow: 0 1px 3px rgba(0,0,0,.06);
+    background: #ffffff;
+    border-radius: 16px;
+    padding: 22px 24px 20px;
+    box-shadow: 0 8px 24px rgba(20, 32, 45, 0.06);
+    margin-bottom: 20px;
 }
-.header h1 {
-    margin: 0 0 4px 0;
-    font-size: 18px;
+.header-top {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 18px;
+}
+.header-avatars {
+    display: flex;
+    align-items: center;
+}
+.header-avatars .avatar { width: 42px; height: 42px; font-size: 15px; }
+.header-avatars .avatar + .avatar {
+    margin-left: -10px;
+    box-shadow: 0 0 0 3px #fff;
+}
+.header-title { flex: 1; min-width: 0; }
+.header-title h1 {
+    margin: 0;
+    font-size: 17px;
     font-weight: 600;
+    letter-spacing: -0.01em;
 }
-.header .sub {
-    color: #6b7280;
-    font-size: 13px;
-    margin-bottom: 12px;
+.header-title .sub {
+    color: #6b7c93;
+    font-size: 12.5px;
+    margin-top: 4px;
 }
-.meta-grid {
-    display: grid;
-    grid-template-columns: max-content 1fr;
-    gap: 6px 16px;
-    font-size: 13px;
+.finish-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: #e7f5ee;
+    color: #1f8b4c;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 11.5px;
+    font-weight: 500;
+    white-space: nowrap;
 }
-.meta-grid dt { color: #6b7280; }
-.meta-grid dd { margin: 0; color: #111; word-break: break-word; }
-.chat {
-    background: #fff;
-    border-radius: 12px;
-    padding: 16px;
-    box-shadow: 0 1px 3px rgba(0,0,0,.06);
+.finish-badge::before {
+    content: "";
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: #1f8b4c;
 }
-.date-sep {
-    text-align: center;
-    color: #6b7280;
+
+/* ─── Метаданные-чипы ────────────────────────────────────────────── */
+.chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 8px;
+}
+.chip {
+    background: #f3f5f8;
+    padding: 6px 11px;
+    border-radius: 8px;
     font-size: 12px;
-    margin: 16px 0 12px;
-    position: relative;
+    color: #374151;
+    line-height: 1.3;
+}
+.chip b { color: #14202d; font-weight: 600; }
+
+/* ─── Chat container ─────────────────────────────────────────────── */
+.chat {
+    background: #ffffff;
+    border-radius: 16px;
+    padding: 18px 18px 24px;
+    box-shadow: 0 8px 24px rgba(20, 32, 45, 0.06);
+}
+
+/* Разделитель дат — плашка по центру */
+.date-sep {
+    display: flex;
+    justify-content: center;
+    margin: 18px 0 14px;
 }
 .date-sep span {
-    background: #fff;
-    padding: 0 10px;
-    position: relative;
-    z-index: 1;
+    background: rgba(60, 80, 105, 0.12);
+    color: #3c5069;
+    padding: 4px 12px;
+    border-radius: 999px;
+    font-size: 11.5px;
+    font-weight: 500;
 }
-.date-sep::before {
-    content: "";
-    position: absolute;
-    left: 0; right: 0; top: 50%;
-    height: 1px;
-    background: #e5e7eb;
+
+/* ─── Строка сообщения ───────────────────────────────────────────── */
+.row {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    margin: 4px 0;
 }
-.row { display: flex; margin: 6px 0; }
 .row.in  { justify-content: flex-start; }
 .row.out { justify-content: flex-end; }
+
+/* Сжимаем повторные подряд от того же отправителя */
+.row + .row.same      { margin-top: 2px; }
+.row.same .avatar     { visibility: hidden; }
+
+.avatar {
+    flex: none;
+    width: 32px; height: 32px;
+    border-radius: 50%;
+    color: #fff;
+    font-size: 12.5px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    user-select: none;
+    letter-spacing: -0.01em;
+}
+
+/* ─── Пузырь ─────────────────────────────────────────────────────── */
 .bubble {
-    max-width: 72%;
-    padding: 8px 12px;
-    border-radius: 14px;
-    font-size: 14px;
-    line-height: 1.4;
-    white-space: pre-wrap;
-    word-break: break-word;
+    max-width: 70%;
+    padding: 7px 12px 5px;
+    border-radius: 16px;
     position: relative;
+    word-wrap: break-word;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
 }
 .row.in  .bubble {
-    background: #f1f3f5;
+    background: #f1f4f8;
+    color: #14202d;
     border-bottom-left-radius: 4px;
 }
 .row.out .bubble {
-    background: #d6f0ff;
+    background: linear-gradient(135deg, #6cb4f5, #4a9eef);
+    color: #fff;
     border-bottom-right-radius: 4px;
 }
-.bubble .time {
-    display: block;
-    font-size: 11px;
-    color: #6b7280;
-    margin-top: 4px;
-    text-align: right;
+/* Хвостики у нижнего угла пузыря, направлены к аватарке */
+.row.in .bubble::before {
+    content: "";
+    position: absolute;
+    left: -6px; bottom: 0;
+    width: 0; height: 0;
+    border-style: solid;
+    border-width: 0 8px 8px 0;
+    border-color: transparent #f1f4f8 transparent transparent;
 }
-.bubble.media-only { color: #6b7280; font-style: italic; }
+.row.out .bubble::before {
+    content: "";
+    position: absolute;
+    right: -6px; bottom: 0;
+    width: 0; height: 0;
+    border-style: solid;
+    border-width: 0 0 8px 8px;
+    border-color: transparent transparent transparent #4a9eef;
+}
+
+/* В цепочке "тех же" сообщений хвост не рисуем у промежуточных */
+.row.same .bubble::before { display: none; }
+
+.bubble .time {
+    display: inline-block;
+    font-size: 10.5px;
+    opacity: 0.65;
+    margin-left: 8px;
+    float: right;
+    margin-top: 4px;
+    line-height: 1;
+    white-space: nowrap;
+}
+.row.out .bubble .time { color: rgba(255,255,255,0.85); opacity: 1; }
+
+.bubble.media-only {
+    font-style: italic;
+    opacity: 0.85;
+}
+
+/* ─── Цитата (reply) внутри пузыря ──────────────────────────────── */
+.reply {
+    border-left: 3px solid currentColor;
+    padding: 3px 8px;
+    margin-bottom: 5px;
+    border-radius: 4px;
+    background: rgba(255,255,255,0.18);
+    font-size: 12px;
+    line-height: 1.3;
+    opacity: 0.92;
+}
+.row.in .reply {
+    background: rgba(74, 158, 239, 0.08);
+    color: #355d8a;
+}
+.row.out .reply {
+    background: rgba(255,255,255,0.18);
+    color: #f0f8ff;
+}
+.reply b { display: block; font-weight: 600; margin-bottom: 1px; font-size: 11.5px; }
+.reply .qtext { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+
+/* ─── Пустое состояние ───────────────────────────────────────────── */
 .empty {
     text-align: center;
-    color: #6b7280;
-    padding: 32px 0;
+    color: #8a99af;
+    padding: 36px 0;
     font-style: italic;
+    font-size: 13px;
+}
+
+/* ─── Footer ─────────────────────────────────────────────────────── */
+.footer {
+    text-align: center;
+    color: #8a99af;
+    font-size: 11.5px;
+    margin-top: 18px;
 }
 """.strip()
 
 
-def _media_placeholder(msg_type: str) -> str:
-    """Короткий ярлычок для сообщений без текста (фото/видео/etc)."""
-    return {
-        "photo": "[фото]",
-        "video": "[видео]",
-        "voice": "[голосовое]",
-        "audio": "[аудио]",
-        "sticker": "[стикер]",
-        "animation": "[GIF]",
-        "video_note": "[кружок]",
-        "document": "[документ]",
-    }.get(msg_type, "[медиа]")
+# ─────────────────────────────────────────────────────────────────────
+# Рендер
+# ─────────────────────────────────────────────────────────────────────
+
+_REPLY_TEXT_MAX = 90
 
 
-def _render_messages(messages: list[dict[str, Any]]) -> str:
+def _reply_snippet(text: str | None, has_media: bool, msg_type: str | None) -> str:
+    """Текст в цитате-плашке: либо обрезанный text, либо ярлык медиа."""
+    if text:
+        snippet = text.strip().replace("\n", " ")
+        if len(snippet) > _REPLY_TEXT_MAX:
+            snippet = snippet[: _REPLY_TEXT_MAX - 1] + "…"
+        return snippet
+    if has_media:
+        return _media_placeholder(msg_type or "")
+    return "сообщение"
+
+
+def _render_reply(m: dict[str, Any], ctx: dict[str, Any]) -> str:
+    """Маленькая плашка-цитата вверху пузыря, если у сообщения есть reply_to."""
+    if m.get("reply_id") is None:
+        return ""
+    is_out = bool(m.get("reply_is_outgoing"))
+    who = ctx.get("worker_name") or "Воркер" if is_out else (
+        _partner_display(ctx).split(" (")[0]  # только handle, без full name
+    )
+    snippet = _reply_snippet(
+        m.get("reply_text"),
+        bool(m.get("reply_has_media")),
+        m.get("reply_type"),
+    )
+    return (
+        f'<div class="reply">'
+        f'<b>{escape(who)}</b>'
+        f'<span class="qtext">{escape(snippet)}</span>'
+        f'</div>'
+    )
+
+
+def _render_messages(messages: list[dict[str, Any]], ctx: dict[str, Any]) -> str:
     if not messages:
         return '<div class="empty">В этом диалоге нет сообщений.</div>'
 
+    p_initials = _partner_initials(ctx)
+    p_color = _stable_color(_partner_seed(ctx))
+    w_initials = _worker_initials(ctx)
+    w_color = _stable_color(_worker_seed(ctx))
+
     out: list[str] = []
     last_date: str | None = None
+    last_is_outgoing: bool | None = None
+    rendered_any = False
+
     for m in messages:
         dt: datetime = m["date"]
         date_str = _format_date_sep(dt)
         if date_str != last_date:
             out.append(f'<div class="date-sep"><span>{escape(date_str)}</span></div>')
             last_date = date_str
+            last_is_outgoing = None  # после разделителя — сбрасываем
 
-        side = "out" if m["is_outgoing"] else "in"
+        is_out = bool(m["is_outgoing"])
         text = m.get("text") or ""
         has_media = m.get("has_media")
         if text:
@@ -269,26 +537,52 @@ def _render_messages(messages: list[dict[str, Any]]) -> str:
             body = escape(_media_placeholder(m.get("type") or ""))
             media_cls = " media-only"
         else:
-            # Сервисное / пустое сообщение — не показываем.
+            # Сервисное / пустое сообщение — пропускаем.
             continue
 
-        time_str = _format_time(dt)
-        out.append(
-            f'<div class="row {side}">'
-            f'<div class="bubble{media_cls}">'
-            f'{body}<span class="time">{escape(time_str)}</span>'
-            f'</div></div>'
-        )
-    if not out or all(s.startswith('<div class="date-sep"') for s in out):
+        side = "out" if is_out else "in"
+        same = " same" if last_is_outgoing == is_out else ""
+
+        if is_out:
+            avatar_html = (
+                f'<div class="avatar" style="background:{escape(w_color)};">'
+                f'{escape(w_initials)}</div>'
+            )
+        else:
+            avatar_html = (
+                f'<div class="avatar" style="background:{escape(p_color)};">'
+                f'{escape(p_initials)}</div>'
+            )
+
+        reply_html = _render_reply(m, ctx)
+        time_html = f'<span class="time">{escape(_format_time(dt))}</span>'
+
+        if is_out:
+            # бабл слева, аватарка справа
+            row_html = (
+                f'<div class="row out{same}">'
+                f'<div class="bubble{media_cls}">{reply_html}{body}{time_html}</div>'
+                f'{avatar_html}'
+                f'</div>'
+            )
+        else:
+            row_html = (
+                f'<div class="row in{same}">'
+                f'{avatar_html}'
+                f'<div class="bubble{media_cls}">{reply_html}{body}{time_html}</div>'
+                f'</div>'
+            )
+        out.append(row_html)
+        last_is_outgoing = is_out
+        rendered_any = True
+
+    if not rendered_any:
         return '<div class="empty">В этом диалоге нет текстовых сообщений.</div>'
     return "\n".join(out)
 
 
 def build_html(ctx: dict[str, Any], messages: list[dict[str, Any]]) -> str:
-    """
-    Собрать самодостаточный HTML. ctx — выход _load_session_context,
-    messages — выход _load_messages.
-    """
+    """Самодостаточный HTML — открывается в браузере, читается как чат."""
     started: datetime = ctx["started_at"]
     finished: datetime = ctx["finished_at"]
     our_count = sum(1 for m in messages if m["is_outgoing"])
@@ -298,38 +592,55 @@ def build_html(ctx: dict[str, Any], messages: list[dict[str, Any]]) -> str:
     worker_phone = ctx.get("worker_phone") or ""
     partner = _partner_display(ctx)
     tg_id = ctx["telegram_user_id"]
+    duration = _format_duration(started, finished)
 
-    body = _render_messages(messages)
+    p_color = _stable_color(_partner_seed(ctx))
+    w_color = _stable_color(_worker_seed(ctx))
+    p_init = _partner_initials(ctx)
+    w_init = _worker_initials(ctx)
+
+    body = _render_messages(messages, ctx)
+    now_str = _format_dt(datetime.now(timezone.utc))
 
     return (
-        f'<!doctype html>\n'
-        f'<html lang="ru">\n'
-        f'<head>\n'
-        f'<meta charset="utf-8">\n'
-        f'<title>Autochat session #{escape(str(ctx["session_id"]))} — {escape(partner)}</title>\n'
+        '<!doctype html>\n'
+        '<html lang="ru">\n'
+        '<head>\n'
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f'<title>Autochat #{escape(str(ctx["session_id"]))} — {escape(partner)}</title>\n'
         f'<style>{_CSS}</style>\n'
-        f'</head>\n'
-        f'<body>\n'
-        f'<div class="wrap">\n'
-        f'  <div class="header">\n'
-        f'    <h1>Автодиалог #{escape(str(ctx["session_id"]))}</h1>\n'
-        f'    <div class="sub">Завершён LLM (&lt;finishdialog/&gt;)</div>\n'
-        f'    <dl class="meta-grid">\n'
-        f'      <dt>Воркер</dt><dd>{escape(worker_label)}'
-        f'{(" — " + escape(worker_phone)) if worker_phone else ""}</dd>\n'
-        f'      <dt>Собеседник</dt><dd>{escape(partner)} (tg_id={escape(str(tg_id))})</dd>\n'
-        f'      <dt>Начало</dt><dd>{escape(_format_dt(started))}</dd>\n'
-        f'      <dt>Финиш</dt><dd>{escape(_format_dt(finished))}</dd>\n'
-        f'      <dt>Длительность</dt><dd>{escape(_format_duration(started, finished))}</dd>\n'
-        f'      <dt>Сообщений</dt><dd>{our_count} наших / {their_count} от собеседника</dd>\n'
-        f'    </dl>\n'
-        f'  </div>\n'
-        f'  <div class="chat">\n'
+        '</head>\n'
+        '<body>\n'
+        '  <div class="wrap">\n'
+        '    <div class="header">\n'
+        '      <div class="header-top">\n'
+        '        <div class="header-avatars">\n'
+        f'          <div class="avatar" style="background:{escape(w_color)};">{escape(w_init)}</div>\n'
+        f'          <div class="avatar" style="background:{escape(p_color)};">{escape(p_init)}</div>\n'
+        '        </div>\n'
+        '        <div class="header-title">\n'
+        f'          <h1>Автодиалог #{escape(str(ctx["session_id"]))}</h1>\n'
+        f'          <div class="sub">{escape(worker_label)}'
+        f'{(" · " + escape(worker_phone)) if worker_phone else ""} → {escape(partner)}</div>\n'
+        '        </div>\n'
+        '        <div class="finish-badge">завершён LLM</div>\n'
+        '      </div>\n'
+        '      <div class="chips">\n'
+        f'        <span class="chip"><b>Старт</b> {escape(_format_dt(started))}</span>\n'
+        f'        <span class="chip"><b>Финиш</b> {escape(_format_dt(finished))}</span>\n'
+        f'        <span class="chip"><b>Длительность</b> {escape(duration)}</span>\n'
+        f'        <span class="chip"><b>Сообщений</b> {our_count} наших · {their_count} от собеседника</span>\n'
+        f'        <span class="chip"><b>tg_id</b> {escape(str(tg_id))}</span>\n'
+        '      </div>\n'
+        '    </div>\n'
+        '    <div class="chat">\n'
         f'{body}\n'
-        f'  </div>\n'
-        f'</div>\n'
-        f'</body>\n'
-        f'</html>\n'
+        '    </div>\n'
+        f'    <div class="footer">отчёт сгенерирован {escape(now_str)}</div>\n'
+        '  </div>\n'
+        '</body>\n'
+        '</html>\n'
     )
 
 
