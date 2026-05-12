@@ -523,6 +523,37 @@ class TelegramWrapper:
             return await self.client.delete_dialog(dialog, revoke=revoke)
         await self._guard(_do)
 
+    async def prime_entity_cache_and_list(self) -> set[int]:
+        """
+        Прогревает session-кэш Telethon и возвращает множество
+        telegram_user_id'ов, которые СЕЙЧАС присутствуют в dialog list
+        аккаунта.
+
+        Нужен для bulk-операций (modules/history/wipe.py):
+          1. После `iter_dialogs()` Telethon кэширует access_hash для
+             каждого peer'a → `delete_dialog(int)` не падает на
+             "Could not find the input entity".
+          2. По возвращённому set'у можно отличить диалоги, которые
+             у нас есть локально, но на стороне Telegram уже не лежат
+             (например, ранее были удалены вручную или ушли в архив,
+             который мы не итерируем) — для них tg-side delete не
+             имеет смысла, делаем только локальную чистку.
+        """
+        if self._client is None:
+            raise NotConnected("Сначала вызвать connect()")
+        ids: set[int] = set()
+        try:
+            async for d in self._client.iter_dialogs():
+                if not getattr(d, "is_user", False):
+                    continue
+                uid = getattr(d.entity, "id", None)
+                if uid is not None:
+                    ids.add(int(uid))
+        except _SESSION_EXPIRED_ERRORS as e:
+            await self._publish_session_expired(str(e))
+            raise SessionExpired(str(e)) from e
+        return ids
+
     async def resolve_username(self, username: str) -> dict[str, Any]:
         """
         Резолв @username → снимок профиля User entity.

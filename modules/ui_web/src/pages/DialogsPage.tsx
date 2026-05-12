@@ -201,20 +201,23 @@ export function DialogsPage() {
           setWipeBusy(true);
           try {
             const r = await api.wipeAccountDialogs(wipeTargetId);
+            const partGone = r.deleted_local_only > 0
+              ? ` Из них ${r.deleted_local_only} — только локально (в Telegram их уже не было).`
+              : "";
             if (r.stopped && r.reason === "flood_wait") {
               toast.error(
                 `Wipe прервался (FloodWait)`,
-                `Удалено: ${r.deleted}/${r.processed_total}. Повтори через ${r.retry_after_seconds ?? "?"} сек.`,
+                `Удалено: ${r.deleted}/${r.processed_total}. Повтори через ${r.retry_after_seconds ?? "?"} сек.${partGone}`,
               );
             } else if (r.failed.length > 0) {
               toast.error(
                 `Wipe закончился с ошибками`,
-                `Удалено: ${r.deleted}/${r.processed_total}, ошибок: ${r.failed.length}.`,
+                `Удалено: ${r.deleted}/${r.processed_total}, ошибок: ${r.failed.length}.${partGone}`,
               );
             } else {
               toast.success(
                 `Wipe завершён`,
-                `Удалено диалогов: ${r.deleted}.`,
+                `Удалено диалогов: ${r.deleted}.${partGone}`,
               );
             }
             // Список диалогов и счётчик в карточке аккаунта меняются — рефетчим.

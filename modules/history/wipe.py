@@ -2,18 +2,23 @@
 Bulk-операция: снести все диалоги одного аккаунта.
 
 Используется ручкой `POST /accounts/{id}/dialogs/wipe?confirm=CONFIRM`
-(см. routes.py). Делает две вещи на каждый диалог:
-  1. Удаление на стороне Telegram через wrapper.delete_dialog(revoke=True)
-     — стирает историю и у собеседника тоже.
-  2. Локальную зачистку — переиспользует purge_dialog_locally из routes.py
+(см. api/routes/accounts.py). Для каждого диалога:
+  1. Если он есть в текущем Telegram dialog list — `wrapper.delete_dialog(revoke=True)`.
+  2. Если нет (диалог локально остался, а в Telegram его уже нет) —
+     tg-side пропускаем, делаем только локальный wipe.
+  3. Локальный wipe — переиспользуем `purge_dialog_locally` из routes.py
      (тот же flow, что у штучного DELETE /dialogs/{id}).
 
-FloodWait: при коротких задержках (<= 30s) делаем sleep+retry того же
-диалога; при длинных — останавливаемся и возвращаем партиал, чтобы
-оператор повторил после паузы. Любая другая ошибка на конкретном
-диалоге — складываем в `failed`, но цикл продолжаем.
+Категории в ответе:
+  - deleted_full        — TG + local OK
+  - deleted_local_only  — TG не было (already_gone), local OK
+  - failed              — TG-side реальная ошибка (не «нет entity») ИЛИ
+                          local purge упал. UI красит это в красный.
 
-См. docs/dev_diary/9.13_wipe_all_dialogs.md.
+FloodWait: <=30s — sleep+retry; >30s — обрываем цикл с partial result.
+Между диалогами пауза 300мс (страховка от rate limit).
+
+См. docs/dev_diary/9.13_wipe_all_dialogs.md (исходно) и 9.14 (фикс).
 """
 from __future__ import annotations
 
@@ -33,9 +38,7 @@ from modules.worker.wrapper import (
 log = logging.getLogger(__name__)
 
 
-# Короткий FloodWait — спим и ретраим. Длинный — выходим с partial result.
 _FLOOD_WAIT_SHORT_SEC = 30
-# Пауза между удалениями — дешёвая защита от попадания в rate limit.
 _INTER_DELETE_SLEEP_SEC = 0.3
 
 
@@ -49,26 +52,17 @@ async def wipe_all_dialogs(
     """
     Удалить все диалоги аккаунта на стороне Telegram + локально.
 
-    Бросает:
-      - ValueError("INVALID_CONFIRM") — если confirm != "CONFIRM".
-      - ValueError("WORKER_NOT_RUNNING") — если у аккаунта нет живого wrapper'а.
-      - ValueError("ACCOUNT_NOT_FOUND") — если такого account_id нет в БД.
+    Бросает (ValueError с кодом):
+      - INVALID_CONFIRM      — confirm != "CONFIRM".
+      - ACCOUNT_NOT_FOUND    — нет такого account_id.
+      - WORKER_NOT_RUNNING   — у аккаунта нет живого wrapper'а.
 
-    Возвращает dict:
-        {
-            "account_id": int,
-            "deleted": int,                       # сколько успешно
-            "failed": [{dialog_id, telegram_user_id, error}],
-            "stopped": bool,                      # True если прерывание по long FloodWait
-            "reason": str | None,                 # "flood_wait" если stopped
-            "retry_after_seconds": int | None,    # сколько ждать перед повтором
-            "processed_total": int,               # сколько диалогов взяли в работу
-        }
+    Возвращает агрегат (см. модульный docstring).
     """
     if confirm != "CONFIRM":
         raise ValueError("INVALID_CONFIRM")
 
-    # Импорт внутри — избегаем циклической зависимости routes <-> wipe.
+    # Ленивый импорт — избегаем циклической зависимости routes <-> wipe.
     from .routes import purge_dialog_locally
 
     pool = db.get_pool()
@@ -92,14 +86,32 @@ async def wipe_all_dialogs(
     if wrapper is None:
         raise ValueError("WORKER_NOT_RUNNING")
 
-    deleted = 0
+    # Прогрев кэша + срез текущих peer'ов в TG dialog list. Best-effort:
+    # если прогрев упал — продолжаем без фильтрации (tg_present_ids=None),
+    # и решение «делать tg-side» принимаем оптимистично, ловя ValueError
+    # уже при самом delete_dialog'е.
+    tg_present_ids: set[int] | None
+    try:
+        tg_present_ids = await wrapper.prime_entity_cache_and_list()
+        log.info(
+            "wipe: account=%s primed cache, %d tg dialogs visible",
+            account_id, len(tg_present_ids),
+        )
+    except WrapperSessionExpired:
+        raise ValueError("WORKER_NOT_RUNNING")
+    except Exception:
+        log.exception("wipe: account=%s prime cache failed (non-fatal)", account_id)
+        tg_present_ids = None
+
+    deleted_full = 0
+    deleted_local_only = 0
     failed: list[dict[str, Any]] = []
     stopped = False
     reason: str | None = None
     retry_after: int | None = None
 
     log.info(
-        "wipe: account=%s starting (total=%d, revoke=%s)",
+        "wipe: account=%s starting (local_total=%d, revoke=%s)",
         account_id, len(dialogs), revoke,
     )
 
@@ -107,47 +119,71 @@ async def wipe_all_dialogs(
         dialog_id = int(d["id"])
         tg_user_id = int(d["telegram_user_id"])
 
-        # Telegram-side delete с одной попыткой retry на короткий FloodWait.
-        try:
-            await _delete_on_telegram_with_retry(wrapper, tg_user_id, revoke=revoke)
-        except _FloodWaitTooLong as e:
-            stopped = True
-            reason = "flood_wait"
-            retry_after = e.seconds
-            log.warning(
-                "wipe: account=%s stopped on dialog=%s (FloodWait %ss)",
-                account_id, dialog_id, e.seconds,
-            )
-            break
-        except WrapperSessionExpired as e:
-            # Сессия протухла — продолжать смысла нет, всё дальше упадёт.
-            stopped = True
-            reason = "session_expired"
-            failed.append({
-                "dialog_id": dialog_id, "telegram_user_id": tg_user_id,
-                "error": f"session_expired: {e}",
-            })
-            log.warning("wipe: account=%s session_expired, stopping", account_id)
-            break
-        except (WrapperError, Exception) as e:
-            # Прочие ошибки на конкретном диалоге — фиксируем и идём дальше.
-            # Локальный wipe всё равно сделаем — там нет внешних зависимостей.
-            log.exception(
-                "wipe: account=%s tg-side delete failed for dialog=%s",
+        # Решаем: пытаться ли tg-side delete.
+        in_tg = (tg_present_ids is None) or (tg_user_id in tg_present_ids)
+
+        tg_side_ok = False
+        tg_side_skipped_not_found = False
+
+        if in_tg:
+            try:
+                await _delete_on_telegram_with_retry(wrapper, tg_user_id, revoke=revoke)
+                tg_side_ok = True
+            except _FloodWaitTooLong as e:
+                stopped = True
+                reason = "flood_wait"
+                retry_after = e.seconds
+                log.warning(
+                    "wipe: account=%s stopped on dialog=%s (FloodWait %ss)",
+                    account_id, dialog_id, e.seconds,
+                )
+                break
+            except WrapperSessionExpired as e:
+                stopped = True
+                reason = "session_expired"
+                failed.append({
+                    "dialog_id": dialog_id, "telegram_user_id": tg_user_id,
+                    "stage": "tg_delete", "error": f"session_expired: {e}",
+                })
+                log.warning("wipe: account=%s session_expired, stopping", account_id)
+                break
+            except _EntityNotFound:
+                # tg уже не знает этот peer — относимся как к "already gone".
+                tg_side_skipped_not_found = True
+                log.info(
+                    "wipe: account=%s tg entity gone for dialog=%s, local-only",
+                    account_id, dialog_id,
+                )
+            except (WrapperError, Exception) as e:
+                log.exception(
+                    "wipe: account=%s tg-side delete failed for dialog=%s",
+                    account_id, dialog_id,
+                )
+                failed.append({
+                    "dialog_id": dialog_id, "telegram_user_id": tg_user_id,
+                    "stage": "tg_delete", "error": str(e)[:300],
+                })
+                # Идём дальше — пробуем хотя бы локальную чистку.
+        else:
+            tg_side_skipped_not_found = True
+            log.info(
+                "wipe: account=%s tg-side skipped for dialog=%s (not in TG list)",
                 account_id, dialog_id,
             )
-            failed.append({
-                "dialog_id": dialog_id, "telegram_user_id": tg_user_id,
-                "error": f"tg_delete_failed: {e}",
-            })
-            # Намеренно идём дальше — пробуем локальную чистку.
 
-        # Локальная чистка.
+        # Локальная чистка делается всегда (если не сломали break-ом выше).
         try:
             await purge_dialog_locally(
                 dialog_id, request=request, autochat_service=autochat_service,
             )
-            deleted += 1
+            if tg_side_ok:
+                deleted_full += 1
+            elif tg_side_skipped_not_found:
+                deleted_local_only += 1
+            # Иначе: tg-side упал с реальной ошибкой → она уже в failed.
+            # Локальный purge всё-таки прошёл — это лучше чем оставлять
+            # неконсистентное состояние, и счётчик deleted_local_only тут
+            # не растёт (чтобы не мешать с реально «чистыми» случаями).
         except Exception as e:
             log.exception(
                 "wipe: account=%s local purge failed for dialog=%s",
@@ -155,15 +191,16 @@ async def wipe_all_dialogs(
             )
             failed.append({
                 "dialog_id": dialog_id, "telegram_user_id": tg_user_id,
-                "error": f"local_purge_failed: {e}",
+                "stage": "local_purge", "error": str(e)[:300],
             })
 
-        # Маленькая пауза между диалогами — снижает шанс FloodWait.
         await asyncio.sleep(_INTER_DELETE_SLEEP_SEC)
 
     summary = {
         "account_id": account_id,
-        "deleted": deleted,
+        "deleted_full": deleted_full,
+        "deleted_local_only": deleted_local_only,
+        "deleted": deleted_full + deleted_local_only,  # обратная совместимость
         "failed": failed,
         "stopped": stopped,
         "reason": reason,
@@ -171,14 +208,14 @@ async def wipe_all_dialogs(
         "processed_total": len(dialogs),
     }
 
-    # Агрегирующее событие в шину.
     await bus.publish(
         module=Module.API,
         type=EventType.ACCOUNT_DIALOGS_WIPED,
-        status=Status.SUCCESS if not failed and not stopped else Status.ERROR,
+        status=Status.SUCCESS if (not failed and not stopped) else Status.ERROR,
         account_id=account_id,
         data={
-            "deleted": deleted,
+            "deleted_full": deleted_full,
+            "deleted_local_only": deleted_local_only,
             "failed_count": len(failed),
             "stopped": stopped,
             "reason": reason,
@@ -189,8 +226,8 @@ async def wipe_all_dialogs(
     )
 
     log.info(
-        "wipe: account=%s done (deleted=%d, failed=%d, stopped=%s)",
-        account_id, deleted, len(failed), stopped,
+        "wipe: account=%s done (full=%d, local_only=%d, failed=%d, stopped=%s)",
+        account_id, deleted_full, deleted_local_only, len(failed), stopped,
     )
     return summary
 
@@ -206,13 +243,25 @@ class _FloodWaitTooLong(Exception):
         self.seconds = seconds
 
 
+class _EntityNotFound(Exception):
+    """Telegram не знает access_hash для этого peer'a — tg-side пропускаем."""
+
+
+# Telethon бросает обычный ValueError со специфическим текстом для случая,
+# когда entity нельзя зарезолвить. Отдельного исключения у него нет — ловим
+# по подстроке. (Альтернатива: catch-all и потом классификация — но текст
+# стабильный и в Telethon специально оставлен таким.)
+_ENTITY_NOT_FOUND_MARKER = "Could not find the input entity"
+
+
 async def _delete_on_telegram_with_retry(
     wrapper: Any, tg_user_id: int, *, revoke: bool,
 ) -> None:
     """
     Одна попытка delete + (опционально) один retry после короткого
-    FloodWait. Длинный FloodWait → _FloodWaitTooLong (внешний цикл
-    останавливается и возвращает partial result).
+    FloodWait. Длинный FloodWait → _FloodWaitTooLong. Ошибка резолва
+    entity → _EntityNotFound (внешний цикл считает такой случай
+    `deleted_local_only`, а не failure).
     """
     try:
         await wrapper.delete_dialog(tg_user_id, revoke=revoke)
@@ -223,11 +272,18 @@ async def _delete_on_telegram_with_retry(
             raise _FloodWaitTooLong(wait) from e
         log.info("wipe: short FloodWait %ss on user=%s, retrying", wait, tg_user_id)
         await asyncio.sleep(wait + 1)
+    except ValueError as e:
+        if _ENTITY_NOT_FOUND_MARKER in str(e):
+            raise _EntityNotFound() from e
+        raise
 
-    # Ровно один retry — если снова FloodWait, считаем «длинной» защитой
-    # от бесконечного цикла.
+    # Один retry после короткого FloodWait.
     try:
         await wrapper.delete_dialog(tg_user_id, revoke=revoke)
     except FloodWaitError as e:
         wait = int(getattr(e, "seconds", 0) or 0)
         raise _FloodWaitTooLong(wait) from e
+    except ValueError as e:
+        if _ENTITY_NOT_FOUND_MARKER in str(e):
+            raise _EntityNotFound() from e
+        raise

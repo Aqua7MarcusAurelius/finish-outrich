@@ -311,8 +311,14 @@ export const api = {
   wipeAccountDialogs: (accountId: number) =>
     request<{
       account_id: number;
+      // deleted = deleted_full + deleted_local_only — оставлено для совместимости.
+      // deleted_full       — TG + локально снесено
+      // deleted_local_only — TG не нужно было трогать (или уже не было) — только локально
+      // failed             — реальные сбои (tg_delete real-error или local_purge)
       deleted: number;
-      failed: { dialog_id: number; telegram_user_id: number; error: string }[];
+      deleted_full: number;
+      deleted_local_only: number;
+      failed: { dialog_id: number; telegram_user_id: number; stage: string; error: string }[];
       stopped: boolean;
       reason: string | null;
       retry_after_seconds: number | null;
