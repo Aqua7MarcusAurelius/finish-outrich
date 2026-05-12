@@ -46,6 +46,18 @@ def _iso(dt: Any) -> str | None:
 
 
 def _dialog_to_dict(row: Any) -> dict[str, Any]:
+    # Операторский «пузырь» — каталог в таблице dialog_statuses,
+    # управляется модулем dialog_statuses. SELECT'ы выше LEFT JOIN'ят
+    # его, поэтому здесь просто читаем уже подцепленные поля. None,
+    # если status_id IS NULL или JOIN не был сделан.
+    keys = row.keys()
+    status_obj: dict[str, Any] | None = None
+    if "status_id" in keys and row["status_id"] is not None:
+        status_obj = {
+            "id": int(row["status_id"]),
+            "label": row["status_label"] if "status_label" in keys else None,
+            "color": row["status_color"] if "status_color" in keys else None,
+        }
     return {
         "id": row["id"],
         "account_id": row["account_id"],
@@ -61,9 +73,7 @@ def _dialog_to_dict(row: Any) -> dict[str, Any]:
         "contact_first_name": row["contact_first_name"],
         "contact_last_name": row["contact_last_name"],
         "is_bot": row["is_bot"],
-        # Чисто визуальный статус оператора (UI-only). Допустимые значения
-        # определены на фронте: talking/waiting/done/failed. None = «без статуса».
-        "user_status": row["user_status"] if "user_status" in row.keys() else None,
+        "status": status_obj,
         "created_at": _iso(row["created_at"]),
         "updated_at": _iso(row["updated_at"]),
     }
@@ -255,10 +265,13 @@ async def list_dialogs(
             """
             SELECT
                 d.*,
+                ds.label AS status_label,
+                ds.color AS status_color,
                 lm.date AS last_message_date,
                 lm.text AS last_message_text,
                 lm.is_outgoing AS last_message_is_outgoing
             FROM dialogs d
+            LEFT JOIN dialog_statuses ds ON ds.id = d.status_id
             LEFT JOIN LATERAL (
                 SELECT date, text, is_outgoing
                 FROM messages
@@ -298,11 +311,14 @@ async def get_dialog(dialog_id: int):
             """
             SELECT
                 d.*,
+                ds.label AS status_label,
+                ds.color AS status_color,
                 (SELECT COUNT(*) FROM messages WHERE dialog_id = d.id) AS messages_count,
                 (SELECT COUNT(*) FROM media m
                   JOIN messages msg ON msg.id = m.message_id
                   WHERE msg.dialog_id = d.id) AS media_count
             FROM dialogs d
+            LEFT JOIN dialog_statuses ds ON ds.id = d.status_id
             WHERE d.id = $1
             """,
             dialog_id,
@@ -444,40 +460,9 @@ async def delete_dialog(dialog_id: int, request: Request):
     return None
 
 
-# ─────────────────────────────────────────────────────────────────────
-# PATCH /dialogs/{id}/status — пометка оператора (UI-only)
-# ─────────────────────────────────────────────────────────────────────
-
-class DialogStatusBody(BaseModel):
-    # None = «снять статус». На фронте допустимы 4 значения, но бэк
-    # принимает любую короткую строку — это операторская заметка,
-    # никакой логикой не используется.
-    status: Optional[str] = None
-
-
-@router.patch("/dialogs/{dialog_id}/status")
-async def patch_dialog_user_status(dialog_id: int, body: DialogStatusBody):
-    value = body.status
-    if value is not None:
-        value = value.strip()
-        if not value:
-            value = None
-        elif len(value) > 32:
-            raise HTTPException(400, {"error": {"code": "STATUS_TOO_LONG"}})
-
-    pool = db.get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            UPDATE dialogs SET user_status = $2, updated_at = NOW()
-            WHERE id = $1
-            RETURNING id, user_status
-            """,
-            dialog_id, value,
-        )
-    if row is None:
-        raise HTTPException(404, {"error": {"code": "DIALOG_NOT_FOUND"}})
-    return {"id": row["id"], "user_status": row["user_status"]}
+# PATCH /dialogs/{id}/status переехал в modules/dialog_statuses/routes.py
+# (там же CRUD каталога). Раньше принимал {status: str}, теперь
+# {status_id: int | null}.
 
 
 # ─────────────────────────────────────────────────────────────────────

@@ -22,6 +22,7 @@ class Module:
     SYSTEM = "system"
     BUS = "bus"
     AUTOCHAT = "autochat"
+    DIALOG_STATUSES = "dialog_statuses"
 
 
 class Status:
@@ -46,6 +47,13 @@ class EventType:
     # (POST /accounts/{id}/dialogs/wipe). Каждый успешно удалённый диалог
     # шлёт свой `dialog.deleted`; это — итоговый агрегат на всю операцию.
     ACCOUNT_DIALOGS_WIPED = "account.dialogs_wiped"
+    # Операторская «пометка» (status_id) на диалоге изменилась.
+    # source: "manual" | "event:<type>" | др. — задел под автоматизацию,
+    # когда статус будет проставляться listener'ом событий шины.
+    DIALOG_STATUS_CHANGED = "dialog.status_changed"
+    # CRUD над каталогом dialog_statuses (создан/обновлён/удалён пузырь).
+    # Один тип на все три операции — UI слушает и инвалидит кэш.
+    DIALOG_STATUSES_CATALOG_CHANGED = "dialog_statuses.catalog_changed"
 
     # ── Медиа ────────────────────────────────────────────────────────
     TRANSCRIPTION_STARTED = "transcription.started"
