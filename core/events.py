@@ -42,6 +42,10 @@ class EventType:
 
     # ── Диалоги ──────────────────────────────────────────────────────
     DIALOG_DELETED = "dialog.deleted"
+    # Завершение bulk-операции «снести все диалоги аккаунта»
+    # (POST /accounts/{id}/dialogs/wipe). Каждый успешно удалённый диалог
+    # шлёт свой `dialog.deleted`; это — итоговый агрегат на всю операцию.
+    ACCOUNT_DIALOGS_WIPED = "account.dialogs_wiped"
 
     # ── Медиа ────────────────────────────────────────────────────────
     TRANSCRIPTION_STARTED = "transcription.started"

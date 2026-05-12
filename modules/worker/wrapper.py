@@ -499,6 +499,30 @@ class TelegramWrapper:
             )
         return bool(await self._guard(_do))
 
+    async def delete_dialog(
+        self,
+        dialog: int | str,
+        *,
+        revoke: bool = False,
+    ) -> None:
+        """
+        Удалить диалог на стороне Telegram.
+
+        revoke=True — стирает историю и для собеседника (как «Удалить
+        для всех» в клиенте). revoke=False — только из нашего dialog list,
+        у партнёра остаётся.
+
+        FloodWaitError пробрасывается наружу — массовые удаления
+        вызывает modules/history/wipe.py, который сам решает что делать
+        с задержкой (короткий sleep+retry либо стоп и возврат партиалa).
+
+        SessionExpired публикуется в шину и пробрасывается дальше
+        (поведение симметрично с send_message/read_message).
+        """
+        async def _do():
+            return await self.client.delete_dialog(dialog, revoke=revoke)
+        await self._guard(_do)
+
     async def resolve_username(self, username: str) -> dict[str, Any]:
         """
         Резолв @username → снимок профиля User entity.

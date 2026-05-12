@@ -2,7 +2,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { StatusDot } from "@/components/common/StatusDot";
 import { cn } from "@/lib/utils";
-import { Play, Square, RefreshCw, FileText } from "lucide-react";
+import { Play, Square, RefreshCw, FileText, Trash2 } from "lucide-react";
 import type { Account } from "@/types/api";
 
 type Props = {
@@ -12,10 +12,17 @@ type Props = {
   onStart?: () => void;
   onStop?: () => void;
   onEditPrompt?: () => void;
+  onWipeDialogs?: () => void;
 };
 
-export function AccountCard({ account, selected, onSelect, onStart, onStop, onEditPrompt }: Props) {
+export function AccountCard({
+  account, selected, onSelect, onStart, onStop, onEditPrompt, onWipeDialogs,
+}: Props) {
   const needsReauth = account.status === "session_expired";
+  // Кнопка wipe активна только если воркер запущен — иначе wrapper.delete_dialog
+  // не сработает и бэк вернёт WORKER_NOT_RUNNING. Не блокируем сам клик,
+  // но визуально приглушаем чтобы не путать оператора.
+  const wipeEnabled = account.status === "running" && account.dialogs_count > 0;
   return (
     <Card
       onClick={onSelect}
@@ -33,6 +40,21 @@ export function AccountCard({ account, selected, onSelect, onStart, onStop, onEd
         <div className="mt-1 flex items-center justify-between">
           <span className="text-xs text-muted-foreground">{account.dialogs_count} диалогов</span>
           <div className="flex flex-col items-end gap-1">
+            {/* Wipe — над «Промт» по запросу. Деструктивный акцент,
+                чтобы случайно не нажать. Реальное удаление — через
+                модалку с обязательным вводом CONFIRM. */}
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={(e) => { e.stopPropagation(); onWipeDialogs?.(); }}
+              disabled={!wipeEnabled}
+              title={wipeEnabled
+                ? "Удалить ВСЕ диалоги аккаунта (Telegram + локально)"
+                : "Доступно только для запущенного воркера с диалогами"}
+              className="text-destructive hover:bg-destructive/10"
+            >
+              <Trash2 className="h-3 w-3" /> Wipe
+            </Button>
             <Button
               size="sm"
               variant="outline"

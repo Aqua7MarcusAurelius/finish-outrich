@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 
 from core import db
 from modules.autochat.generation import render_preview_text
+from modules.history.wipe import wipe_all_dialogs
 
 router = APIRouter(tags=["accounts"])
 
@@ -233,3 +234,48 @@ async def preview_prompts(account_id: int, payload: PreviewIn):
         "reply": reply_text,
         "dialog_id": payload.dialog_id,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Bulk wipe: снести все диалоги аккаунта (Telegram + локально)
+# ─────────────────────────────────────────────────────────────────────
+
+@router.post("/accounts/{account_id}/dialogs/wipe")
+async def wipe_account_dialogs(
+    account_id: int,
+    request: Request,
+    confirm: str = "",
+    revoke: bool = True,
+):
+    """
+    Удалить все диалоги аккаунта:
+      - на стороне Telegram через wrapper.delete_dialog(revoke=...).
+        revoke=True (по умолчанию) — стирает историю и у собеседников.
+      - локально через purge_dialog_locally (тот же flow, что у штучного
+        DELETE /dialogs/{id}: CASCADE по messages/media/reactions/edits,
+        чистка MinIO, остановка autochat-сессии, dialog.deleted в шину).
+
+    Защита: query-параметр `confirm` ДОЛЖЕН быть равен `CONFIRM`. UI
+    дополнительно требует ввести эту строку руками в модалке. Бэк
+    проверяет независимо — обход UI через curl не сработает.
+
+    Воркер должен быть запущен — иначе нечем удалять на стороне Telegram.
+    На длинном FloodWait операция останавливается с partial result, чтобы
+    оператор повторил запрос позже (см. modules/history/wipe.py).
+    """
+    try:
+        result = await wipe_all_dialogs(
+            account_id, request=request, confirm=confirm, revoke=revoke,
+        )
+    except ValueError as e:
+        code = str(e)
+        status_code = {
+            "INVALID_CONFIRM": 400,
+            "ACCOUNT_NOT_FOUND": 404,
+            "WORKER_NOT_RUNNING": 409,
+        }.get(code, 400)
+        return JSONResponse(
+            status_code=status_code,
+            content={"error": {"code": code, "message": code.replace("_", " ").lower()}},
+        )
+    return result

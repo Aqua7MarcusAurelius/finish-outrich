@@ -302,6 +302,23 @@ export const api = {
   stopWorker: (accountId: number) =>
     request<void>(`/workers/${accountId}/stop`, { method: "POST" }),
 
+  // Снести все диалоги аккаунта: и на стороне Telegram через wrapper
+  // (revoke=true — стирает и у собеседников), и локально (CASCADE из БД,
+  // чистка MinIO, остановка autochat). Для защиты от случайного нажатия
+  // бэк требует confirm=CONFIRM в URL — UI просит ту же строку ввести
+  // в модалке вручную. Возвращает агрегат: сколько удалили, что упало,
+  // стопнулись ли по FloodWait и через сколько повторять.
+  wipeAccountDialogs: (accountId: number) =>
+    request<{
+      account_id: number;
+      deleted: number;
+      failed: { dialog_id: number; telegram_user_id: number; error: string }[];
+      stopped: boolean;
+      reason: string | null;
+      retry_after_seconds: number | null;
+      processed_total: number;
+    }>(`/accounts/${accountId}/dialogs/wipe?confirm=CONFIRM`, { method: "POST" }),
+
   // ── per-worker prompts (AutoChat) ───────────────────────────────────
   // Два свободных текста: initial_template и reply_template. Внутри —
   // плейсхолдеры {current_time}, {worker_name}, {partner_*},

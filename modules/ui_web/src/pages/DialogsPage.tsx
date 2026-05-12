@@ -11,6 +11,7 @@ import { NewAccountDialog } from "@/components/dialogs/NewAccountDialog";
 import { NewDialogButton } from "@/components/dialogs/NewDialogButton";
 import { NewDialogDialog } from "@/components/dialogs/NewDialogDialog";
 import { DeleteDialogConfirm } from "@/components/dialogs/DeleteDialogConfirm";
+import { WipeDialogsConfirm } from "@/components/dialogs/WipeDialogsConfirm";
 import { DialogEventsWidget } from "@/components/dialogs/DialogEventsWidget";
 import { DialogListItem } from "@/components/dialogs/DialogListItem";
 import { AllWorkersDropdown } from "@/components/dialogs/AllWorkersDropdown";
@@ -43,6 +44,9 @@ export function DialogsPage() {
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [autochatBusy, setAutochatBusy] = useState(false);
+  // Wipe-all-dialogs модалка: какой аккаунт сейчас в фокусе кнопки + busy
+  const [wipeTargetId, setWipeTargetId] = useState<number | null>(null);
+  const [wipeBusy, setWipeBusy] = useState(false);
 
   // Polling статуса автодиалога каждые 5с — чтобы кнопка вживую отражала
   // ситуацию (например, LLM сама поставила <finishdialog/> и сессия
@@ -134,6 +138,7 @@ export function DialogsPage() {
                     .then(() => { toast.success(`Воркер ${a.name || `#${a.id}`} остановлен`); accountsQ.refetch(); })
                     .catch((e) => { const d = describeApiError(e); toast.error(`Stop: ${d.title}`, d.detail); })}
                   onEditPrompt={() => navigate(`/workers/${a.id}/prompt`)}
+                  onWipeDialogs={() => setWipeTargetId(a.id)}
                 />
               ))}
               <NewAccountCard onClick={() => setNewAccOpen(true)} />
@@ -178,6 +183,54 @@ export function DialogsPage() {
         busy={deleteBusy}
         onConfirm={confirmDelete}
         onCancel={() => setDeleteOpen(false)}
+      />
+
+      {/* Wipe ALL dialogs of an account — двойная защита: открытие модалки
+          + ввод строки CONFIRM. Бэк перепроверяет тот же литерал. */}
+      <WipeDialogsConfirm
+        open={wipeTargetId !== null}
+        accountLabel={(() => {
+          const a = accounts.find((x) => x.id === wipeTargetId);
+          if (!a) return "";
+          return a.name ? `${a.name} (${a.phone})` : a.phone || `account #${a.id}`;
+        })()}
+        dialogsCount={accounts.find((x) => x.id === wipeTargetId)?.dialogs_count ?? 0}
+        busy={wipeBusy}
+        onConfirm={async () => {
+          if (wipeTargetId == null) return;
+          setWipeBusy(true);
+          try {
+            const r = await api.wipeAccountDialogs(wipeTargetId);
+            if (r.stopped && r.reason === "flood_wait") {
+              toast.error(
+                `Wipe прервался (FloodWait)`,
+                `Удалено: ${r.deleted}/${r.processed_total}. Повтори через ${r.retry_after_seconds ?? "?"} сек.`,
+              );
+            } else if (r.failed.length > 0) {
+              toast.error(
+                `Wipe закончился с ошибками`,
+                `Удалено: ${r.deleted}/${r.processed_total}, ошибок: ${r.failed.length}.`,
+              );
+            } else {
+              toast.success(
+                `Wipe завершён`,
+                `Удалено диалогов: ${r.deleted}.`,
+              );
+            }
+            // Список диалогов и счётчик в карточке аккаунта меняются — рефетчим.
+            accountsQ.refetch();
+            dialogsQ.refetch();
+            // Если открыт диалог — он мог быть удалён, сбросим выделение.
+            navigate(`/dialogs/${wipeTargetId}`);
+            setWipeTargetId(null);
+          } catch (e) {
+            const d = describeApiError(e);
+            toast.error(`Wipe: ${d.title}`, d.detail);
+          } finally {
+            setWipeBusy(false);
+          }
+        }}
+        onCancel={() => setWipeTargetId(null)}
       />
 
       {/* ── Body: dialogs + messages ─────────────────────────────── */}

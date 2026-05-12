@@ -322,22 +322,28 @@ async def get_dialog(dialog_id: int):
 # DELETE /dialogs/{id}
 # ─────────────────────────────────────────────────────────────────────
 
-@router.delete("/dialogs/{dialog_id}", status_code=204)
-async def delete_dialog(dialog_id: int, request: Request):
+async def purge_dialog_locally(
+    dialog_id: int,
+    *,
+    request: Request,
+    autochat_service: Any | None = None,
+) -> dict[str, Any]:
     """
-    Полное жёсткое удаление диалога. Для системы собеседник станет «новым»:
-    следующее сообщение от/к нему создаст dialog с пустой историей.
+    Локальная зачистка одного диалога: остановка autochat-сессии, чистка
+    MinIO, CASCADE DELETE из БД, публикация dialog.deleted.
 
-    Шаги:
-      1. Останавливаем активную AutoChat-сессию по паре
-         (account_id, telegram_user_id), если есть.
-      2. Удаляем MinIO-файлы всех media этого диалога.
-      3. DELETE FROM dialogs — Postgres каскадом снесёт messages →
-         media/reactions/message_edits (FK CASCADE из миграции 0001).
-      4. Публикуем `dialog.deleted` в шину для аудита.
+    Поведение идентично прежнему inline-коду из `delete_dialog`. Вынесено
+    в shared helper, чтобы переиспользовать в bulk-операции
+    (modules/history/wipe.py).
 
-    events_archive не трогаем — это исторический лог. dialog_id внутри JSONB
-    `data` останется, но это валидное поведение audit-trail.
+    autochat_service может быть передан явно (когда вызывается из wipe-цикла
+    и хочется избежать повторного чтения из request.app.state) или взят
+    из request.
+
+    Возвращает dict с метаданными зачищенного диалога (используется как
+    `data` в событии `dialog.deleted` и для агрегата в массовой операции).
+    Бросает HTTPException(404) если диалога нет — соответствует контракту
+    единичной ручки.
     """
     pool = db.get_pool()
     async with pool.acquire() as conn:
@@ -372,9 +378,9 @@ async def delete_dialog(dialog_id: int, request: Request):
 
     # 1. Останавливаем активную автосессию (если есть).
     if active_session is not None:
-        autochat_service = request.app.state.autochat_service
+        svc = autochat_service or request.app.state.autochat_service
         try:
-            await autochat_service.stop_session(active_session["id"])
+            await svc.stop_session(active_session["id"])
         except Exception:
             # Не блокируем удаление из-за проблем со stop'ом — сессия
             # будет в "stopped" после CASCADE NULL по dialog_id.
@@ -393,21 +399,48 @@ async def delete_dialog(dialog_id: int, request: Request):
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM dialogs WHERE id = $1", dialog_id)
 
+    summary = {
+        "dialog_id": dialog_id,
+        "telegram_user_id": int(dlg["telegram_user_id"]),
+        "username": dlg["username"],
+        "media_files_attempted": len(media_keys),
+        "stopped_autochat_session_id": active_session["id"] if active_session else None,
+    }
+
     # 4. Audit.
     await bus.publish(
         module=Module.API,
         type=EventType.DIALOG_DELETED,
         status=Status.SUCCESS,
-        account_id=dlg["account_id"],
-        data={
-            "dialog_id": dialog_id,
-            "telegram_user_id": dlg["telegram_user_id"],
-            "username": dlg["username"],
-            "media_files_attempted": len(media_keys),
-            "stopped_autochat_session_id": active_session["id"] if active_session else None,
-        },
+        account_id=int(dlg["account_id"]),
+        data=summary,
     )
 
+    return {**summary, "account_id": int(dlg["account_id"])}
+
+
+@router.delete("/dialogs/{dialog_id}", status_code=204)
+async def delete_dialog(dialog_id: int, request: Request):
+    """
+    Полное жёсткое удаление диалога. Для системы собеседник станет «новым»:
+    следующее сообщение от/к нему создаст dialog с пустой историей.
+
+    Шаги:
+      1. Останавливаем активную AutoChat-сессию по паре
+         (account_id, telegram_user_id), если есть.
+      2. Удаляем MinIO-файлы всех media этого диалога.
+      3. DELETE FROM dialogs — Postgres каскадом снесёт messages →
+         media/reactions/message_edits (FK CASCADE из миграции 0001).
+      4. Публикуем `dialog.deleted` в шину для аудита.
+
+    events_archive не трогаем — это исторический лог. dialog_id внутри JSONB
+    `data` останется, но это валидное поведение audit-trail.
+
+    В Telegram чат НЕ удаляется — только локальная копия. Если нужно
+    стереть и на стороне Telegram (для всех собеседников аккаунта сразу),
+    используется bulk-операция POST /accounts/{id}/dialogs/wipe.
+    """
+    await purge_dialog_locally(dialog_id, request=request)
     return None
 
 
