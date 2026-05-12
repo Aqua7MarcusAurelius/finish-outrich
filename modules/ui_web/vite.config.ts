@@ -26,14 +26,14 @@ export default defineConfig(({ mode }) => {
         // Каждый префикс должен соответствовать реальному роутеру в api/main.py.
         // Если ручка существует, но префикса тут нет — Vite отдаёт 404 на
         // запрос (особенно POST/DELETE), потому что считает его SPA-путём.
-        "/api":      { target: apiTarget, changeOrigin: true, rewrite: p => p.replace(/^\/api/, "") },
-        "/media":    { target: apiTarget, changeOrigin: true },
-        "/events":   { target: apiTarget, changeOrigin: true },
-        "/accounts": { target: apiTarget, changeOrigin: true },
-        "/dialogs":  { target: apiTarget, changeOrigin: true },
-        "/messages": { target: apiTarget, changeOrigin: true },
-        "/workers":  { target: apiTarget, changeOrigin: true },
-        "/auth":     { target: apiTarget, changeOrigin: true },
+        "/api":             { target: apiTarget, changeOrigin: true, rewrite: p => p.replace(/^\/api/, "") },
+        "/media":           { target: apiTarget, changeOrigin: true },
+        "/events":          { target: apiTarget, changeOrigin: true },
+        "/accounts":        { target: apiTarget, changeOrigin: true },
+        "/dialogs":         { target: apiTarget, changeOrigin: true },
+        "/messages":        { target: apiTarget, changeOrigin: true },
+        "/workers":         { target: apiTarget, changeOrigin: true },
+        "/auth":            { target: apiTarget, changeOrigin: true },
         "/autochat":        { target: apiTarget, changeOrigin: true },
         "/dialog-statuses": { target: apiTarget, changeOrigin: true },
         "/system":          { target: apiTarget, changeOrigin: true },
