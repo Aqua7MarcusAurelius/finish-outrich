@@ -11,7 +11,8 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { api, describeApiError } from "@/lib/api";
 import { useToast } from "@/lib/toast";
-import type { DialogSummary, DialogUserStatus } from "@/types/api";
+import { useDialogStatuses } from "@/hooks/useAccounts";
+import type { DialogSummary, DialogStatusRef } from "@/types/api";
 
 function initials(d: DialogSummary) {
   const name = d.title?.trim() || d.username || "?";
@@ -30,32 +31,6 @@ function previewText(d: DialogSummary) {
   return `[${m.type}]`;
 }
 
-// Конфиг отображения 4 статусов + "без". Цвета берём из существующих
-// status-* токенов темы, без новых CSS-переменных.
-type StatusOption = {
-  value: DialogUserStatus;
-  label: string;
-  // Tailwind-класс на круглую точку и текст-цвет в дропдауне.
-  dotClass: string;
-};
-
-const STATUS_OPTIONS: StatusOption[] = [
-  { value: "talking", label: "Общаемся",  dotClass: "bg-status-success" },
-  { value: "waiting", label: "Ждём ответ", dotClass: "bg-status-in_progress" },
-  { value: "done",    label: "Готово",    dotClass: "bg-status-stopped" },
-  { value: "failed",  label: "Провал",    dotClass: "bg-status-error" },
-];
-
-const NO_STATUS: StatusOption = {
-  value: null,
-  label: "Без статуса",
-  dotClass: "bg-border",
-};
-
-function statusOption(value: DialogUserStatus): StatusOption {
-  return STATUS_OPTIONS.find((o) => o.value === value) ?? NO_STATUS;
-}
-
 export function DialogListItem({
   dialog,
   selected,
@@ -68,28 +43,42 @@ export function DialogListItem({
   onStatusChange?: () => void;
 }) {
   const toast = useToast();
-  const [pending, setPending] = useState<DialogUserStatus | undefined>(undefined);
+  const catalog = useDialogStatuses().data ?? [];
 
-  // pending — оптимистичное значение пока летит запрос. Для UI это
-  // выглядит как "статус сменился сразу", если PATCH упадёт — откатим.
-  const effective: DialogUserStatus = pending !== undefined ? pending : dialog.user_status;
-  const opt = statusOption(effective);
+  // pending — оптимистичное значение пока летит PATCH. undefined = нет
+  // пендинга, null = пендинг «снять статус», number = пендинг id.
+  // Полную карточку (label/color) для рендера находим в catalog.
+  const [pendingId, setPendingId] = useState<number | null | undefined>(undefined);
 
-  async function setStatus(value: DialogUserStatus) {
-    if (value === effective) return;
-    const prev = dialog.user_status;
-    setPending(value);
+  const effectiveId: number | null =
+    pendingId !== undefined ? pendingId : (dialog.status?.id ?? null);
+
+  const effective: DialogStatusRef | null =
+    pendingId === undefined
+      ? dialog.status
+      : pendingId === null
+        ? null
+        : (catalog.find((s) => s.id === pendingId) ?? null);
+
+  async function setStatus(value: number | null) {
+    if (value === effectiveId) return;
+    const prevId = dialog.status?.id ?? null;
+    setPendingId(value);
     try {
       await api.setDialogStatus(dialog.id, value);
       onStatusChange?.();
     } catch (e) {
-      setPending(prev);
+      setPendingId(prevId);
       const d = describeApiError(e);
       toast.error(`Статус: ${d.title}`, d.detail);
       return;
     }
-    setPending(undefined);
+    setPendingId(undefined);
   }
+
+  const sortedCatalog = [...catalog].sort(
+    (a, b) => a.sort_order - b.sort_order || a.id - b.id,
+  );
 
   return (
     <div
@@ -128,40 +117,47 @@ export function DialogListItem({
       {/* Pill — абсолютно позиционирована от левого края строки на
          ~280px. Right-based позиционирование иногда уезжало за
          viewport из-за scrollbar/Radix display:table — left-based
-         предсказуемо в видимой зоне 320px-aside. */}
+         предсказуемо в видимой зоне 320px-aside.
+         Цвет точки и список опций тянутся из каталога dialog_statuses. */}
       <div className="absolute left-[270px] top-1.5 z-10">
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <button
               type="button"
               onClick={(e) => e.stopPropagation()}
-              title={`Статус: ${opt.label}`}
+              title={effective ? `Статус: ${effective.label}` : "Без статуса"}
               className={cn(
                 "flex items-center gap-1 rounded-full border border-border bg-secondary px-1.5 py-0.5",
                 "text-foreground hover:bg-background",
               )}
             >
               <span
-                className={cn(
-                  "h-2.5 w-2.5 rounded-full ring-1 ring-border",
-                  effective === null ? "bg-transparent" : opt.dotClass,
-                )}
+                className="h-2.5 w-2.5 rounded-full ring-1 ring-border"
+                style={{ backgroundColor: effective?.color ?? "transparent" }}
               />
               <ChevronDown className="h-3 w-3 opacity-80" />
             </button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="min-w-[160px]">
+          <DropdownMenuContent align="end" className="min-w-[180px]">
             <DropdownMenuLabel>Статус диалога</DropdownMenuLabel>
             <DropdownMenuSeparator />
-            {STATUS_OPTIONS.map((o) => (
+            {sortedCatalog.length === 0 && (
+              <DropdownMenuItem disabled className="text-xs text-muted-foreground">
+                Каталог пуст — заведи статус в «Настройки».
+              </DropdownMenuItem>
+            )}
+            {sortedCatalog.map((o) => (
               <DropdownMenuItem
-                key={o.label}
-                onSelect={() => setStatus(o.value)}
+                key={o.id}
+                onSelect={() => setStatus(o.id)}
                 className="gap-2"
               >
-                <span className={cn("h-2 w-2 rounded-full", o.dotClass)} />
-                <span className="flex-1">{o.label}</span>
-                {effective === o.value && <Check className="h-3 w-3" />}
+                <span
+                  className="h-2 w-2 rounded-full"
+                  style={{ backgroundColor: o.color }}
+                />
+                <span className="flex-1 truncate">{o.label}</span>
+                {effectiveId === o.id && <Check className="h-3 w-3" />}
               </DropdownMenuItem>
             ))}
             <DropdownMenuSeparator />
@@ -169,9 +165,9 @@ export function DialogListItem({
               onSelect={() => setStatus(null)}
               className="gap-2 text-muted-foreground"
             >
-              <span className={cn("h-2 w-2 rounded-full", NO_STATUS.dotClass)} />
-              <span className="flex-1">{NO_STATUS.label}</span>
-              {effective === null && <Check className="h-3 w-3" />}
+              <span className="h-2 w-2 rounded-full bg-border" />
+              <span className="flex-1">Без статуса</span>
+              {effectiveId === null && <Check className="h-3 w-3" />}
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>

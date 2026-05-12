@@ -81,29 +81,13 @@ type BackendDialog = {
   phone: string | null;
   is_bot: boolean;
   is_contact: boolean;
-  // С миграции 0009 диалог несёт уже не строковый user_status, а ссылку
-  // на пузырь в каталоге dialog_statuses. Старый формат полностью убран
-  // на бэкенде. Этот адаптер существует временно — на период между
-  // коммитом «бэкенд новых статусов» и коммитом «UI новых статусов»
-  // (страница настроек + рефакторинг DialogListItem). После последнего
-  // адаптер уйдёт, тип DialogSummary заменится на полноценный.
   status: { id: number; label: string; color: string } | null;
   last_message: { date: string; text: string | null; is_outgoing: boolean } | null;
-};
-
-// 4 сидированных id из миграции 0009 → старые UI-ключи.
-// Хардкод оправдан тем, что это переходный мостик в одном коммите.
-const _LEGACY_STATUS_BY_ID: Record<number, "talking" | "waiting" | "done" | "failed"> = {
-  1: "talking", 2: "waiting", 3: "done", 4: "failed",
-};
-const _LEGACY_STATUS_ID_BY_KEY: Record<"talking" | "waiting" | "done" | "failed", number> = {
-  talking: 1, waiting: 2, done: 3, failed: 4,
 };
 
 function adaptDialog(d: BackendDialog): DialogSummary {
   const name = [d.first_name, d.last_name].filter(Boolean).join(" ").trim();
   const title = name || d.username || "(без имени)";
-  const status = d.status ? (_LEGACY_STATUS_BY_ID[d.status.id] ?? null) : null;
   return {
     id: d.id,
     account_id: d.account_id,
@@ -112,7 +96,7 @@ function adaptDialog(d: BackendDialog): DialogSummary {
     phone: d.phone,
     is_bot: d.is_bot,
     is_contact: d.is_contact,
-    user_status: status,
+    status: d.status,
     last_message: d.last_message
       ? {
           text: d.last_message.text,
@@ -255,16 +239,13 @@ export const api = {
   deleteDialog: (dialogId: number) =>
     request<void>(`/dialogs/${dialogId}`, { method: "DELETE" }),
 
-  // Операторская пометка. С миграции 0009 хранится как FK на dialog_statuses;
-  // адаптер ниже временно мостит старый enum-API UI к новому endpoint'у —
-  // и уйдёт вместе с рефакторингом DialogListItem на полный каталог.
-  setDialogStatus: (dialogId: number, status: "talking" | "waiting" | "done" | "failed" | null) => {
-    const status_id = status ? _LEGACY_STATUS_ID_BY_KEY[status] : null;
-    return request<{ id: number; status: { id: number; label: string; color: string } | null }>(
+  // Присвоить (или снять, если status_id=null) операторский пузырь диалогу.
+  // Каталог пузырей живёт в dialog_statuses и редактируется на /settings.
+  setDialogStatus: (dialogId: number, statusId: number | null) =>
+    request<{ id: number; status: { id: number; label: string; color: string } | null }>(
       `/dialogs/${dialogId}/status`,
-      { method: "PATCH", body: JSON.stringify({ status_id }) },
-    );
-  },
+      { method: "PATCH", body: JSON.stringify({ status_id: statusId }) },
+    ),
 
   // Toggle автодиалога для существующего диалога. POST включает (без
   // отправки initial — просто active-сессия ждёт входящих), DELETE гасит

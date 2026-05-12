@@ -53,9 +53,14 @@ export interface WorkerPrompts {
   updated_at: string | null;
 }
 
-// Чисто визуальный статус оператора. Бэк хранит как nullable text,
-// фронт показывает 4 значения + "без статуса".
-export type DialogUserStatus = "talking" | "waiting" | "done" | "failed" | null;
+// Операторский «пузырь». Каталог — в таблице dialog_statuses,
+// управляется через страницу /settings. На диалоге хранится `status_id`,
+// API отдаёт уже подцепленную карточку. null = «без статуса».
+export interface DialogStatusRef {
+  id: number;
+  label: string;
+  color: string;
+}
 
 export interface DialogSummary {
   id: number;
@@ -65,7 +70,7 @@ export interface DialogSummary {
   phone: string | null;
   is_bot: boolean;
   is_contact: boolean;
-  user_status: DialogUserStatus;
+  status: DialogStatusRef | null;
   last_message: { text: string | null; date: string; type: string } | null;
 }
 
