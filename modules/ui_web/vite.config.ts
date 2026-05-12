@@ -34,8 +34,9 @@ export default defineConfig(({ mode }) => {
         "/messages": { target: apiTarget, changeOrigin: true },
         "/workers":  { target: apiTarget, changeOrigin: true },
         "/auth":     { target: apiTarget, changeOrigin: true },
-        "/autochat": { target: apiTarget, changeOrigin: true },
-        "/system":   { target: apiTarget, changeOrigin: true },
+        "/autochat":        { target: apiTarget, changeOrigin: true },
+        "/dialog-statuses": { target: apiTarget, changeOrigin: true },
+        "/system":          { target: apiTarget, changeOrigin: true },
       },
     },
     preview: {
