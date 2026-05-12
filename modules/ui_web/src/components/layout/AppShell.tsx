@@ -1,5 +1,5 @@
 import { NavLink } from "react-router-dom";
-import { Activity, MessagesSquare, Moon, Sun } from "lucide-react";
+import { Activity, MessagesSquare, Moon, Settings, Sun } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useState } from "react";
@@ -35,6 +35,10 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           <NavLink to="/events" className={navLinkCls}>
             <Activity className="h-4 w-4" />
             Event log
+          </NavLink>
+          <NavLink to="/settings" className={navLinkCls}>
+            <Settings className="h-4 w-4" />
+            Настройки
           </NavLink>
         </nav>
         <div className="ml-auto flex items-center gap-2">

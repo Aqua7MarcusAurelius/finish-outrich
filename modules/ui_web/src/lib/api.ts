@@ -311,6 +311,30 @@ export const api = {
 
   mediaPreviewUrl: (mediaId: number) => `/media/${mediaId}/preview`,
 
+  // ── dialog statuses (каталог операторских пузырей) ─────────────────
+  // Поверх REST'а от modules/dialog_statuses/routes.py. Управляет каталог
+  // (label, hex color, sort_order). Привязка к диалогу — через setDialogStatus
+  // (выше), которая шлёт PATCH /dialogs/{id}/status.
+  listDialogStatuses: () =>
+    request<{ items: { id: number; label: string; color: string; sort_order: number }[] }>(
+      "/dialog-statuses",
+    ),
+  createDialogStatus: (body: { label: string; color: string; sort_order?: number }) =>
+    request<{ id: number; label: string; color: string; sort_order: number }>(
+      "/dialog-statuses",
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+  updateDialogStatus: (
+    id: number,
+    body: { label?: string; color?: string; sort_order?: number },
+  ) =>
+    request<{ id: number; label: string; color: string; sort_order: number }>(
+      `/dialog-statuses/${id}`,
+      { method: "PATCH", body: JSON.stringify(body) },
+    ),
+  deleteDialogStatus: (id: number) =>
+    request<void>(`/dialog-statuses/${id}`, { method: "DELETE" }),
+
   // ── worker control ──────────────────────────────────────────────────
   startWorker: (accountId: number) =>
     request<void>(`/workers/${accountId}/start`, { method: "POST" }),

@@ -32,3 +32,15 @@ export function useDialogProfile(dialogId: number | null) {
     enabled: dialogId != null,
   });
 }
+
+// Каталог операторских пузырей. Используется и страницей настроек
+// (CRUD), и DialogListItem (рендер dropdown). Меняется редко —
+// staleTime 60s достаточно. Инвалидация после mutate — вручную
+// через queryClient.invalidateQueries(["dialog-statuses"]).
+export function useDialogStatuses() {
+  return useQuery({
+    queryKey: ["dialog-statuses"],
+    queryFn: () => api.listDialogStatuses().then((r) => r.items),
+    staleTime: 60_000,
+  });
+}
