@@ -23,6 +23,7 @@ class Module:
     BUS = "bus"
     AUTOCHAT = "autochat"
     DIALOG_STATUSES = "dialog_statuses"
+    WORKER_AUTO_RUNNER = "worker_auto_runner"
 
 
 class Status:
@@ -54,6 +55,15 @@ class EventType:
     # CRUD над каталогом dialog_statuses (создан/обновлён/удалён пузырь).
     # Один тип на все три операции — UI слушает и инвалидит кэш.
     DIALOG_STATUSES_CATALOG_CHANGED = "dialog_statuses.catalog_changed"
+
+    # ── Worker Auto Runner (автомат старта диалогов из очереди юзернеймов) ──
+    # Это и есть «лог автомата» — отдельной таблицы для логов нет, всё
+    # читается из events_archive с фильтром module=worker_auto_runner.
+    AUTO_RUNNER_STARTED = "auto_runner.started"
+    AUTO_RUNNER_STOPPED = "auto_runner.stopped"
+    AUTO_RUNNER_LEAD_SENT = "auto_runner.lead_sent"
+    AUTO_RUNNER_LEAD_SKIPPED = "auto_runner.lead_skipped"
+    AUTO_RUNNER_QUEUE_EMPTY = "auto_runner.queue_empty"
 
     # ── Медиа ────────────────────────────────────────────────────────
     TRANSCRIPTION_STARTED = "transcription.started"

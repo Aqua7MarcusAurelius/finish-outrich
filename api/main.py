@@ -38,6 +38,8 @@ from modules.history.routes import router as history_router
 from modules.history.service import HistoryService
 from modules.media_description.service import DescriptionService
 from modules.transcription.service import TranscriptionService
+from modules.worker_auto_runner.routes import router as auto_runner_router
+from modules.worker_auto_runner.service import WorkerAutoRunnerService
 from modules.worker_manager.routes import router as workers_router
 from modules.worker_manager.service import WorkerManager
 
@@ -91,11 +93,37 @@ async def lifespan(app: FastAPI):
     autochat_task = asyncio.create_task(autochat_service.run())
     app.state.autochat_task = autochat_task
 
+    # WorkerAutoRunner: per-account автомат старта диалогов из очереди.
+    # Создаётся ПОСЛЕ AutoChat, потому что зовёт его create_session.
+    # При старте сбрасывает is_running у всех — после рестарта не
+    # возобновляется автоматически, оператор включает заново.
+    auto_runner_service = WorkerAutoRunnerService(
+        get_wrapper=app.state.worker_manager.get_wrapper,
+        autochat_service=autochat_service,
+    )
+    app.state.auto_runner_service = auto_runner_service
+    await auto_runner_service.reset_on_boot()
+    auto_runner_task = asyncio.create_task(auto_runner_service.run())
+    app.state.auto_runner_task = auto_runner_task
+
     try:
         yield
     finally:
         # ── Shutdown ───────────────────────────────────────────────
-        # AutoChat — первым: дадим активным сессиям дописать сегменты
+        # WorkerAutoRunner гасим первым — чтобы он перестал звать
+        # autochat.create_session, пока тот ещё в shutdown'е.
+        try:
+            await auto_runner_service.shutdown()
+        except Exception:
+            log.exception("auto_runner_service shutdown error")
+
+        auto_runner_task.cancel()
+        try:
+            await auto_runner_task
+        except asyncio.CancelledError:
+            pass
+
+        # AutoChat — следом: дадим активным сессиям дописать сегменты
         # до того как закроем Telegram-сессии.
         try:
             await autochat_service.stop()
@@ -199,3 +227,4 @@ app.include_router(media_router)
 app.include_router(autochat_router)
 app.include_router(dialog_autochat_router)
 app.include_router(dialog_statuses_router)
+app.include_router(auto_runner_router)
