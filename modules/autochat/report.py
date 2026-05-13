@@ -13,6 +13,7 @@ AutoChatService._on_session_finished_by_llm. Best-effort: ошибки
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from html import escape
 from typing import Any
@@ -626,11 +627,48 @@ def build_html(ctx: dict[str, Any], messages: list[dict[str, Any]]) -> str:
 # Внешняя точка входа
 # ─────────────────────────────────────────────────────────────────────
 
+# Что считается «опасным» символом в имени объекта MinIO. По спеке S3
+# почти всё разрешено, но для удобства браузера и `mc cp` ограничиваемся
+# буквами (включая кириллицу), цифрами, `_`, `-`, `.` и `@`. Всё прочее
+# (пробелы, слэши, скобки и т.п.) заменяем на `_`. Подряд идущие `_`
+# схлопываем в один.
+_KEY_SAFE_CHARS_RE = re.compile(r"[^\w@.-]+", re.UNICODE)
+_KEY_MULTI_UNDERSCORE_RE = re.compile(r"_+")
+
+
+def _sanitize_for_key(value: str | None, *, fallback: str = "unknown", maxlen: int = 64) -> str:
+    if not value:
+        return fallback
+    cleaned = _KEY_SAFE_CHARS_RE.sub("_", value)
+    cleaned = _KEY_MULTI_UNDERSCORE_RE.sub("_", cleaned).strip("_")
+    if not cleaned:
+        return fallback
+    return cleaned[:maxlen]
+
+
 def _build_storage_key(ctx: dict[str, Any]) -> str:
-    """{YYYY}/{MM}/session_{id}.html — папки не пухнут."""
+    """
+    Плоский ключ в корне бакета:
+        {worker}_@{partner_username}_dd-mm-yy_hh-mm.html
+    либо если у собеседника пустой username:
+        {worker}_id{telegram_user_id}_dd-mm-yy_hh-mm.html
+
+    Время — finished_at в UTC. Папки больше не используются (раньше
+    были по YYYY/MM, но оператор предпочитает видеть всё списком в одном
+    бакете и иметь нужную инфу прямо в имени файла).
+    """
     dt: datetime = ctx["finished_at"]
     dt_utc = dt.astimezone(timezone.utc)
-    return f"{dt_utc.year:04d}/{dt_utc.month:02d}/session_{ctx['session_id']}.html"
+
+    worker = _sanitize_for_key(ctx.get("worker_name"), fallback=f"account{ctx.get('account_id', '?')}")
+    partner_username = ctx.get("partner_username") or ctx.get("target_username") or ""
+    if partner_username:
+        partner_part = "@" + _sanitize_for_key(partner_username)
+    else:
+        partner_part = f"id{ctx['telegram_user_id']}"
+
+    timestamp = dt_utc.strftime("%d-%m-%y_%H-%M")
+    return f"{worker}_{partner_part}_{timestamp}.html"
 
 
 async def save_report_for_session(session_id: int) -> str | None:
