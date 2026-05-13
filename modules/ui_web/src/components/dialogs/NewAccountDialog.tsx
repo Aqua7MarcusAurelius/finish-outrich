@@ -11,6 +11,24 @@ import { useToast } from "@/lib/toast";
 //   step "code"  — код из SMS/TG → POST /auth/code (может попросить 2FA)
 //   step "2fa"   — облачный пароль → POST /auth/2fa
 // На любом этапе отмена → DELETE /auth/{session_id} (если есть) + закрытие.
+//
+// Формат прокси: предпочтительный ввод — `host:port:user:pass`
+// (то, как обычно отдают провайдеры). В URL `socks5://user:pass@host:port`
+// конвертирует helper ниже — бэкенд и БД продолжают работать со старой
+// URL-формой, существующие аккаунты не трогаем.
+
+const PROXY_COLON_RE = /^([^:\s]+):(\d+):([^:\s]+):(.+)$/;
+
+function proxyToUrl(input: string): string | null {
+  const v = input.trim();
+  if (!v) return null;
+  // Уже URL-форма (например, скопирована из старого источника) — пропускаем.
+  if (v.startsWith("socks5://")) return v;
+  const m = v.match(PROXY_COLON_RE);
+  if (!m) return null;
+  const [, host, port, user, pass] = m;
+  return `socks5://${user}:${pass}@${host}:${port}`;
+}
 
 type Step = "form" | "code" | "2fa";
 
@@ -53,13 +71,23 @@ export function NewAccountDialog({ open, onClose, onCreated }: Props) {
   }
 
   async function submitForm() {
+    const primaryUrl = proxyToUrl(proxyPrimary);
+    const fallbackUrl = proxyToUrl(proxyFallback);
+    if (!primaryUrl || !fallbackUrl) {
+      toast.error(
+        "Прокси: неверный формат",
+        "Ожидается host:port:user:pass (или socks5://user:pass@host:port).",
+      );
+      return;
+    }
+
     setBusy(true);
     try {
       const res = await api.authStart({
         phone: phone.trim(),
         name: name.trim(),
-        proxy_primary: proxyPrimary.trim(),
-        proxy_fallback: proxyFallback.trim(),
+        proxy_primary: primaryUrl,
+        proxy_fallback: fallbackUrl,
       });
       setSessionId(res.session_id);
       setStep("code");
@@ -137,11 +165,27 @@ export function NewAccountDialog({ open, onClose, onCreated }: Props) {
             </div>
             <div className="flex flex-col gap-1">
               <Label htmlFor="acc-proxy1">Proxy (primary)</Label>
-              <Input id="acc-proxy1" placeholder="socks5://user:pass@host:port" value={proxyPrimary} onChange={(e) => setProxyPrimary(e.target.value)} className="mono" />
+              <Input
+                id="acc-proxy1"
+                placeholder="158.46.145.227:63795:user:pass"
+                value={proxyPrimary}
+                onChange={(e) => setProxyPrimary(e.target.value)}
+                className="mono"
+              />
             </div>
             <div className="flex flex-col gap-1">
               <Label htmlFor="acc-proxy2">Proxy (fallback)</Label>
-              <Input id="acc-proxy2" placeholder="socks5://..." value={proxyFallback} onChange={(e) => setProxyFallback(e.target.value)} className="mono" />
+              <Input
+                id="acc-proxy2"
+                placeholder="host:port:user:pass"
+                value={proxyFallback}
+                onChange={(e) => setProxyFallback(e.target.value)}
+                className="mono"
+              />
+            </div>
+            <div className="-mt-1 text-[11px] leading-tight text-muted-foreground">
+              Формат — <span className="mono">host:port:user:pass</span>.
+              Старый URL-вид <span className="mono">socks5://user:pass@host:port</span> тоже принимается.
             </div>
             <div className="flex justify-end gap-2 pt-1">
               <Button variant="ghost" size="sm" onClick={handleClose} disabled={busy}>Отмена</Button>
