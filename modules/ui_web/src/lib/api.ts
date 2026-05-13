@@ -1,5 +1,7 @@
 import type {
   Account,
+  AutoRunnerPatchBody,
+  AutoRunnerState,
   BusEvent,
   DialogProfile,
   DialogSummary,
@@ -321,6 +323,20 @@ export const api = {
     request<void>(`/workers/${accountId}/start`, { method: "POST" }),
   stopWorker: (accountId: number) =>
     request<void>(`/workers/${accountId}/stop`, { method: "POST" }),
+
+  // ── worker auto runner (автомат старта диалогов из очереди) ────────
+  // Per-аккаунт ряд в worker_auto_runners. UI поллит каждые ~10с, чтобы
+  // отражать автоматическое выключение (например, после worker.stopped).
+  getAutoRunner: (accountId: number) =>
+    request<AutoRunnerState>(`/workers/${accountId}/auto-runner`),
+  patchAutoRunner: (accountId: number, body: AutoRunnerPatchBody) =>
+    request<AutoRunnerState>(`/workers/${accountId}/auto-runner`, {
+      method: "PATCH", body: JSON.stringify(body),
+    }),
+  startAutoRunner: (accountId: number) =>
+    request<AutoRunnerState>(`/workers/${accountId}/auto-runner/start`, { method: "POST" }),
+  stopAutoRunner: (accountId: number) =>
+    request<AutoRunnerState>(`/workers/${accountId}/auto-runner/stop`, { method: "POST" }),
 
   // Снести все диалоги аккаунта: и на стороне Telegram через wrapper
   // (revoke=true — стирает и у собеседников), и локально (CASCADE из БД,

@@ -12,6 +12,7 @@ import { NewDialogButton } from "@/components/dialogs/NewDialogButton";
 import { NewDialogDialog } from "@/components/dialogs/NewDialogDialog";
 import { DeleteDialogConfirm } from "@/components/dialogs/DeleteDialogConfirm";
 import { WipeDialogsConfirm } from "@/components/dialogs/WipeDialogsConfirm";
+import { AutoRunnerSettingsDialog } from "@/components/dialogs/AutoRunnerSettingsDialog";
 import { DialogEventsWidget } from "@/components/dialogs/DialogEventsWidget";
 import { DialogListItem } from "@/components/dialogs/DialogListItem";
 import { AllWorkersDropdown } from "@/components/dialogs/AllWorkersDropdown";
@@ -47,6 +48,8 @@ export function DialogsPage() {
   // Wipe-all-dialogs модалка: какой аккаунт сейчас в фокусе кнопки + busy
   const [wipeTargetId, setWipeTargetId] = useState<number | null>(null);
   const [wipeBusy, setWipeBusy] = useState(false);
+  // Авторежим: какой аккаунт открыли в модалке настроек.
+  const [arSettingsAccount, setArSettingsAccount] = useState<number | null>(null);
 
   // Polling статуса автодиалога каждые 5с — чтобы кнопка вживую отражала
   // ситуацию (например, LLM сама поставила <finishdialog/> и сессия
@@ -139,6 +142,7 @@ export function DialogsPage() {
                     .catch((e) => { const d = describeApiError(e); toast.error(`Stop: ${d.title}`, d.detail); })}
                   onEditPrompt={() => navigate(`/workers/${a.id}/prompt`)}
                   onWipeDialogs={() => setWipeTargetId(a.id)}
+                  onAutoRunnerSettings={() => setArSettingsAccount(a.id)}
                 />
               ))}
               <NewAccountCard onClick={() => setNewAccOpen(true)} />
@@ -183,6 +187,16 @@ export function DialogsPage() {
         busy={deleteBusy}
         onConfirm={confirmDelete}
         onCancel={() => setDeleteOpen(false)}
+      />
+
+      <AutoRunnerSettingsDialog
+        open={arSettingsAccount !== null}
+        accountId={arSettingsAccount}
+        accountLabel={(() => {
+          const a = accounts.find((x) => x.id === arSettingsAccount);
+          return a ? (a.name || `account_${a.id}`) : "";
+        })()}
+        onClose={() => setArSettingsAccount(null)}
       />
 
       {/* Wipe ALL dialogs of an account — двойная защита: открытие модалки

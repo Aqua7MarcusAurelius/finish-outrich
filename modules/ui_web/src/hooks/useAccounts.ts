@@ -44,3 +44,15 @@ export function useDialogStatuses() {
     staleTime: 60_000,
   });
 }
+
+// Состояние авторежима для воркера. Поллится — потому что автомат
+// может сам выключиться (например, после worker.stopped), и UI должен
+// это отражать без рефреша страницы.
+export function useAutoRunner(accountId: number | null) {
+  return useQuery({
+    queryKey: ["auto-runner", accountId],
+    queryFn: () => api.getAutoRunner(accountId!),
+    enabled: accountId != null,
+    refetchInterval: 10_000,
+  });
+}

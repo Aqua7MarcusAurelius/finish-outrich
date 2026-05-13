@@ -180,6 +180,25 @@ export interface EventStats {
   events_per_sec: number;
 }
 
+// Per-account автомат старта диалогов. Очередь — список юзернеймов
+// (без `@`, бэк нормализует). interval_sec — минимум 60 (защита от флуда).
+export interface AutoRunnerState {
+  account_id: number;
+  is_running: boolean;
+  queue: string[];
+  interval_sec: number;
+  jitter_sec: number;
+  last_action_at: string | null;
+  last_status: string | null;
+  updated_at: string | null;
+}
+
+export interface AutoRunnerPatchBody {
+  queue?: string[];
+  interval_sec?: number;
+  jitter_sec?: number;
+}
+
 export interface EventFilters {
   account?: number;
   module?: BusModule;
