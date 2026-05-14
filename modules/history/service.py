@@ -4,10 +4,12 @@
 Единственный writer в таблицы dialogs, messages, media, reactions, message_edits.
 
 Слушает шину событий через consumer group "history-writer":
-  - message.received    → upsert dialogs, insert messages+media, publish message.saved
-  - transcription.done  → update media.transcription, publish message.updated
-  - description.done    → update media.description, publish message.updated
-  - (остальные события) → молча ack'аются, пропускаются
+  - message.received       → upsert dialogs, insert messages+media,
+                             publish message.saved (+ dialog.created при INSERT)
+  - transcription.done     → update media.transcription, publish message.updated
+  - description.done       → update media.description, publish message.updated
+  - dialog.profile.fetched → update dialogs.bio + birthday_* (COALESCE)
+  - (остальные события)    → молча ack'аются, пропускаются
 
 См. docs/history.md.
 """
@@ -138,6 +140,8 @@ class HistoryService:
             await self._on_transcription_done(event)
         elif et == EventType.DESCRIPTION_DONE:
             await self._on_description_done(event)
+        elif et == EventType.DIALOG_PROFILE_FETCHED:
+            await self._on_dialog_profile_fetched(event)
         # Остальные события нас не интересуют — молча ack'аются вызывающим.
 
     # ─── message.received ─────────────────────────────────────────
@@ -176,7 +180,7 @@ class HistoryService:
         async with pool.acquire() as conn:
             async with conn.transaction():
                 # 1. Upsert dialog
-                dialog_id = await self._upsert_dialog(
+                dialog_id, dialog_was_inserted = await self._upsert_dialog(
                     conn, account_id, telegram_user_id, peer_profile,
                 )
 
@@ -274,17 +278,41 @@ class HistoryService:
             },
         )
 
+        # 6. Если диалог только что появился — даём знать peer_profile (он
+        # дотянет bio + день рождения через GetFullUserRequest). Событие
+        # летит ОДИН раз за всю жизнь dialog'а, поскольку срабатывает только
+        # на INSERT, а не на UPDATE (см. _upsert_dialog: was_inserted).
+        if dialog_was_inserted:
+            await bus.publish(
+                module=Module.HISTORY,
+                type=EventType.DIALOG_CREATED,
+                status=Status.SUCCESS,
+                parent_id=event.get("id"),
+                account_id=account_id,
+                data={
+                    "dialog_id": dialog_id,
+                    "telegram_user_id": telegram_user_id,
+                },
+            )
+
     async def _upsert_dialog(
         self,
         conn: Any,
         account_id: int,
         telegram_user_id: int,
         profile: dict | None,
-    ) -> int:
+    ) -> tuple[int, bool]:
         """
         Upsert диалога. Если peer_profile есть — обновляем поля профиля через
         COALESCE (не перетираем существующие данные NULL-ом), флаги is_bot/is_contact
         обновляем жёстко. Если peer_profile нет — просто освежаем updated_at.
+
+        Возвращает (dialog_id, was_inserted). `was_inserted` — True только когда
+        строка реально INSERT'нулась (а не UPDATE по ON CONFLICT). Признак —
+        системный `xmax = 0` у возвращённой строки: на свежевставленной он 0,
+        на обновлённой — id транзакции, обновившей её. Caller использует флаг
+        чтобы один раз опубликовать `dialog.created` (запрос на дотяжку
+        расширенного профиля).
         """
         if profile is not None:
             row = await conn.fetchrow(
@@ -301,7 +329,7 @@ class HistoryService:
                     is_bot      = EXCLUDED.is_bot,
                     is_contact  = EXCLUDED.is_contact,
                     updated_at  = NOW()
-                RETURNING id
+                RETURNING id, (xmax = 0) AS was_inserted
                 """,
                 account_id, telegram_user_id,
                 profile.get("username"),
@@ -318,11 +346,11 @@ class HistoryService:
                 VALUES ($1, $2, NOW())
                 ON CONFLICT (account_id, telegram_user_id) DO UPDATE SET
                     updated_at = NOW()
-                RETURNING id
+                RETURNING id, (xmax = 0) AS was_inserted
                 """,
                 account_id, telegram_user_id,
             )
-        return row["id"]
+        return row["id"], bool(row["was_inserted"])
 
     # ─── transcription.done / description.done ────────────────────
 
@@ -423,3 +451,47 @@ class HistoryService:
                 "status": status,
             },
         )
+
+    # ─── dialog.profile.fetched ───────────────────────────────────
+
+    async def _on_dialog_profile_fetched(self, event: dict) -> None:
+        """
+        Записать расширенный профиль в `dialogs` (bio + день рождения).
+
+        Источник — модуль `peer_profile`, дотягивает данные через
+        `GetFullUserRequest` после нашего `dialog.created`. Поля кладутся
+        через COALESCE: уже записанные значения не перетираем (например,
+        если bio пришло, потом оператор поправил руками — повторный
+        fetch не сотрёт правку).
+
+        Структура `data`:
+            dialog_id:  int
+            bio:        str | null
+            birthday:   {"day": int, "month": int, "year": int | null} | null
+        """
+        data = event.get("data") or {}
+        dialog_id = data.get("dialog_id")
+        if dialog_id is None:
+            log.warning("dialog.profile.fetched without dialog_id, skip")
+            return
+
+        bio = data.get("bio")
+        birthday = data.get("birthday") or {}
+        b_day = birthday.get("day") if isinstance(birthday, dict) else None
+        b_month = birthday.get("month") if isinstance(birthday, dict) else None
+        b_year = birthday.get("year") if isinstance(birthday, dict) else None
+
+        pool = db.get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE dialogs SET
+                    bio            = COALESCE($2, bio),
+                    birthday_day   = COALESCE($3, birthday_day),
+                    birthday_month = COALESCE($4, birthday_month),
+                    birthday_year  = COALESCE($5, birthday_year),
+                    updated_at     = NOW()
+                WHERE id = $1
+                """,
+                dialog_id, bio, b_day, b_month, b_year,
+            )
