@@ -79,7 +79,9 @@ autochat_sessions  ← account_id → accounts, dialog_id → dialogs
 | `first_name` | string | имя из публичного профиля |
 | `last_name` | string | фамилия из публичного профиля (nullable) |
 | `phone` | string | номер телефона (nullable) |
-| `birthday` | date | день рождения (nullable) |
+| `birthday_day` | smallint | день рождения, число (1–31, nullable) |
+| `birthday_month` | smallint | день рождения, месяц (1–12, nullable) |
+| `birthday_year` | smallint | день рождения, год (1900–2100, nullable — Telegram отдаёт год не всегда) |
 | `bio` | text | "о себе" из профиля (nullable) |
 | `is_contact` | bool | добавлен ли в наши контакты |
 | `contact_first_name` | string | как сохранили у себя в контактах |
