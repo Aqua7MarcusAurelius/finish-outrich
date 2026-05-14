@@ -32,6 +32,7 @@ from telethon.errors import (
 )
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import SetTypingRequest
+from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import (
     DocumentAttributeAnimated,
     DocumentAttributeAudio,
@@ -595,6 +596,42 @@ class TelegramWrapper:
         if profile is None or profile.get("telegram_user_id") is None:
             raise UsernameUnavailable(f"@{cleaned} — не удалось снять профиль")
         return profile
+
+    async def fetch_full_profile(self, user_id: int) -> dict[str, Any]:
+        """
+        Расширенный профиль собеседника через `GetFullUserRequest`.
+
+        Поля, которые НЕ приходят в обычном `User` entity и требуют
+        отдельного запроса: bio (статус) и день рождения. Используется
+        модулем `peer_profile` при появлении нового диалога — один раз
+        на нового собеседника, потом хранится в `dialogs`.
+
+        Возвращает dict со всеми полями (значения None если их нет
+        в ответе TG):
+            {"bio": str | None, "birthday": {"day": int, "month": int,
+              "year": int | None} | None}
+
+        SessionExpired — через `_guard`. Прочие ошибки пробрасываются
+        наверх; caller (peer_profile.service) решает что с ними делать
+        (логировать и пропустить — bio не критичен).
+        """
+        async def _do():
+            return await self.client(GetFullUserRequest(user_id))
+
+        result = await self._guard(_do)
+        full = getattr(result, "full_user", None)
+        bio = getattr(full, "about", None) if full is not None else None
+
+        birthday_obj = getattr(full, "birthday", None) if full is not None else None
+        birthday: dict[str, Any] | None = None
+        if birthday_obj is not None:
+            day = getattr(birthday_obj, "day", None)
+            month = getattr(birthday_obj, "month", None)
+            year = getattr(birthday_obj, "year", None)
+            if day is not None and month is not None:
+                birthday = {"day": int(day), "month": int(month), "year": int(year) if year is not None else None}
+
+        return {"bio": bio, "birthday": birthday}
 
     async def set_typing(self, user_id: int) -> None:
         """

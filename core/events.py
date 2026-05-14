@@ -24,6 +24,7 @@ class Module:
     AUTOCHAT = "autochat"
     DIALOG_STATUSES = "dialog_statuses"
     WORKER_AUTO_RUNNER = "worker_auto_runner"
+    PEER_PROFILE = "peer_profile"
 
 
 class Status:
@@ -43,6 +44,13 @@ class EventType:
     MESSAGE_REACTED = "message.reacted"
 
     # ── Диалоги ──────────────────────────────────────────────────────
+    # Новая строка в dialogs появилась впервые (history.service после INSERT,
+    # не UPDATE). Слушает peer_profile — чтобы один раз дотянуть bio+birthday
+    # через GetFullUserRequest. UI/CRM-export могут подписаться отдельно.
+    DIALOG_CREATED = "dialog.created"
+    # Расширенный профиль успешно подтянут — публикует peer_profile, слушает
+    # history (UPDATE dialogs.bio, birthday_*).
+    DIALOG_PROFILE_FETCHED = "dialog.profile.fetched"
     DIALOG_DELETED = "dialog.deleted"
     # Завершение bulk-операции «снести все диалоги аккаунта»
     # (POST /accounts/{id}/dialogs/wipe). Каждый успешно удалённый диалог
