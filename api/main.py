@@ -37,6 +37,7 @@ from modules.history.cleaner import Cleaner
 from modules.history.routes import router as history_router
 from modules.history.service import HistoryService
 from modules.media_description.service import DescriptionService
+from modules.peer_profile.service import PeerProfileService
 from modules.transcription.service import TranscriptionService
 from modules.worker_auto_runner.routes import router as auto_runner_router
 from modules.worker_auto_runner.service import WorkerAutoRunnerService
@@ -93,6 +94,16 @@ async def lifespan(app: FastAPI):
     autochat_task = asyncio.create_task(autochat_service.run())
     app.state.autochat_task = autochat_task
 
+    # PeerProfile: фоновый consumer, дотягивает bio + день рождения через
+    # GetFullUserRequest на каждый dialog.created. Запускается после
+    # WorkerManager (нужен get_wrapper), гасится до него (см. shutdown).
+    peer_profile_service = PeerProfileService(
+        get_wrapper=app.state.worker_manager.get_wrapper,
+    )
+    app.state.peer_profile_service = peer_profile_service
+    peer_profile_task = asyncio.create_task(peer_profile_service.run())
+    app.state.peer_profile_task = peer_profile_task
+
     # WorkerAutoRunner: per-account автомат старта диалогов из очереди.
     # Создаётся ПОСЛЕ AutoChat, потому что зовёт его create_session.
     # При старте сбрасывает is_running у всех — после рестарта не
@@ -133,6 +144,19 @@ async def lifespan(app: FastAPI):
         autochat_task.cancel()
         try:
             await autochat_task
+        except asyncio.CancelledError:
+            pass
+
+        # PeerProfile — до WorkerManager: пока wrapper'ы ещё живы, даём
+        # consumer'у спокойно остановиться без падений на половине fetch'а.
+        try:
+            await peer_profile_service.stop()
+        except Exception:
+            log.exception("peer_profile_service stop error")
+
+        peer_profile_task.cancel()
+        try:
+            await peer_profile_task
         except asyncio.CancelledError:
             pass
 
