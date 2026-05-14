@@ -16,6 +16,9 @@
   {partner_username}  — @username собеседника (без @, может быть пусто)
   {partner_name}      — отображаемое имя собеседника (first + last)
   {partner_bio}       — Telegram-bio собеседника (может быть пусто)
+  {partner_birthday}  — день рождения собеседника "DD.MM" или
+                        "DD.MM.YYYY" (если Telegram отдал год), пусто
+                        если собеседник не указал
 
 ТОЛЬКО В REPLY (требуют существующего диалога с историей):
   {conversation_history}  — вся история по docs/history_format_spec.md
@@ -79,6 +82,22 @@ def _strip_comments(text: str) -> str:
     return _COMMENT_RE.sub("", text)
 
 
+def _format_birthday(
+    day: int | None, month: int | None, year: int | None,
+) -> str:
+    """
+    День рождения для подстановки в `{partner_birthday}`.
+
+    "" если day/month не заданы (так что плейсхолдер просто исчезнет
+    в промпте). С годом — "DD.MM.YYYY", без — "DD.MM".
+    """
+    if not day or not month:
+        return ""
+    if year:
+        return f"{int(day):02d}.{int(month):02d}.{int(year):04d}"
+    return f"{int(day):02d}.{int(month):02d}"
+
+
 def _read_prompt_file(path: Path, fallback: str) -> str:
     """Прочитать файл-фолбэк. Используется только если БД пуста."""
     try:
@@ -111,6 +130,7 @@ class PartnerInfo:
     username: str = ""
     name: str = ""
     bio: str = ""
+    birthday: str = ""
 
     @classmethod
     def from_dialog_row(cls, row: Any | None) -> "PartnerInfo":
@@ -123,11 +143,22 @@ class PartnerInfo:
             username=(row["username"] or "").lstrip("@"),
             name=name,
             bio=(row["bio"] or "").strip(),
+            birthday=_format_birthday(
+                row["birthday_day"],
+                row["birthday_month"],
+                row["birthday_year"],
+            ),
         )
 
     @classmethod
     def from_resolved_profile(cls, username: str, profile: dict[str, Any]) -> "PartnerInfo":
-        """profile — то что отдаёт wrapper.resolve_username()."""
+        """
+        profile — то что отдаёт wrapper.resolve_username().
+        Birthday здесь не приходит — для него нужен отдельный
+        GetFullUserRequest, который дёргается уже после первого
+        сообщения (см. modules/peer_profile/). Поэтому здесь оставляем
+        пустым; reply-промпт уже будет иметь актуальную дату из БД.
+        """
         first = profile.get("first_name") or ""
         last = profile.get("last_name") or ""
         name = " ".join(p for p in (first, last) if p).strip()
@@ -154,6 +185,7 @@ def _build_placeholders(
         "partner_username": partner.username,
         "partner_name": partner.name,
         "partner_bio": partner.bio,
+        "partner_birthday": partner.birthday,
     }
     # Reply-only ключи. Всегда добавляем когда заданы — иначе оставляем
     # _render оставлять {key} литералом, оператор увидит опечатку.
@@ -182,7 +214,8 @@ async def _load_partner_info_for_dialog(
 ) -> PartnerInfo:
     row = await conn.fetchrow(
         """
-        SELECT username, first_name, last_name, bio
+        SELECT username, first_name, last_name, bio,
+               birthday_day, birthday_month, birthday_year
         FROM dialogs WHERE id = $1
         """,
         dialog_id,
