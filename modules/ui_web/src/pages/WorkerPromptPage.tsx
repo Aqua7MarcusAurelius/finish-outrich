@@ -26,6 +26,7 @@ const PLACEHOLDERS: Placeholder[] = [
   { name: "partner_username",    description: "@username собеседника, без @",            scope: "both" },
   { name: "partner_name",        description: "Имя собеседника (first + last)",          scope: "both" },
   { name: "partner_bio",         description: "Telegram-bio собеседника",                scope: "both" },
+  { name: "partner_birthday",    description: "День рождения собеседника: \"DD.MM\" или \"DD.MM.YYYY\" (пусто если не указан)", scope: "both" },
   { name: "conversation_history",description: "Вся история переписки в формате блоков (см. docs/history_format_spec.md)", scope: "reply-only" },
   { name: "messages_count",      description: "Сколько сообщений в диалоге",             scope: "reply-only" },
   { name: "days_since_first",    description: "Сколько дней с первого сообщения",        scope: "reply-only" },
