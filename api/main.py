@@ -37,6 +37,8 @@ from modules.history.cleaner import Cleaner
 from modules.history.routes import router as history_router
 from modules.history.service import HistoryService
 from modules.media_description.service import DescriptionService
+from modules.partner_crm.routes import router as partner_crm_router
+from modules.partner_crm.service import PartnerCrmService
 from modules.peer_profile.service import PeerProfileService
 from modules.transcription.service import TranscriptionService
 from modules.worker_auto_runner.routes import router as auto_runner_router
@@ -104,6 +106,13 @@ async def lifespan(app: FastAPI):
     peer_profile_task = asyncio.create_task(peer_profile_service.run())
     app.state.peer_profile_task = peer_profile_task
 
+    # PartnerCrm: HTTP-клиент партнёрской CRM + локальный пул лидов.
+    # Не запускает фоновых задач в 10.2 (poller — отдельный юнит 10.3).
+    # Stateless относительно жизненного цикла приложения, нужен только
+    # httpx-клиент с keep-alive — закрываем его в shutdown.
+    partner_crm_service = PartnerCrmService()
+    app.state.partner_crm_service = partner_crm_service
+
     # WorkerAutoRunner: per-account автомат старта диалогов из очереди.
     # Создаётся ПОСЛЕ AutoChat, потому что зовёт его create_session.
     # При старте сбрасывает is_running у всех — после рестарта не
@@ -159,6 +168,11 @@ async def lifespan(app: FastAPI):
             await peer_profile_task
         except asyncio.CancelledError:
             pass
+
+        try:
+            await partner_crm_service.shutdown()
+        except Exception:
+            log.exception("partner_crm_service shutdown error")
 
         try:
             await app.state.worker_manager.shutdown()
@@ -252,3 +266,4 @@ app.include_router(autochat_router)
 app.include_router(dialog_autochat_router)
 app.include_router(dialog_statuses_router)
 app.include_router(auto_runner_router)
+app.include_router(partner_crm_router)

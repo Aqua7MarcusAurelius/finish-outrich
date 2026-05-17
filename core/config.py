@@ -63,6 +63,15 @@ class Settings(BaseSettings):
     # "anthropic/claude-opus-4.7" (или похожее). При несовпадении —
     # поменять только в .env без правок кода.
     OPENROUTER_MODEL_AUTOCHAT: str = "anthropic/claude-opus-4.7"
+    # Модель для оценщика лидов (модуль lead_evaluator). Дефолт — тот же
+    # Opus 4.7. Меняется независимо от autochat для тюнинга качества.
+    OPENROUTER_MODEL_EVALUATOR: str = "anthropic/claude-opus-4.7"
+
+    # ── Партнёрская CRM (этап 10) ──────────────────────────────────────
+    # Адрес и токен для модуля partner_crm. Полное описание API:
+    # docs/INT_CRM_API_TOKEN_GUIDE.md.
+    CRM_BASE_URL: str = ""
+    CRM_API_TOKEN: str = ""
 
     # ── Вычисляемые свойства ─────────────────────────────────────────
 
