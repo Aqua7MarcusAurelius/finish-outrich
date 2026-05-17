@@ -40,6 +40,7 @@ from modules.media_description.service import DescriptionService
 from modules.lead_evaluator.routes import router as lead_evaluator_router
 from modules.lead_evaluator.service import LeadEvaluatorService
 from modules.lead_evaluator.silence_watcher import SilenceWatcher
+from modules.partner_crm.finalizer import PartnerCrmFinalizer
 from modules.partner_crm.poller import PartnerCrmPoller
 from modules.partner_crm.routes import router as partner_crm_router
 from modules.partner_crm.service import PartnerCrmService
@@ -137,6 +138,14 @@ async def lifespan(app: FastAPI):
     partner_crm_poller_task = asyncio.create_task(partner_crm_poller.run())
     app.state.partner_crm_poller_task = partner_crm_poller_task
 
+    # Финалайзер: слушает dialog.status_changed, при терминальном пузыре
+    # и from_crm=TRUE пушит финальный статус в CRM. Реактивный, не
+    # имеет состояния — может быть остановлен в любой момент.
+    partner_crm_finalizer = PartnerCrmFinalizer(partner_crm_service)
+    app.state.partner_crm_finalizer = partner_crm_finalizer
+    partner_crm_finalizer_task = asyncio.create_task(partner_crm_finalizer.run())
+    app.state.partner_crm_finalizer_task = partner_crm_finalizer_task
+
     # WorkerAutoRunner: per-account автомат старта диалогов из очереди.
     # Создаётся ПОСЛЕ AutoChat, потому что зовёт его create_session.
     # При старте сбрасывает is_running у всех — после рестарта не
@@ -213,6 +222,17 @@ async def lifespan(app: FastAPI):
         lead_evaluator_task.cancel()
         try:
             await lead_evaluator_task
+        except asyncio.CancelledError:
+            pass
+
+        try:
+            await partner_crm_finalizer.stop()
+        except Exception:
+            log.exception("partner_crm_finalizer stop error")
+
+        partner_crm_finalizer_task.cancel()
+        try:
+            await partner_crm_finalizer_task
         except asyncio.CancelledError:
             pass
 
