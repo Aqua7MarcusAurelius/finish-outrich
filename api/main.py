@@ -27,6 +27,7 @@ from core import redis as redis_mod
 from core.config import settings
 from modules.auth.routes import router as auth_router
 from modules.auth.service import AuthService
+from modules.autochat.report_consumer import ReportConsumer
 from modules.autochat.routes import (
     dialog_autochat_router,
     router as autochat_router,
@@ -118,6 +119,15 @@ async def lifespan(app: FastAPI):
     app.state.lead_evaluator_service = lead_evaluator_service
     lead_evaluator_task = asyncio.create_task(lead_evaluator_service.run())
     app.state.lead_evaluator_task = lead_evaluator_task
+
+    # ReportConsumer: слушает dialog.status_changed, при терминальном
+    # пузыре собирает HTML-отчёт и кладёт в MinIO в одну из трёх папок
+    # (success/failed/archive). Заменил старый трюк "сразу после
+    # <finishdialog/>" — теперь дожидаемся вердикта оценщика.
+    report_consumer = ReportConsumer()
+    app.state.report_consumer = report_consumer
+    report_consumer_task = asyncio.create_task(report_consumer.run())
+    app.state.report_consumer_task = report_consumer_task
 
     # SilenceWatcher: фоновый процесс переходов "Общение→Обрыв" по 4ч
     # тишины и "Первый контакт/Обрыв → Завершен провал" по 48ч.
@@ -211,6 +221,17 @@ async def lifespan(app: FastAPI):
         silence_watcher_task.cancel()
         try:
             await silence_watcher_task
+        except asyncio.CancelledError:
+            pass
+
+        try:
+            await report_consumer.stop()
+        except Exception:
+            log.exception("report_consumer stop error")
+
+        report_consumer_task.cancel()
+        try:
+            await report_consumer_task
         except asyncio.CancelledError:
             pass
 

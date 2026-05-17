@@ -717,26 +717,12 @@ class AutoChatService:
         Callback от AutoChatSession когда LLM поставила <finishdialog/>
         и последний сегмент уже отправлен.
 
-        Перед стопом — best-effort сохраняем HTML-отчёт в MinIO (бакет
-        MINIO_REPORTS_BUCKET) + строку в autochat_reports. Ошибка
-        сохранения отчёта не должна блокировать стоп сессии — поэтому
-        save_report_for_session всё ловит сам.
-
-        Затем — стандартный flow stop_session (чистит индексы, ставит
-        status='stopped', публикует autochat.session_stopped).
+        В 10.8 ответственность за HTML-отчёт перенесена на
+        `ReportConsumer` — он строит файл когда на диалоге появляется
+        терминальный пузырь (от оценщика / таймера / оператора).
+        Здесь больше не зовём `save_report_for_session`: оценщик
+        запустится по autochat.finished_by_llm и проставит пузырь.
         """
-        try:
-            # Импорт внутри — модуль report.py использует core.bus/db/minio,
-            # чтобы не тянуть тяжёлые зависимости на верхний уровень
-            # service.py (импорты симметричны с прочими отложенными
-            # импортами в этом модуле).
-            from .report import save_report_for_session
-            await save_report_for_session(session_id)
-        except Exception:
-            log.exception(
-                "autochat: report save failed for session %s (non-fatal)", session_id,
-            )
-
         try:
             await self.stop_session(session_id)
         except Exception:
