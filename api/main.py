@@ -37,6 +37,8 @@ from modules.history.cleaner import Cleaner
 from modules.history.routes import router as history_router
 from modules.history.service import HistoryService
 from modules.media_description.service import DescriptionService
+from modules.lead_evaluator.routes import router as lead_evaluator_router
+from modules.lead_evaluator.service import LeadEvaluatorService
 from modules.partner_crm.poller import PartnerCrmPoller
 from modules.partner_crm.routes import router as partner_crm_router
 from modules.partner_crm.service import PartnerCrmService
@@ -107,6 +109,14 @@ async def lifespan(app: FastAPI):
     peer_profile_task = asyncio.create_task(peer_profile_service.run())
     app.state.peer_profile_task = peer_profile_task
 
+    # LeadEvaluator: LLM-судья закрытых диалогов + извлечение полей.
+    # Consumer слушает autochat.finished_by_llm. Не зависит от других
+    # сервисов кроме openrouter и dialog_statuses (через прямой импорт).
+    lead_evaluator_service = LeadEvaluatorService()
+    app.state.lead_evaluator_service = lead_evaluator_service
+    lead_evaluator_task = asyncio.create_task(lead_evaluator_service.run())
+    app.state.lead_evaluator_task = lead_evaluator_task
+
     # PartnerCrm: HTTP-клиент партнёрской CRM + локальный пул лидов.
     # Сервис держит httpx-клиент (keep-alive), poller докачивает пул из
     # CRM раз в `partner_crm.poll_interval_sec` если есть активные
@@ -172,6 +182,17 @@ async def lifespan(app: FastAPI):
         peer_profile_task.cancel()
         try:
             await peer_profile_task
+        except asyncio.CancelledError:
+            pass
+
+        try:
+            await lead_evaluator_service.stop()
+        except Exception:
+            log.exception("lead_evaluator_service stop error")
+
+        lead_evaluator_task.cancel()
+        try:
+            await lead_evaluator_task
         except asyncio.CancelledError:
             pass
 
@@ -284,3 +305,4 @@ app.include_router(dialog_autochat_router)
 app.include_router(dialog_statuses_router)
 app.include_router(auto_runner_router)
 app.include_router(partner_crm_router)
+app.include_router(lead_evaluator_router)
