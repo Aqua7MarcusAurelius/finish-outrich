@@ -37,6 +37,7 @@ from modules.history.cleaner import Cleaner
 from modules.history.routes import router as history_router
 from modules.history.service import HistoryService
 from modules.media_description.service import DescriptionService
+from modules.partner_crm.poller import PartnerCrmPoller
 from modules.partner_crm.routes import router as partner_crm_router
 from modules.partner_crm.service import PartnerCrmService
 from modules.peer_profile.service import PeerProfileService
@@ -107,11 +108,15 @@ async def lifespan(app: FastAPI):
     app.state.peer_profile_task = peer_profile_task
 
     # PartnerCrm: HTTP-клиент партнёрской CRM + локальный пул лидов.
-    # Не запускает фоновых задач в 10.2 (poller — отдельный юнит 10.3).
-    # Stateless относительно жизненного цикла приложения, нужен только
-    # httpx-клиент с keep-alive — закрываем его в shutdown.
+    # Сервис держит httpx-клиент (keep-alive), poller докачивает пул из
+    # CRM раз в `partner_crm.poll_interval_sec` если есть активные
+    # CRM-воркеры и пул просел ниже `partner_crm.pool_low_threshold`.
     partner_crm_service = PartnerCrmService()
     app.state.partner_crm_service = partner_crm_service
+    partner_crm_poller = PartnerCrmPoller(partner_crm_service)
+    app.state.partner_crm_poller = partner_crm_poller
+    partner_crm_poller_task = asyncio.create_task(partner_crm_poller.run())
+    app.state.partner_crm_poller_task = partner_crm_poller_task
 
     # WorkerAutoRunner: per-account автомат старта диалогов из очереди.
     # Создаётся ПОСЛЕ AutoChat, потому что зовёт его create_session.
@@ -166,6 +171,17 @@ async def lifespan(app: FastAPI):
         peer_profile_task.cancel()
         try:
             await peer_profile_task
+        except asyncio.CancelledError:
+            pass
+
+        try:
+            await partner_crm_poller.stop()
+        except Exception:
+            log.exception("partner_crm_poller stop error")
+
+        partner_crm_poller_task.cancel()
+        try:
+            await partner_crm_poller_task
         except asyncio.CancelledError:
             pass
 
