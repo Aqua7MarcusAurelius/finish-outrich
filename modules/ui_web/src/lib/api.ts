@@ -417,6 +417,47 @@ export const api = {
       { method: "POST", body: JSON.stringify(body) },
     ),
 
+  // ── lead-settings (10.9: lead_source + target_gender) ──────────────
+  patchLeadSettings: (
+    accountId: number,
+    body: { lead_source?: "manual" | "partner_crm"; target_gender?: "any" | "female" | "male" },
+  ) =>
+    request<{ id: number; lead_source: string; target_gender: string }>(
+      `/accounts/${accountId}/lead-settings`,
+      { method: "PATCH", body: JSON.stringify(body) },
+    ),
+
+  // ── partner_crm (10.9: статус подключения + операции с пулом) ──────
+  partnerCrmHealth: () =>
+    request<{ configured: boolean; pool_size: number }>("/partner-crm/health"),
+  partnerCrmPool: () =>
+    request<{ items: Array<{ id: number; username: string; gender: string | null; fetched_at: string }>; count: number }>(
+      "/partner-crm/pool",
+    ),
+  partnerCrmRefill: (count: number) =>
+    request<{ requested: number; fetched: number; inserted: number; skipped_duplicates: number }>(
+      "/partner-crm/pool/refill",
+      { method: "POST", body: JSON.stringify({ count }) },
+    ),
+
+  // ── lead_evaluator (10.10/10.11) ────────────────────────────────────
+  getEvaluation: (dialogId: number) =>
+    request<{ evaluation: import("@/types/api").LeadEvaluation | null }>(
+      `/lead-evaluator/dialogs/${dialogId}/evaluation`,
+    ),
+  evaluateDialog: (dialogId: number) =>
+    request<import("@/types/api").LeadEvaluation>(
+      `/lead-evaluator/dialogs/${dialogId}/evaluate`,
+      { method: "POST" },
+    ),
+  getEvaluatorPrompt: () =>
+    request<{ path: string; content: string }>("/lead-evaluator/prompt"),
+  saveEvaluatorPrompt: (content: string) =>
+    request<{ path: string; bytes_written: number }>(
+      "/lead-evaluator/prompt",
+      { method: "PUT", body: JSON.stringify({ content }) },
+    ),
+
   // ── events ──────────────────────────────────────────────────────────
   listEvents: async (f: EventFilters): Promise<Paginated<BusEvent>> => {
     const raw = await request<{ events: BusEvent[]; next_cursor: string | null }>(

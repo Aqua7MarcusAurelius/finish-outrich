@@ -129,25 +129,39 @@ class PartnerInfo:
     """Данные собеседника для подстановки в плейсхолдеры."""
     username: str = ""
     name: str = ""
+    first_name: str = ""
+    last_name: str = ""
     bio: str = ""
     birthday: str = ""
+    # 10.9: пол лида (для CRM-лидов). Пустая строка если не знаем.
+    gender: str = ""
 
     @classmethod
     def from_dialog_row(cls, row: Any | None) -> "PartnerInfo":
         if row is None:
             return cls()
-        name = " ".join(
-            p for p in (row["first_name"], row["last_name"]) if p
-        ).strip()
+        first = row["first_name"] or ""
+        last = row["last_name"] or ""
+        name = " ".join(p for p in (first, last) if p).strip()
+        # row["gender"] может отсутствовать в выдаче старых SELECT-ов;
+        # _load_partner_info_for_dialog обновлён, остальные тоже терпимы.
+        gender = ""
+        try:
+            gender = (row["gender"] or "").strip()
+        except (KeyError, TypeError):
+            pass
         return cls(
             username=(row["username"] or "").lstrip("@"),
             name=name,
+            first_name=first,
+            last_name=last,
             bio=(row["bio"] or "").strip(),
             birthday=_format_birthday(
                 row["birthday_day"],
                 row["birthday_month"],
                 row["birthday_year"],
             ),
+            gender=gender,
         )
 
     @classmethod
@@ -186,6 +200,7 @@ def _build_placeholders(
         "partner_name": partner.name,
         "partner_bio": partner.bio,
         "partner_birthday": partner.birthday,
+        "partner_gender": partner.gender,
     }
     # Reply-only ключи. Всегда добавляем когда заданы — иначе оставляем
     # _render оставлять {key} литералом, оператор увидит опечатку.
@@ -215,7 +230,8 @@ async def _load_partner_info_for_dialog(
     row = await conn.fetchrow(
         """
         SELECT username, first_name, last_name, bio,
-               birthday_day, birthday_month, birthday_year
+               birthday_day, birthday_month, birthday_year,
+               gender
         FROM dialogs WHERE id = $1
         """,
         dialog_id,
