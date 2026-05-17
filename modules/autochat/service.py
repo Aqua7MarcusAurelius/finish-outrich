@@ -292,6 +292,8 @@ class AutoChatService:
         *,
         account_id: int,
         username: str,
+        gender: str | None = None,
+        from_crm: bool = False,
     ) -> dict[str, Any]:
         """
         Синхронный флоу:
@@ -424,23 +426,32 @@ class AutoChatService:
 
         # Публикуем message.received (история запишет; history создаст dialog)
         if tg_msg_id is not None:
+            message_data: dict[str, Any] = {
+                "telegram_message_id": tg_msg_id,
+                "telegram_user_id": telegram_user_id,
+                "is_outgoing": True,
+                "date": sent.get("date") or bus.now_utc(),
+                "text": initial_text,
+                "reply_to_telegram_message_id": None,
+                "forward_from": None,
+                "media_group_id": None,
+                "peer_profile": profile,
+                "media": [],
+            }
+            # Метаданные из партнёрской CRM — history запишет в
+            # dialogs.gender / dialogs.from_crm при первом INSERT диалога.
+            # Передаём только если есть что-то осмысленное.
+            if from_crm or gender:
+                message_data["partner_crm_meta"] = {
+                    "from_crm": bool(from_crm),
+                    "gender": gender,
+                }
             await bus.publish(
                 module=Module.WRAPPER,
                 type=EventType.MESSAGE_RECEIVED,
                 status=Status.SUCCESS,
                 account_id=account_id,
-                data={
-                    "telegram_message_id": tg_msg_id,
-                    "telegram_user_id": telegram_user_id,
-                    "is_outgoing": True,
-                    "date": sent.get("date") or bus.now_utc(),
-                    "text": initial_text,
-                    "reply_to_telegram_message_id": None,
-                    "forward_from": None,
-                    "media_group_id": None,
-                    "peer_profile": profile,
-                    "media": [],
-                },
+                data=message_data,
             )
 
         # initial_sent event

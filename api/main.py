@@ -125,6 +125,7 @@ async def lifespan(app: FastAPI):
     auto_runner_service = WorkerAutoRunnerService(
         get_wrapper=app.state.worker_manager.get_wrapper,
         autochat_service=autochat_service,
+        partner_crm_service=partner_crm_service,
     )
     app.state.auto_runner_service = auto_runner_service
     await auto_runner_service.reset_on_boot()
