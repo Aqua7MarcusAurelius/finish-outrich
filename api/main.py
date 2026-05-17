@@ -39,6 +39,7 @@ from modules.history.service import HistoryService
 from modules.media_description.service import DescriptionService
 from modules.lead_evaluator.routes import router as lead_evaluator_router
 from modules.lead_evaluator.service import LeadEvaluatorService
+from modules.lead_evaluator.silence_watcher import SilenceWatcher
 from modules.partner_crm.poller import PartnerCrmPoller
 from modules.partner_crm.routes import router as partner_crm_router
 from modules.partner_crm.service import PartnerCrmService
@@ -117,6 +118,14 @@ async def lifespan(app: FastAPI):
     lead_evaluator_task = asyncio.create_task(lead_evaluator_service.run())
     app.state.lead_evaluator_task = lead_evaluator_task
 
+    # SilenceWatcher: фоновый процесс переходов "Общение→Обрыв" по 4ч
+    # тишины и "Первый контакт/Обрыв → Завершен провал" по 48ч.
+    # Не зависит от lead_evaluator кроме общего settings/dialog_statuses.
+    silence_watcher = SilenceWatcher()
+    app.state.silence_watcher = silence_watcher
+    silence_watcher_task = asyncio.create_task(silence_watcher.run())
+    app.state.silence_watcher_task = silence_watcher_task
+
     # PartnerCrm: HTTP-клиент партнёрской CRM + локальный пул лидов.
     # Сервис держит httpx-клиент (keep-alive), poller докачивает пул из
     # CRM раз в `partner_crm.poll_interval_sec` если есть активные
@@ -182,6 +191,17 @@ async def lifespan(app: FastAPI):
         peer_profile_task.cancel()
         try:
             await peer_profile_task
+        except asyncio.CancelledError:
+            pass
+
+        try:
+            await silence_watcher.stop()
+        except Exception:
+            log.exception("silence_watcher stop error")
+
+        silence_watcher_task.cancel()
+        try:
+            await silence_watcher_task
         except asyncio.CancelledError:
             pass
 

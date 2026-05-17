@@ -104,6 +104,8 @@ class LeadEvaluatorService:
         self._stop_event = asyncio.Event()
         self._running: set[int] = set()
         self._running_lock = asyncio.Lock()
+        # Кэш ID пузырей по лейблу — заполняется лениво.
+        self._label_cache: dict[str, int] = {}
 
     # ─── Lifecycle ───────────────────────────────────────────────────
 
@@ -153,8 +155,12 @@ class LeadEvaluatorService:
 
     async def _handle(self, event: dict) -> None:
         et = event.get("type")
-        if et != EventType.AUTOCHAT_FINISHED_BY_LLM:
-            return
+        if et == EventType.AUTOCHAT_FINISHED_BY_LLM:
+            await self._on_finished_by_llm(event)
+        elif et == EventType.MESSAGE_SAVED:
+            await self._on_message_saved(event)
+
+    async def _on_finished_by_llm(self, event: dict) -> None:
         data = event.get("data") or {}
         dialog_id = data.get("dialog_id")
         if dialog_id is None:
@@ -172,6 +178,76 @@ class LeadEvaluatorService:
             log.exception(
                 "lead_evaluator: evaluate failed for dialog %s", dialog_id,
             )
+
+    async def _on_message_saved(self, event: dict) -> None:
+        """
+        Автоматические транзиции по факту сохранения сообщения:
+          NULL + outgoing                → "Первый контакт"
+          NULL + incoming                → "Общение" (редко — мы инициируем)
+          "Первый контакт" + incoming    → "Общение" (лид ответил)
+          "Обрыв" + incoming             → "Общение" (вернулся)
+        Терминальные пузыри (Завершен/Невалид) не трогаем — они финальные.
+        """
+        data = event.get("data") or {}
+        dialog_id = data.get("dialog_id")
+        is_outgoing = bool(data.get("is_outgoing", False))
+        if dialog_id is None:
+            return
+
+        pool = db.get_pool()
+        async with pool.acquire() as conn:
+            current_status_id = await conn.fetchval(
+                "SELECT status_id FROM dialogs WHERE id = $1", dialog_id,
+            )
+
+        # Лукапы по лейблу — один раз кэшируем за время жизни процесса.
+        s_pervyi = await self._status_id("Первый контакт")
+        s_obshenie = await self._status_id("Общение")
+        s_obryv = await self._status_id("Обрыв")
+
+        target: int | None = None
+        if current_status_id is None:
+            target = s_pervyi if is_outgoing else s_obshenie
+        elif current_status_id == s_pervyi and not is_outgoing:
+            target = s_obshenie
+        elif current_status_id == s_obryv and not is_outgoing:
+            target = s_obshenie
+
+        if target is None or target == current_status_id:
+            return
+
+        try:
+            await dialog_statuses_service.set_dialog_status(
+                int(dialog_id), target,
+                source="event:message_saved.auto_transition",
+            )
+        except dialog_statuses_service.DialogStatusError as e:
+            log.warning(
+                "lead_evaluator: failed to auto-transition dialog %s: %s",
+                dialog_id, e,
+            )
+
+    # ─── Кэш лукапов по лейблу ───────────────────────────────────────
+
+    async def _status_id(self, label: str) -> int | None:
+        """
+        Кэш живёт всю жизнь процесса. Если оператор переименует пузырь —
+        первый промах потянет апдейт. Дешевле чем SELECT на каждое
+        message.saved (а их много).
+        """
+        cached = self._label_cache.get(label)
+        if cached is not None:
+            return cached
+        pool = db.get_pool()
+        async with pool.acquire() as conn:
+            row_id = await conn.fetchval(
+                "SELECT id FROM dialog_statuses WHERE label = $1 LIMIT 1",
+                label,
+            )
+        if row_id is not None:
+            self._label_cache[label] = int(row_id)
+            return int(row_id)
+        return None
 
     # ─── Публичный API ───────────────────────────────────────────────
 
