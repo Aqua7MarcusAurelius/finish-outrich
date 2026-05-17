@@ -1,18 +1,29 @@
 import { useState } from "react";
 import { cn } from "@/lib/utils";
 import { DialogStatusesPanel } from "@/components/settings/DialogStatusesPanel";
+import { LeadEvaluatorPanel } from "@/components/settings/LeadEvaluatorPanel";
+import { PartnerCrmPanel } from "@/components/settings/PartnerCrmPanel";
 
-// Страница /settings — общий контейнер с левым саб-навом. Сейчас
-// внутри один пункт «Статусы диалогов». Когда понадобится — добавим
-// «AutoChat», «Глобальные параметры» и т.п. без изменения роутинга.
+// Страница /settings — общий контейнер с левым саб-навом. В 10.11
+// добавили два новых раздела для CRM-интеграции.
 
-type SectionKey = "statuses";
+type SectionKey = "statuses" | "evaluator" | "partner_crm";
 
 const SECTIONS: { key: SectionKey; label: string; description: string }[] = [
   {
     key: "statuses",
     label: "Статусы диалогов",
     description: "Каталог операторских пузырей: лейбл, цвет, порядок",
+  },
+  {
+    key: "evaluator",
+    label: "Оценщик лидов",
+    description: "Промт LLM-судьи + таймеры тишины и закрытия",
+  },
+  {
+    key: "partner_crm",
+    label: "Партнёрский CRM",
+    description: "Подключение, пул лидов, параметры автозабора",
   },
 ];
 
@@ -46,6 +57,8 @@ export function SettingsPage() {
 
       <section className="min-w-0 flex-1 overflow-auto">
         {section === "statuses" && <DialogStatusesPanel />}
+        {section === "evaluator" && <LeadEvaluatorPanel />}
+        {section === "partner_crm" && <PartnerCrmPanel />}
       </section>
     </div>
   );

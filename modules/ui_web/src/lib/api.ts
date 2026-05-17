@@ -422,6 +422,17 @@ export const api = {
       { method: "POST", body: JSON.stringify(body) },
     ),
 
+  // ── system settings (10.11: ключи partner_crm.*, lead_evaluator.*) ─
+  listSettings: (prefix?: string) =>
+    request<{ items: Array<{ key: string; value: string; description: string | null; updated_at: string | null }> }>(
+      `/system/settings${qs({ prefix })}`,
+    ),
+  patchSettings: (updates: Record<string, string>) =>
+    request<{ updated: number }>(
+      "/system/settings",
+      { method: "PATCH", body: JSON.stringify({ updates }) },
+    ),
+
   // ── lead-settings (10.9: lead_source + target_gender) ──────────────
   patchLeadSettings: (
     accountId: number,
