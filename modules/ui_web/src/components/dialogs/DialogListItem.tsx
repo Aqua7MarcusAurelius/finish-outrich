@@ -103,6 +103,14 @@ export function DialogListItem({
           <div className="flex items-center gap-1">
             {dialog.is_contact && <span className="h-1.5 w-1.5 rounded-full bg-status-success" />}
             <span className="truncate text-sm font-medium">{dialog.title || "(без имени)"}</span>
+            {dialog.from_crm && (
+              <span
+                className="inline-flex shrink-0 items-center rounded-md border border-blue-500/30 bg-blue-500/10 px-1 py-0.5 text-[9px] uppercase tracking-wider text-blue-600"
+                title="Лид из партнёрского CRM"
+              >
+                CRM
+              </span>
+            )}
             {dialog.last_message && (
               <span className="ml-auto shrink-0 text-[11px] text-muted-foreground">{formatTime(dialog.last_message.date)}</span>
             )}

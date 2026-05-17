@@ -58,6 +58,16 @@ def _dialog_to_dict(row: Any) -> dict[str, Any]:
             "label": row["status_label"] if "status_label" in keys else None,
             "color": row["status_color"] if "status_color" in keys else None,
         }
+    # 10.10: CRM-метаданные на диалоге. SELECT'ы для get_dialog
+    # (через `d.*`) их подхватывают автоматически. Для других путей
+    # (например, в _on_message_received row может не содержать эти поля)
+    # — защищаемся .get-логикой через keys().
+    gender = row["gender"] if "gender" in keys else None
+    from_crm = bool(row["from_crm"]) if "from_crm" in keys else False
+    partner_crm_terminal_reason = (
+        row["partner_crm_terminal_reason"]
+        if "partner_crm_terminal_reason" in keys else None
+    )
     return {
         "id": row["id"],
         "account_id": row["account_id"],
@@ -75,6 +85,9 @@ def _dialog_to_dict(row: Any) -> dict[str, Any]:
         "contact_first_name": row["contact_first_name"],
         "contact_last_name": row["contact_last_name"],
         "is_bot": row["is_bot"],
+        "gender": gender,
+        "from_crm": from_crm,
+        "partner_crm_terminal_reason": partner_crm_terminal_reason,
         "status": status_obj,
         "created_at": _iso(row["created_at"]),
         "updated_at": _iso(row["updated_at"]),

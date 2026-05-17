@@ -15,6 +15,7 @@ import { WipeDialogsConfirm } from "@/components/dialogs/WipeDialogsConfirm";
 import { AutoRunnerSettingsDialog } from "@/components/dialogs/AutoRunnerSettingsDialog";
 import { DialogEventsWidget } from "@/components/dialogs/DialogEventsWidget";
 import { DialogListItem } from "@/components/dialogs/DialogListItem";
+import { LeadInfoPanel } from "@/components/dialogs/LeadInfoPanel";
 import { AllWorkersDropdown } from "@/components/dialogs/AllWorkersDropdown";
 import { MessageBubble } from "@/components/dialogs/MessageBubble";
 import { ErrorBox } from "@/components/common/ErrorBox";
@@ -354,9 +355,12 @@ export function DialogsPage() {
             </div>
           </div>
 
-          {/* Правая колонка — виджет потока событий по текущему диалогу. */}
-          <div className="min-w-0 flex-1">
-            <DialogEventsWidget dialogId={dialogId} />
+          {/* Правая колонка — инфа о лиде (10.10) + поток событий. */}
+          <div className="flex min-w-0 flex-1 flex-col">
+            {dialogQ.data && <LeadInfoPanel dialog={dialogQ.data} />}
+            <div className="min-h-0 flex-1">
+              <DialogEventsWidget dialogId={dialogId} />
+            </div>
           </div>
         </section>
       </div>

@@ -104,6 +104,9 @@ export interface DialogSummary {
   phone: string | null;
   is_bot: boolean;
   is_contact: boolean;
+  // 10.10: CRM-метки на диалоге.
+  from_crm: boolean;
+  gender: "female" | "male" | null;
   status: DialogStatusRef | null;
   last_message: { text: string | null; date: string; type: string } | null;
 }

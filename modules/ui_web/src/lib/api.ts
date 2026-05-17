@@ -83,6 +83,9 @@ type BackendDialog = {
   phone: string | null;
   is_bot: boolean;
   is_contact: boolean;
+  // 10.10: CRM-метаданные
+  from_crm?: boolean;
+  gender?: "female" | "male" | null;
   status: { id: number; label: string; color: string } | null;
   last_message: { date: string; text: string | null; is_outgoing: boolean } | null;
 };
@@ -98,6 +101,8 @@ function adaptDialog(d: BackendDialog): DialogSummary {
     phone: d.phone,
     is_bot: d.is_bot,
     is_contact: d.is_contact,
+    from_crm: d.from_crm === true,
+    gender: d.gender ?? null,
     status: d.status,
     last_message: d.last_message
       ? {
