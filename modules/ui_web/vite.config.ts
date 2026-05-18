@@ -37,6 +37,8 @@ export default defineConfig(({ mode }) => {
         "/autochat":        { target: apiTarget, changeOrigin: true },
         "/dialog-statuses": { target: apiTarget, changeOrigin: true },
         "/system":          { target: apiTarget, changeOrigin: true },
+        "/partner-crm":     { target: apiTarget, changeOrigin: true },
+        "/lead-evaluator":  { target: apiTarget, changeOrigin: true },
       },
     },
     preview: {
