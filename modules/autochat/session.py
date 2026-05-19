@@ -508,6 +508,37 @@ class AutoChatSession:
             )
         return row is not None
 
+    # ─── Принудительная генерация (UI-кнопка "оживить диалог") ───────
+
+    async def force_generate_reply(self) -> dict[str, Any]:
+        """
+        Заставить сгенерить ответ сейчас, минуя reply_timer и проверку
+        in_chat. Использует обычный flow `_generate_and_enqueue`, поэтому
+        сегменты пойдут через тот же sender_loop с typing-имитацией.
+
+        Сценарий: оператор перезапустил app, reply_timer пропал, диалог
+        залип. Или просто хочет "оживить" сейчас. Нажимает кнопку,
+        мы пропускаем все ожидания.
+        """
+        if self._stopped.is_set():
+            raise AutoSessionExpired(
+                f"session {self.id} stopped, cannot regenerate"
+            )
+
+        # Дождёмся медиа (как делает обычный planner) — иначе LLM увидит
+        # сырое сообщение без транскрипции и ответит мимо темы.
+        await self._wait_for_transcriptions()
+
+        # _generate_and_enqueue сам ловит OpenRouterError → AUTOCHAT_SESSION_ERROR
+        # и просто возвращается, не валя сессию. Здесь добавим обёртку
+        # чтобы вернуть caller'у факт результата.
+        await self._generate_and_enqueue()
+        return {
+            "session_id": self.id,
+            "dialog_id": self.dialog_id,
+            "queued": True,
+        }
+
     # ─── Генерация ───────────────────────────────────────────────────
 
     async def _generate_and_enqueue(self) -> None:

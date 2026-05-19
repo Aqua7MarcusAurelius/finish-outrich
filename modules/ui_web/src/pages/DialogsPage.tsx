@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { X, Bot } from "lucide-react";
+import { X, Bot, Zap, Loader2 } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -79,6 +79,24 @@ export function DialogsPage() {
       toast.error(`Автодиалог: ${d.title}`, d.detail);
     } finally {
       setAutochatBusy(false);
+    }
+  }
+
+  const [regenBusy, setRegenBusy] = useState(false);
+  async function regenerateReply() {
+    if (dialogId == null) return;
+    setRegenBusy(true);
+    try {
+      await api.regenerateDialogAutochat(dialogId);
+      toast.success(
+        "Генерация запущена",
+        "ответ сейчас уйдёт через обычный sender",
+      );
+    } catch (e) {
+      const d = describeApiError(e);
+      toast.error(`Регенерация: ${d.title}`, d.detail);
+    } finally {
+      setRegenBusy(false);
     }
   }
 
@@ -326,6 +344,23 @@ export function DialogsPage() {
                     />
                     <Bot className="h-3 w-3" />
                     Авто: {autochatQ.data?.active ? "ВКЛ" : "ВЫКЛ"}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={regenerateReply}
+                    disabled={regenBusy || !autochatQ.data?.active}
+                    title={
+                      autochatQ.data?.active
+                        ? "Сгенерить ответ сейчас (пропустить reply_timer)"
+                        : "Сначала включи автодиалог"
+                    }
+                    className="h-7 gap-1.5 px-2 text-[11px]"
+                  >
+                    {regenBusy
+                      ? <Loader2 className="h-3 w-3 animate-spin" />
+                      : <Zap className="h-3 w-3" />}
+                    Сгенерить
                   </Button>
                   <Button
                     variant="ghost"

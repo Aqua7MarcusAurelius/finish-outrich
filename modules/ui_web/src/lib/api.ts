@@ -272,6 +272,15 @@ export const api = {
       { method: "DELETE" },
     ),
 
+  // Принудительная регенерация ответа — пропускает reply_timer и
+  // in_chat, дёргает обычный _generate_and_enqueue. Под UI-кнопку
+  // "оживить диалог". Требует активной autochat-сессии на диалоге.
+  regenerateDialogAutochat: (dialogId: number) =>
+    request<{ session_id: number; dialog_id: number | null; queued: boolean }>(
+      `/dialogs/${dialogId}/autochat/regenerate`,
+      { method: "POST" },
+    ),
+
   listMessages: async (dialogId: number, cursor?: string, limit = 50): Promise<Paginated<Message>> => {
     const raw = await request<{ messages: BackendMessage[]; next_cursor: string | null }>(
       `/dialogs/${dialogId}/messages${qs({ cursor, limit })}`,

@@ -34,6 +34,7 @@ from .errors import (
     CannotWrite,
     DialogNotFound,
     GenerationFailed,
+    NoActiveSession,
     PromptNotConfigured,
     SessionAlreadyActive,
     SessionExpired as AutoSessionExpired,
@@ -711,6 +712,35 @@ class AutoChatService:
         if existing is None:
             raise SessionNotFound()
         return await self.stop_session(existing["id"])
+
+    async def force_reply_for_dialog(self, dialog_id: int) -> dict[str, Any]:
+        """
+        Найти активную сессию для диалога и заставить её сгенерить ответ
+        сейчас (минуя reply_timer и проверку in_chat). Под UI-кнопку
+        "оживить диалог" / "сгенерить принудительно".
+
+        Кидает:
+          - DialogNotFound — нет такого dialog_id в БД
+          - NoActiveSession — сессии нет в памяти (после рестарта могло
+            не подняться, либо сессия была остановлена/закрыта)
+          - AutoSessionExpired — если протухла TG-сессия в процессе
+        """
+        pool = db.get_pool()
+        async with pool.acquire() as conn:
+            dlg = await conn.fetchrow(
+                "SELECT account_id FROM dialogs WHERE id = $1", dialog_id,
+            )
+        if dlg is None:
+            raise DialogNotFound()
+        account_id = int(dlg["account_id"])
+
+        async with self._lock:
+            sid = self._by_dialog.get((account_id, dialog_id))
+            session = self._sessions_by_id.get(sid) if sid is not None else None
+
+        if session is None:
+            raise NoActiveSession()
+        return await session.force_generate_reply()
 
     async def _on_session_finished_by_llm(self, session_id: int) -> None:
         """

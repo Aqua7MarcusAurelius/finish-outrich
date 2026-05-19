@@ -81,3 +81,10 @@ class DialogNotFound(AutoChatError):
     code = "DIALOG_NOT_FOUND"
     message = "Диалог не найден"
     status_code = 404
+
+
+class NoActiveSession(AutoChatError):
+    """Нет активной autochat-сессии для этого диалога — нечего регенерить."""
+    code = "NO_ACTIVE_SESSION"
+    message = "На этом диалоге нет активной авто-сессии. Включи автодиалог сначала."
+    status_code = 409
