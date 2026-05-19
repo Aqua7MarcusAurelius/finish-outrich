@@ -50,7 +50,10 @@ def _dialog_to_dict(row: Any) -> dict[str, Any]:
     # управляется модулем dialog_statuses. SELECT'ы выше LEFT JOIN'ят
     # его, поэтому здесь просто читаем уже подцепленные поля. None,
     # если status_id IS NULL или JOIN не был сделан.
-    keys = row.keys()
+    # asyncpg.Record.keys() возвращает tuple_iterator, который "съедается"
+    # каждой проверкой `in` — нельзя использовать дважды. Сразу разворачиваем
+    # в set, чтобы все последующие membership-чеки были O(1) и независимы.
+    keys = set(row.keys())
     status_obj: dict[str, Any] | None = None
     if "status_id" in keys and row["status_id"] is not None:
         status_obj = {
