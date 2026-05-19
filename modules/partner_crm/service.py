@@ -83,58 +83,97 @@ class PartnerCrmService:
 
     async def refill_pool(self, count: int) -> dict[str, Any]:
         """
-        POST /api/l1/leads/request-new + INSERT в crm_lead_pool.
+        Двухфазный рефилл пула.
 
-        Возвращает: {requested, fetched, inserted, skipped_duplicates}.
-        Не валится если часть лидов уже есть в пуле — просто пропускает.
-        Публикует partner_crm.pool_refilled / partner_crm.refill_failed.
+        Фаза 1 — `GET /api/l1/leads?status=taken`: подтягиваем лидов,
+                 которые CRM уже назначила нам (либо нашим прошлым
+                 request-new'ом, либо без нашего запроса), но ещё не
+                 переведены в in_progress.
+        Фаза 2 — `POST /api/l1/leads/request-new {count: N}` на остаток
+                 до целевого размера `count` (берётся pool_size после
+                 фазы 1, разница идёт в request).
+
+        На каждого УСПЕШНО взятого лида сразу `POST /leads/:u/start` →
+        CRM-статус становится in_progress, событие
+        `partner_crm.lead_started`. Если /start упал — лид НЕ кладётся
+        в локальный пул (на следующем тике увидим его снова в taken
+        и попробуем ещё).
+
+        Возвращает агрегат по двум фазам.
+        Публикует `partner_crm.pool_refilled` / `partner_crm.refill_failed`.
         """
         if count <= 0:
-            return {"requested": 0, "fetched": 0, "inserted": 0,
-                    "skipped_duplicates": 0}
+            return {
+                "requested": 0,
+                "from_assigned": 0,
+                "from_request_new": 0,
+                "inserted": 0,
+                "skipped_duplicates": 0,
+                "start_failed": 0,
+            }
 
+        # ── Фаза 1: уже назначенные нам, ещё не в работе ──────────────
+        # Фильтр `?status=new` совпадает с `lead_status=new` — те лиды
+        # что висят у нас на профиле (либо нам их назначили, либо мы
+        # сами через request-new забрали), и которых мы ещё не двинули
+        # в in_progress. (Workflow поле `status` нам неважно — оно
+        # внутреннее у CRM.)
+        assigned_taken: list[dict[str, Any]] = []
         try:
-            payload = await self._client.request_new_leads(count)
+            assigned_taken = await self._client.list_leads(status="new")
         except PartnerCrmError as e:
-            await self._publish_failed(EventType.PARTNER_CRM_REFILL_FAILED, e)
-            raise
+            # Не валим всю операцию — пробуем хотя бы request-new
+            log.warning("partner_crm refill: phase-1 list_leads failed: %s", e)
 
-        assigned = payload.get("assigned") or payload.get("leads") or []
-        inserted = 0
-        skipped = 0
+        phase1_inserted = 0
+        phase1_skipped = 0
+        phase1_start_failed = 0
+        for lead in assigned_taken:
+            r = await self._take_into_pool(lead, origin="assigned")
+            if r == "inserted":
+                phase1_inserted += 1
+            elif r == "skipped":
+                phase1_skipped += 1
+            elif r == "start_failed":
+                phase1_start_failed += 1
 
-        pool = db.get_pool()
-        async with pool.acquire() as conn:
-            for lead in assigned:
-                username = lead.get("username")
-                if not username:
-                    skipped += 1
-                    continue
-                gender = lead.get("gender")
-                if gender not in (None, "female", "male"):
-                    gender = None
-                # ON CONFLICT — если уже у нас в пуле, не дублируем.
-                # CRM не должна выдавать одного и того же дважды,
-                # но защищаемся на всякий.
-                inserted_ok = await conn.fetchval(
-                    """
-                    INSERT INTO crm_lead_pool (username, gender)
-                    VALUES ($1, $2)
-                    ON CONFLICT (username) DO NOTHING
-                    RETURNING id
-                    """,
-                    username, gender,
-                )
-                if inserted_ok is not None:
-                    inserted += 1
-                else:
-                    skipped += 1
+        # ── Фаза 2: дозалив через request-new если ещё мало ───────────
+        current_size = await self.pool_size()
+        needed = max(0, int(count) - current_size)
+
+        phase2_fetched = 0
+        phase2_inserted = 0
+        phase2_skipped = 0
+        phase2_start_failed = 0
+        if needed > 0:
+            try:
+                payload = await self._client.request_new_leads(needed)
+            except PartnerCrmError as e:
+                await self._publish_failed(EventType.PARTNER_CRM_REFILL_FAILED, e)
+                # Если первая фаза что-то сделала — публикуем результат с
+                # пометкой что вторая упала, иначе пробрасываем ошибку.
+                if phase1_inserted == 0:
+                    raise
+                payload = {"assigned": [], "leads": [], "count": 0}
+
+            new_leads = payload.get("assigned") or payload.get("leads") or []
+            phase2_fetched = len(new_leads)
+            for lead in new_leads:
+                r = await self._take_into_pool(lead, origin="request_new")
+                if r == "inserted":
+                    phase2_inserted += 1
+                elif r == "skipped":
+                    phase2_skipped += 1
+                elif r == "start_failed":
+                    phase2_start_failed += 1
 
         result = {
             "requested": int(count),
-            "fetched": len(assigned),
-            "inserted": inserted,
-            "skipped_duplicates": skipped,
+            "from_assigned": len(assigned_taken),
+            "from_request_new": phase2_fetched,
+            "inserted": phase1_inserted + phase2_inserted,
+            "skipped_duplicates": phase1_skipped + phase2_skipped,
+            "start_failed": phase1_start_failed + phase2_start_failed,
         }
 
         await bus.publish(
@@ -145,6 +184,76 @@ class PartnerCrmService:
         )
         log.info("partner_crm: refill pool result=%s", result)
         return result
+
+    async def _take_into_pool(
+        self, lead: dict[str, Any], *, origin: str,
+    ) -> str:
+        """
+        Взять одного лида в локальный пул: сначала `POST /leads/:u/start`,
+        потом INSERT в `crm_lead_pool`.
+
+        Порядок важен: если /start упадёт, в локальный пул не кладём —
+        иначе будем держать у себя лида, который для CRM «не в работе»,
+        и это рассинхрон.
+
+        origin — для аудита в `partner_crm.lead_started` ('assigned' /
+        'request_new' / 'manual_refill'). На event payload не влияет
+        фатально, удобно для фильтрации в /events.
+
+        Возвращает 'inserted' | 'skipped' | 'start_failed' | 'invalid'.
+        """
+        username = lead.get("username")
+        if not username:
+            return "invalid"
+
+        gender = lead.get("gender")
+        if gender not in (None, "female", "male"):
+            gender = None
+
+        # 1) Переводим в in_progress первым — чтобы локально не держать
+        # лида, которого CRM не подтвердила «в работе».
+        # Используем /status {in_progress}, а не /start: /start у CRM
+        # требует привязанного L1-TG аккаунта на их стороне (которого у
+        # нас нет — мы общаемся через свой Telethon). /status работает
+        # без привязки и просто меняет lead_status.
+        try:
+            await self._client.set_lead_status(username, "in_progress")
+        except PartnerCrmError as e:
+            log.warning(
+                "partner_crm refill: set in_progress failed for %s: %s",
+                username, e,
+            )
+            await bus.publish(
+                module=Module.PARTNER_CRM,
+                type=EventType.PARTNER_CRM_LEAD_START_FAILED,
+                status=Status.ERROR,
+                data={"username": username, "error": str(e), "origin": origin},
+            )
+            return "start_failed"
+
+        await bus.publish(
+            module=Module.PARTNER_CRM,
+            type=EventType.PARTNER_CRM_LEAD_STARTED,
+            status=Status.SUCCESS,
+            data={"username": username, "origin": origin},
+        )
+
+        # 2) INSERT в пул. ON CONFLICT — если уже там, пропускаем (это
+        # нормально: /start был успешным, статус в CRM теперь in_progress,
+        # лид и так у нас в очереди).
+        pool = db.get_pool()
+        async with pool.acquire() as conn:
+            inserted_id = await conn.fetchval(
+                """
+                INSERT INTO crm_lead_pool (username, gender)
+                VALUES ($1, $2)
+                ON CONFLICT (username) DO NOTHING
+                RETURNING id
+                """,
+                username, gender,
+            )
+
+        return "inserted" if inserted_id is not None else "skipped"
 
     async def claim_lead_for_account(
         self,

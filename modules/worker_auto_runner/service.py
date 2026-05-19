@@ -571,22 +571,10 @@ class WorkerAutoRunnerService:
                     "from_crm": from_crm,
                 },
             )
-            return
 
-        # Пуш в партнёрскую CRM — лид взят в работу (in_progress).
-        # Делаем после успешного autochat.create_session и не считаем
-        # фатальным если упало (autochat уже работает, лид в БД, лог пишется).
-        if from_crm and self._partner_crm is not None:
-            try:
-                await self._partner_crm.push_lead_started(
-                    account_id=account_id,
-                    username=username,
-                )
-            except Exception as e:
-                log.warning(
-                    "auto_runner[%s]: push_lead_started failed username=%s err=%s",
-                    account_id, username, e,
-                )
+        # `/leads/:u/start` больше НЕ зовём здесь — это делается на этапе
+        # рефилла пула (см. partner_crm.service._take_into_pool). К моменту
+        # когда воркер взял лида из пула, у партнёра он уже in_progress.
 
     async def _chunked_sleep(self, account_id: int, delay: float) -> None:
         """
