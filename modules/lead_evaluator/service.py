@@ -163,10 +163,31 @@ class LeadEvaluatorService:
     async def _on_finished_by_llm(self, event: dict) -> None:
         data = event.get("data") or {}
         dialog_id = data.get("dialog_id")
+        session_id = data.get("session_id")
+
+        # Defensive-резолв: если publisher не положил dialog_id (старый
+        # контракт до фикса) — резолвим через autochat_sessions по
+        # session_id. Это даёт обратную совместимость со старыми
+        # событиями в стриме и страховку от рассинхрона контрактов.
+        if dialog_id is None and session_id is not None:
+            pool = db.get_pool()
+            async with pool.acquire() as conn:
+                dialog_id = await conn.fetchval(
+                    "SELECT dialog_id FROM autochat_sessions WHERE id = $1",
+                    int(session_id),
+                )
+
         if dialog_id is None:
-            # AutoChat не всегда передаёт dialog_id (если сессия упала
-            # до создания диалога) — без него оценщик ничего не сделает.
+            # Сессия упала до создания диалога — единственный сценарий,
+            # когда оценщик не может ничего сделать. ВСЕ другие случаи
+            # должны давать dialog_id либо в data, либо через резолв выше.
+            log.warning(
+                "lead_evaluator: autochat.finished_by_llm без dialog_id "
+                "(session_id=%s) — пропускаем",
+                session_id,
+            )
             return
+
         try:
             await self.evaluate(int(dialog_id), source="autochat.finished_by_llm")
         except EvaluationAlreadyRunning:

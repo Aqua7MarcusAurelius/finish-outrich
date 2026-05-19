@@ -786,13 +786,20 @@ class AutoChatSession:
     async def _publish_finished_by_llm(self, parent_id: str | None) -> None:
         """Публикует событие autochat.finished_by_llm. Сам stop делает callback."""
         try:
+            data: dict[str, Any] = {"session_id": self.id}
+            # dialog_id критично для lead_evaluator consumer'а — без него
+            # оценщик не знает по какому диалогу анализировать. На момент
+            # finished_by_llm диалог уже создан (autochat.create_session
+            # делает INSERT dialogs до отправки первого сообщения).
+            if self.dialog_id is not None:
+                data["dialog_id"] = self.dialog_id
             await bus.publish(
                 module=Module.AUTOCHAT,
                 type=EventType.AUTOCHAT_FINISHED_BY_LLM,
                 status=Status.SUCCESS,
                 parent_id=parent_id,
                 account_id=self.account_id,
-                data={"session_id": self.id},
+                data=data,
             )
         except Exception:
             log.exception(
