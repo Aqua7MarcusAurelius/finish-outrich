@@ -445,6 +445,12 @@ class LeadEvaluatorService:
                     messages,
                     model=settings.OPENROUTER_MODEL_EVALUATOR,
                     temperature=0.4,
+                    # Жёсткий потолок — оценщику нужно лишь несколько
+                    # тегов плюс пара фраз рассуждения. Без явного
+                    # max_tokens OpenRouter резервирует контекст Opus
+                    # под максимум модели (65k), и при низком балансе
+                    # запрос отбивается с HTTP 402 "недостаточно кредитов".
+                    max_tokens=2000,
                 )
             except openrouter.OpenRouterError as e:
                 raise LlmCallFailed(f"LLM call failed: {e}") from e
