@@ -110,6 +110,25 @@ async def _select_one(account_id: int) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+async def _get_account_lead_meta(account_id: int) -> tuple[str, str]:
+    """
+    Возвращает (lead_source, target_gender) — определяет откуда брать
+    следующего лида на тике и какой пол приоритетен.
+
+    Дефолты ('manual', 'any') — если по какой-то причине запись в accounts
+    исчезла (race с удалением).
+    """
+    pool = db.get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT lead_source, target_gender FROM accounts WHERE id = $1",
+            account_id,
+        )
+    if row is None:
+        return "manual", "any"
+    return str(row["lead_source"] or "manual"), str(row["target_gender"] or "any")
+
+
 async def _pop_first_username(account_id: int) -> str | None:
     """
     Атомарно достать и удалить первый юзернейм из очереди.
@@ -173,9 +192,15 @@ class WorkerAutoRunnerService:
         *,
         get_wrapper: Callable[[int], Any],
         autochat_service: Any,
+        partner_crm_service: Any = None,
     ) -> None:
         self._get_wrapper = get_wrapper
         self._autochat = autochat_service
+        # PartnerCrmService — нужен для воркеров с `accounts.lead_source =
+        # 'partner_crm'` (берут лидов из общего пула вместо своей очереди).
+        # Передаётся опционально, чтобы старые тесты / сценарии без
+        # partner_crm работали без изменений.
+        self._partner_crm = partner_crm_service
         # Активные циклы — account_id → Task. Только тут ими управляем.
         self._tasks: dict[int, asyncio.Task] = {}
         self._lock = asyncio.Lock()
@@ -435,17 +460,41 @@ class WorkerAutoRunnerService:
                     )
                     return
 
-                # 2. Pop username.
-                username = await _pop_first_username(account_id)
+                # 2. Pop username. Источник зависит от accounts.lead_source.
+                #    'manual'      → берём из своей worker_auto_runners.queue
+                #    'partner_crm' → claim из общего crm_lead_pool с учётом
+                #                    target_gender (через partner_crm_service)
+                lead_source, target_gender = await _get_account_lead_meta(account_id)
+                claimed: dict[str, Any] | None = None
+                username: str | None = None
+                gender: str | None = None
+                from_crm = False
+
+                if lead_source == "partner_crm" and self._partner_crm is not None:
+                    claimed = await self._partner_crm.claim_lead_for_account(
+                        account_id=account_id,
+                        target_gender=target_gender,
+                    )
+                    if claimed is not None:
+                        username = claimed["username"]
+                        gender = claimed.get("gender")
+                        from_crm = True
+                else:
+                    username = await _pop_first_username(account_id)
+
                 if username is None:
                     await bus.publish(
                         module=Module.WORKER_AUTO_RUNNER,
                         type=EventType.AUTO_RUNNER_QUEUE_EMPTY,
                         status=Status.SUCCESS,
                         account_id=account_id,
+                        data={"lead_source": lead_source},
                     )
                 else:
-                    await self._try_start_dialog(account_id, username)
+                    await self._try_start_dialog(
+                        account_id, username,
+                        gender=gender, from_crm=from_crm,
+                    )
 
                 # 3. Sleep.
                 cfg = await _select_one(account_id)
@@ -471,12 +520,28 @@ class WorkerAutoRunnerService:
                 data={"reason": "loop_crashed"},
             )
 
-    async def _try_start_dialog(self, account_id: int, username: str) -> None:
-        """Вызывает autochat.create_session. Любую ошибку превращает в SKIPPED."""
+    async def _try_start_dialog(
+        self,
+        account_id: int,
+        username: str,
+        *,
+        gender: str | None = None,
+        from_crm: bool = False,
+    ) -> None:
+        """
+        Вызывает autochat.create_session. Любую ошибку превращает в SKIPPED.
+
+        Для CRM-лидов (from_crm=True) дополнительно:
+        - передаёт gender и from_crm в autochat → history запишет на dialog;
+        - после успешного старта пушит "беру в работу" в партнёрскую CRM
+          (POST /api/l1/leads/:username/start).
+        """
         try:
             session = await self._autochat.create_session(
                 account_id=account_id,
                 username=username,
+                gender=gender,
+                from_crm=from_crm,
             )
             await bus.publish(
                 module=Module.WORKER_AUTO_RUNNER,
@@ -486,6 +551,8 @@ class WorkerAutoRunnerService:
                 data={
                     "username": username,
                     "session_id": session.get("id") if isinstance(session, dict) else None,
+                    "from_crm": from_crm,
+                    "gender": gender,
                 },
             )
         except Exception as e:
@@ -498,8 +565,16 @@ class WorkerAutoRunnerService:
                 type=EventType.AUTO_RUNNER_LEAD_SKIPPED,
                 status=Status.ERROR,
                 account_id=account_id,
-                data={"username": username, "error": str(e)[:300]},
+                data={
+                    "username": username,
+                    "error": str(e)[:300],
+                    "from_crm": from_crm,
+                },
             )
+
+        # `/leads/:u/start` больше НЕ зовём здесь — это делается на этапе
+        # рефилла пула (см. partner_crm.service._take_into_pool). К моменту
+        # когда воркер взял лида из пула, у партнёра он уже in_progress.
 
     async def _chunked_sleep(self, account_id: int, delay: float) -> None:
         """

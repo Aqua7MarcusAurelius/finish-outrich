@@ -6,6 +6,7 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { ErrorBox } from "@/components/common/ErrorBox";
 import { PromptPreviewDialog } from "@/components/dialogs/PromptPreviewDialog";
+import { LeadSettingsPanel } from "@/components/settings/LeadSettingsPanel";
 import { api, describeApiError } from "@/lib/api";
 import { useToast } from "@/lib/toast";
 import { useAccounts } from "@/hooks/useAccounts";
@@ -27,6 +28,7 @@ const PLACEHOLDERS: Placeholder[] = [
   { name: "partner_name",        description: "Имя собеседника (first + last)",          scope: "both" },
   { name: "partner_bio",         description: "Telegram-bio собеседника",                scope: "both" },
   { name: "partner_birthday",    description: "День рождения собеседника: \"DD.MM\" или \"DD.MM.YYYY\" (пусто если не указан)", scope: "both" },
+  { name: "partner_gender",      description: "Пол лида (для CRM-лидов): female / male / пусто",     scope: "both" },
   { name: "conversation_history",description: "Вся история переписки в формате блоков (см. docs/history_format_spec.md)", scope: "reply-only" },
   { name: "messages_count",      description: "Сколько сообщений в диалоге",             scope: "reply-only" },
   { name: "days_since_first",    description: "Сколько дней с первого сообщения",        scope: "reply-only" },
@@ -133,6 +135,9 @@ export function WorkerPromptPage() {
 
           {!loading && !loadError && (
             <div className="flex flex-col gap-6">
+              {/* Источник лидов (10.9) */}
+              {account && <LeadSettingsPanel account={account} />}
+
               {/* Справочник плейсхолдеров */}
               <PlaceholderReference copiedKey={copiedKey} onCopy={copyPlaceholder} />
 

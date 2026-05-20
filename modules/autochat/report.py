@@ -64,6 +64,80 @@ async def _load_session_context(session_id: int) -> dict[str, Any] | None:
     return dict(row)
 
 
+async def _load_report_context_by_dialog(dialog_id: int) -> dict[str, Any] | None:
+    """
+    Версия для триггера по dialog.status_changed (10.8).
+
+    Поднимает: dialog, account, последнюю autochat_session (если была),
+    последнюю lead_evaluations, текущий пузырь. Если автодиалога не
+    было — `session_id`/`started_at` берутся из dialog.created_at,
+    отчёт всё равно строится.
+    """
+    pool = db.get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                d.id                       AS dialog_id,
+                d.account_id               AS account_id,
+                d.telegram_user_id         AS telegram_user_id,
+                d.username                 AS partner_username,
+                d.first_name               AS partner_first_name,
+                d.last_name                AS partner_last_name,
+                d.from_crm                 AS from_crm,
+                d.gender                   AS partner_gender,
+                d.created_at               AS dialog_created_at,
+                a.name                     AS worker_name,
+                a.phone                    AS worker_phone,
+                ds.label                   AS pubble_label,
+                ds.partner_terminal_status AS pubble_terminal,
+                s.id                       AS session_id,
+                s.target_username          AS target_username,
+                s.created_at               AS session_started_at,
+                s.updated_at               AS session_finished_at,
+                e.verdict                  AS eval_verdict,
+                e.extracted_name           AS eval_name,
+                e.extracted_age            AS eval_age,
+                e.extracted_city           AS eval_city,
+                e.extracted_workplace      AS eval_workplace,
+                e.extracted_interests      AS eval_interests,
+                e.parse_succeeded          AS eval_parse_succeeded,
+                e.evaluator_model          AS eval_model,
+                e.evaluated_at             AS eval_at
+            FROM dialogs d
+            JOIN accounts a ON a.id = d.account_id
+            LEFT JOIN dialog_statuses ds ON ds.id = d.status_id
+            LEFT JOIN LATERAL (
+                SELECT id, target_username, created_at, updated_at
+                FROM autochat_sessions
+                WHERE account_id = d.account_id
+                  AND telegram_user_id = d.telegram_user_id
+                ORDER BY id DESC LIMIT 1
+            ) s ON TRUE
+            LEFT JOIN lead_evaluations e ON e.dialog_id = d.id
+            WHERE d.id = $1
+            """,
+            dialog_id,
+        )
+    if row is None:
+        return None
+
+    ctx = dict(row)
+    # Унификация с _load_session_context для переиспользования
+    # downstream-хелперов (_build_storage_key, build_html и т.д.).
+    if ctx.get("session_id") is None:
+        # Был только ручной чат без autochat — fake session_id отсутствует,
+        # пишем dialog_id для ключа.
+        ctx["session_id"] = f"dialog{dialog_id}"
+    ctx["started_at"] = (
+        ctx.get("session_started_at") or ctx.get("dialog_created_at")
+    )
+    ctx["finished_at"] = (
+        ctx.get("session_finished_at") or datetime.now(timezone.utc)
+    )
+    return ctx
+
+
 async def _load_messages(dialog_id: int) -> list[dict[str, Any]]:
     """
     Все сообщения диалога по дате. Для каждого тянем поля reply_* из
@@ -296,6 +370,41 @@ body {
     width: 6px; height: 6px;
     border-radius: 50%;
     background: #1f8b4c;
+}
+
+/* ─── Блок "Оценка лида" (10.8) ───────────────────────────────────── */
+.eval-block {
+    margin: 16px 24px 0 24px;
+    padding: 12px 16px;
+    background: #f7f9fc;
+    border: 1px solid #d6deea;
+    border-radius: 10px;
+    font-size: 13px;
+    color: #2a2f3a;
+}
+.eval-title {
+    font-weight: 600;
+    font-size: 12.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #4a5469;
+    margin-bottom: 6px;
+}
+.eval-row {
+    padding: 2px 0;
+    line-height: 1.5;
+}
+.eval-row b {
+    color: #1a2030;
+    margin-right: 4px;
+}
+.verdict-success {
+    color: #1f8b4c;
+    font-weight: 600;
+}
+.verdict-archive {
+    color: #c44a32;
+    font-weight: 600;
 }
 
 /* ─── Метаданные-чипы ────────────────────────────────────────────── */
@@ -580,6 +689,9 @@ def build_html(ctx: dict[str, Any], messages: list[dict[str, Any]]) -> str:
 
     body = _render_messages(messages, ctx)
     now_str = _format_dt(datetime.now(timezone.utc))
+    eval_html = _eval_block_html(ctx)
+    pubble = ctx.get("pubble_label")
+    finish_label = "завершён LLM" if not pubble else f"закрыт: {pubble}"
 
     return (
         '<!doctype html>\n'
@@ -603,7 +715,7 @@ def build_html(ctx: dict[str, Any], messages: list[dict[str, Any]]) -> str:
         f'          <div class="sub">{escape(worker_label)}'
         f'{(" · " + escape(worker_phone)) if worker_phone else ""} → {escape(partner)}</div>\n'
         '        </div>\n'
-        '        <div class="finish-badge">завершён LLM</div>\n'
+        f'        <div class="finish-badge">{escape(finish_label)}</div>\n'
         '      </div>\n'
         '      <div class="chips">\n'
         f'        <span class="chip"><b>Старт</b> {escape(_format_dt(started))}</span>\n'
@@ -613,6 +725,7 @@ def build_html(ctx: dict[str, Any], messages: list[dict[str, Any]]) -> str:
         f'        <span class="chip"><b>tg_id</b> {escape(str(tg_id))}</span>\n'
         '      </div>\n'
         '    </div>\n'
+        f'{eval_html}'
         '    <div class="chat">\n'
         f'{body}\n'
         '    </div>\n'
@@ -646,16 +759,35 @@ def _sanitize_for_key(value: str | None, *, fallback: str = "unknown", maxlen: i
     return cleaned[:maxlen]
 
 
+def _determine_folder(ctx: dict[str, Any]) -> str:
+    """
+    Куда положить отчёт в бакете MinIO:
+      - success/ — оценщик отработал, verdict='success'
+      - archive/ — парсинг ответа LLM сломан даже после ретрая
+                    (parse_succeeded=False)
+      - failed/  — всё остальное: оценщик archive, таймер закрыл,
+                    оператор вручную поставил Невалид/Завершен провал
+
+    Возвращает 'success' | 'failed' | 'archive' (без слэша).
+    Слэш добавляется в _build_storage_key.
+    """
+    verdict = ctx.get("eval_verdict")
+    parse_succeeded = ctx.get("eval_parse_succeeded")
+
+    if verdict == "success":
+        return "success"
+    if verdict == "archive" and parse_succeeded is False:
+        return "archive"
+    return "failed"
+
+
 def _build_storage_key(ctx: dict[str, Any]) -> str:
     """
-    Плоский ключ в корне бакета:
-        {worker}_@{partner_username}_dd-mm-yy_hh-mm.html
-    либо если у собеседника пустой username:
-        {worker}_id{telegram_user_id}_dd-mm-yy_hh-mm.html
+    Ключ в бакете с префиксом-папкой по итогу диалога:
+        {folder}/{worker}_@{partner_username}_dd-mm-yy_hh-mm.html
 
-    Время — finished_at в UTC. Папки больше не используются (раньше
-    были по YYYY/MM, но оператор предпочитает видеть всё списком в одном
-    бакете и иметь нужную инфу прямо в имени файла).
+    Если у собеседника пустой username — `id{telegram_user_id}` вместо
+    `@username`. Время — finished_at в UTC.
     """
     dt: datetime = ctx["finished_at"]
     dt_utc = dt.astimezone(timezone.utc)
@@ -667,26 +799,99 @@ def _build_storage_key(ctx: dict[str, Any]) -> str:
     else:
         partner_part = f"id{ctx['telegram_user_id']}"
 
+    folder = _determine_folder(ctx)
     timestamp = dt_utc.strftime("%d-%m-%y_%H-%M")
-    return f"{worker}_{partner_part}_{timestamp}.html"
+    return f"{folder}/{worker}_{partner_part}_{timestamp}.html"
+
+
+def _eval_block_html(ctx: dict[str, Any]) -> str:
+    """
+    HTML-блок "Оценка лида" — встраивается в заголовок отчёта если
+    оценщик отработал. Если evaluation нет (таймер / ручной финал /
+    отчёт построен до запуска оценщика) — возвращает пустую строку.
+    """
+    verdict = ctx.get("eval_verdict")
+    if verdict is None:
+        return ""
+
+    if verdict == "success":
+        verdict_label = "Успешно"
+        verdict_class = "verdict-success"
+    elif ctx.get("eval_parse_succeeded") is False:
+        verdict_label = "Провал (LLM-ответ не распарсился, ручной разбор)"
+        verdict_class = "verdict-archive"
+    else:
+        verdict_label = "Провал"
+        verdict_class = "verdict-archive"
+
+    rows: list[str] = [
+        f'      <div class="eval-row"><b>Вердикт:</b> '
+        f'<span class="{verdict_class}">{escape(verdict_label)}</span></div>'
+    ]
+    fields = [
+        ("Имя",          ctx.get("eval_name")),
+        ("Возраст",      ctx.get("eval_age")),
+        ("Город",        ctx.get("eval_city")),
+        ("Место работы", ctx.get("eval_workplace")),
+        ("Интересы",     ctx.get("eval_interests")),
+    ]
+    for label, value in fields:
+        if value is None or value == "":
+            continue
+        rows.append(
+            f'      <div class="eval-row"><b>{escape(label)}:</b> '
+            f'{escape(str(value))}</div>'
+        )
+    rows_html = "\n".join(rows)
+    return (
+        '    <div class="eval-block">\n'
+        '      <div class="eval-title">Оценка лида</div>\n'
+        f'{rows_html}\n'
+        '    </div>\n'
+    )
 
 
 async def save_report_for_session(session_id: int) -> str | None:
     """
-    Собрать HTML и положить в MinIO. Возвращает minio_key либо None
-    при ошибке. Ошибки логируются + публикуется autochat.report_failed,
-    но наружу не пробрасываются — это best-effort.
+    Старая точка входа — оставлена для backward compat (есть эндпоинт
+    POST /autochat/sessions/{id}/build-report). Сейчас просто резолвит
+    session_id → dialog_id и зовёт save_report_for_dialog.
+    """
+    pool = db.get_pool()
+    async with pool.acquire() as conn:
+        dialog_id = await conn.fetchval(
+            "SELECT dialog_id FROM autochat_sessions WHERE id = $1",
+            session_id,
+        )
+    if dialog_id is None:
+        log.warning(
+            "autochat report: session %s has no dialog_id (yet), skip",
+            session_id,
+        )
+        return None
+    return await save_report_for_dialog(int(dialog_id))
+
+
+async def save_report_for_dialog(dialog_id: int) -> str | None:
+    """
+    Собрать HTML и положить в MinIO. Используется как из таска-консьюмера
+    `dialog.status_changed` (10.8), так и из ручного API.
+
+    Папка в бакете определяется по lead_evaluations:
+      - verdict=success                   → success/
+      - parse_succeeded=False              → archive/
+      - всё остальное (archive, таймер, ручной финал) → failed/
+
+    Возвращает minio_key либо None при ошибке. Best-effort:
+    публикуется autochat.report_failed, но наружу не пробрасывается.
     """
     try:
-        ctx = await _load_session_context(session_id)
+        ctx = await _load_report_context_by_dialog(dialog_id)
         if ctx is None:
-            log.warning("autochat report: session %s not found", session_id)
+            log.warning("autochat report: dialog %s not found", dialog_id)
             return None
-        dialog_id = ctx.get("dialog_id")
-        messages: list[dict[str, Any]] = []
-        if dialog_id is not None:
-            messages = await _load_messages(int(dialog_id))
 
+        messages = await _load_messages(dialog_id)
         html = build_html(ctx, messages)
         storage_key = _build_storage_key(ctx)
         data = html.encode("utf-8")
@@ -698,19 +903,24 @@ async def save_report_for_session(session_id: int) -> str | None:
             bucket=settings.MINIO_REPORTS_BUCKET,
         )
 
-        pool = db.get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO autochat_reports (session_id, minio_key, messages_count)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (session_id) DO UPDATE
-                    SET minio_key = EXCLUDED.minio_key,
-                        messages_count = EXCLUDED.messages_count,
-                        created_at = NOW()
-                """,
-                session_id, storage_key, len(messages),
-            )
+        # Привязка отчёта к autochat_sessions осталась для backward compat
+        # (UI кнопка "перестроить отчёт" на странице сессии). Только если
+        # autochat-сессия реально существует.
+        raw_session_id = ctx.get("session_id")
+        if isinstance(raw_session_id, int):
+            pool = db.get_pool()
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO autochat_reports (session_id, minio_key, messages_count)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (session_id) DO UPDATE
+                        SET minio_key = EXCLUDED.minio_key,
+                            messages_count = EXCLUDED.messages_count,
+                            created_at = NOW()
+                    """,
+                    raw_session_id, storage_key, len(messages),
+                )
 
         await bus.publish(
             module=Module.AUTOCHAT,
@@ -718,32 +928,36 @@ async def save_report_for_session(session_id: int) -> str | None:
             status=Status.SUCCESS,
             account_id=int(ctx["account_id"]),
             data={
-                "session_id": session_id,
+                "dialog_id": dialog_id,
+                "session_id": raw_session_id if isinstance(raw_session_id, int) else None,
                 "minio_key": storage_key,
                 "messages_count": len(messages),
+                "folder": _determine_folder(ctx),
             },
         )
         log.info(
-            "autochat report saved: session=%s key=%s msgs=%d",
-            session_id, storage_key, len(messages),
+            "autochat report saved: dialog=%s key=%s msgs=%d",
+            dialog_id, storage_key, len(messages),
         )
         return storage_key
 
     except Exception as e:
-        log.exception("autochat report: build/save failed for session %s", session_id)
+        log.exception(
+            "autochat report: build/save failed for dialog %s", dialog_id,
+        )
         try:
             await bus.publish(
                 module=Module.AUTOCHAT,
                 type=EventType.AUTOCHAT_REPORT_FAILED,
                 status=Status.ERROR,
                 data={
-                    "session_id": session_id,
+                    "dialog_id": dialog_id,
                     "error": str(e)[:500],
                 },
             )
         except Exception:
             log.exception(
-                "autochat report: failed to publish report_failed for session %s",
-                session_id,
+                "autochat report: failed to publish report_failed for dialog %s",
+                dialog_id,
             )
         return None

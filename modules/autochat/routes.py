@@ -151,3 +151,22 @@ async def autochat_dialog_disable(dialog_id: int, request: Request):
         return {"session": session}
     except AutoChatError as e:
         return _err(e)
+
+
+@dialog_autochat_router.post("/dialogs/{dialog_id}/autochat/regenerate")
+async def autochat_dialog_regenerate(dialog_id: int, request: Request):
+    """
+    Принудительно сгенерить ответ сейчас. Минует reply_timer и проверку
+    in_chat. Используется UI-кнопкой "оживить диалог" — когда после
+    рестарта таймер пропал и диалог залип, или просто оператор хочет
+    ответ сейчас.
+
+    Требует активной autochat-сессии на этом диалоге. Если нет —
+    включи автодиалог сначала через POST /dialogs/{id}/autochat.
+    """
+    service = _service(request)
+    try:
+        result = await service.force_reply_for_dialog(dialog_id)
+        return result
+    except AutoChatError as e:
+        return _err(e)

@@ -34,6 +34,7 @@ from .errors import (
     CannotWrite,
     DialogNotFound,
     GenerationFailed,
+    NoActiveSession,
     PromptNotConfigured,
     SessionAlreadyActive,
     SessionExpired as AutoSessionExpired,
@@ -292,6 +293,8 @@ class AutoChatService:
         *,
         account_id: int,
         username: str,
+        gender: str | None = None,
+        from_crm: bool = False,
     ) -> dict[str, Any]:
         """
         Синхронный флоу:
@@ -424,23 +427,32 @@ class AutoChatService:
 
         # Публикуем message.received (история запишет; history создаст dialog)
         if tg_msg_id is not None:
+            message_data: dict[str, Any] = {
+                "telegram_message_id": tg_msg_id,
+                "telegram_user_id": telegram_user_id,
+                "is_outgoing": True,
+                "date": sent.get("date") or bus.now_utc(),
+                "text": initial_text,
+                "reply_to_telegram_message_id": None,
+                "forward_from": None,
+                "media_group_id": None,
+                "peer_profile": profile,
+                "media": [],
+            }
+            # Метаданные из партнёрской CRM — history запишет в
+            # dialogs.gender / dialogs.from_crm при первом INSERT диалога.
+            # Передаём только если есть что-то осмысленное.
+            if from_crm or gender:
+                message_data["partner_crm_meta"] = {
+                    "from_crm": bool(from_crm),
+                    "gender": gender,
+                }
             await bus.publish(
                 module=Module.WRAPPER,
                 type=EventType.MESSAGE_RECEIVED,
                 status=Status.SUCCESS,
                 account_id=account_id,
-                data={
-                    "telegram_message_id": tg_msg_id,
-                    "telegram_user_id": telegram_user_id,
-                    "is_outgoing": True,
-                    "date": sent.get("date") or bus.now_utc(),
-                    "text": initial_text,
-                    "reply_to_telegram_message_id": None,
-                    "forward_from": None,
-                    "media_group_id": None,
-                    "peer_profile": profile,
-                    "media": [],
-                },
+                data=message_data,
             )
 
         # initial_sent event
@@ -701,31 +713,46 @@ class AutoChatService:
             raise SessionNotFound()
         return await self.stop_session(existing["id"])
 
+    async def force_reply_for_dialog(self, dialog_id: int) -> dict[str, Any]:
+        """
+        Найти активную сессию для диалога и заставить её сгенерить ответ
+        сейчас (минуя reply_timer и проверку in_chat). Под UI-кнопку
+        "оживить диалог" / "сгенерить принудительно".
+
+        Кидает:
+          - DialogNotFound — нет такого dialog_id в БД
+          - NoActiveSession — сессии нет в памяти (после рестарта могло
+            не подняться, либо сессия была остановлена/закрыта)
+          - AutoSessionExpired — если протухла TG-сессия в процессе
+        """
+        pool = db.get_pool()
+        async with pool.acquire() as conn:
+            dlg = await conn.fetchrow(
+                "SELECT account_id FROM dialogs WHERE id = $1", dialog_id,
+            )
+        if dlg is None:
+            raise DialogNotFound()
+        account_id = int(dlg["account_id"])
+
+        async with self._lock:
+            sid = self._by_dialog.get((account_id, dialog_id))
+            session = self._sessions_by_id.get(sid) if sid is not None else None
+
+        if session is None:
+            raise NoActiveSession()
+        return await session.force_generate_reply()
+
     async def _on_session_finished_by_llm(self, session_id: int) -> None:
         """
         Callback от AutoChatSession когда LLM поставила <finishdialog/>
         и последний сегмент уже отправлен.
 
-        Перед стопом — best-effort сохраняем HTML-отчёт в MinIO (бакет
-        MINIO_REPORTS_BUCKET) + строку в autochat_reports. Ошибка
-        сохранения отчёта не должна блокировать стоп сессии — поэтому
-        save_report_for_session всё ловит сам.
-
-        Затем — стандартный flow stop_session (чистит индексы, ставит
-        status='stopped', публикует autochat.session_stopped).
+        В 10.8 ответственность за HTML-отчёт перенесена на
+        `ReportConsumer` — он строит файл когда на диалоге появляется
+        терминальный пузырь (от оценщика / таймера / оператора).
+        Здесь больше не зовём `save_report_for_session`: оценщик
+        запустится по autochat.finished_by_llm и проставит пузырь.
         """
-        try:
-            # Импорт внутри — модуль report.py использует core.bus/db/minio,
-            # чтобы не тянуть тяжёлые зависимости на верхний уровень
-            # service.py (импорты симметричны с прочими отложенными
-            # импортами в этом модуле).
-            from .report import save_report_for_session
-            await save_report_for_session(session_id)
-        except Exception:
-            log.exception(
-                "autochat: report save failed for session %s (non-fatal)", session_id,
-            )
-
         try:
             await self.stop_session(session_id)
         except Exception:

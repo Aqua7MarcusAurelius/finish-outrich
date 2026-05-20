@@ -25,6 +25,8 @@ class Module:
     DIALOG_STATUSES = "dialog_statuses"
     WORKER_AUTO_RUNNER = "worker_auto_runner"
     PEER_PROFILE = "peer_profile"
+    PARTNER_CRM = "partner_crm"
+    LEAD_EVALUATOR = "lead_evaluator"
 
 
 class Status:
@@ -119,6 +121,29 @@ class EventType:
 
     # Тайпинг собеседника — публикует враппер, слушает AutoChat
     DIALOG_TYPING_OBSERVED = "dialog.typing_observed"
+
+    # ── Партнёрский CRM (этап 10) ────────────────────────────────────
+    # Сторож пула докачал лидов из CRM.
+    PARTNER_CRM_POOL_REFILLED = "partner_crm.pool_refilled"
+    # Не смогли дозалить пул — сетевая ошибка / 4xx от CRM.
+    PARTNER_CRM_REFILL_FAILED = "partner_crm.refill_failed"
+    # Воркер забрал лид из общего пула и идёт стартовать autochat.
+    PARTNER_CRM_LEAD_TAKEN = "partner_crm.lead_taken"
+    # Финал отправлен в CRM (POST /leads/:u/status).
+    PARTNER_CRM_STATUS_PUSHED = "partner_crm.status_pushed"
+    PARTNER_CRM_STATUS_PUSH_FAILED = "partner_crm.status_push_failed"
+    # Лид "поставлен в работу" (POST /leads/:u/start) — autochat начал.
+    PARTNER_CRM_LEAD_STARTED = "partner_crm.lead_started"
+    PARTNER_CRM_LEAD_START_FAILED = "partner_crm.lead_start_failed"
+
+    # ── Lead Evaluator (этап 10) ─────────────────────────────────────
+    # Оценщик начал смотреть диалог.
+    LEAD_EVALUATOR_STARTED = "lead_evaluator.started"
+    # Оценщик выдал вердикт (success | archive) + извлечённые поля.
+    LEAD_EVALUATOR_COMPLETED = "lead_evaluator.completed"
+    # LLM не дал распарсить ответ даже после ретрая. Считаем archive,
+    # отчёт уйдёт в папку archive/ для ручного разбора.
+    LEAD_EVALUATOR_PARSE_FAILED = "lead_evaluator.parse_failed"
 
     # ── Системные ────────────────────────────────────────────────────
     SYSTEM_ERROR = "system.error"

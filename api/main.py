@@ -27,6 +27,7 @@ from core import redis as redis_mod
 from core.config import settings
 from modules.auth.routes import router as auth_router
 from modules.auth.service import AuthService
+from modules.autochat.report_consumer import ReportConsumer
 from modules.autochat.routes import (
     dialog_autochat_router,
     router as autochat_router,
@@ -37,6 +38,13 @@ from modules.history.cleaner import Cleaner
 from modules.history.routes import router as history_router
 from modules.history.service import HistoryService
 from modules.media_description.service import DescriptionService
+from modules.lead_evaluator.routes import router as lead_evaluator_router
+from modules.lead_evaluator.service import LeadEvaluatorService
+from modules.lead_evaluator.silence_watcher import SilenceWatcher
+from modules.partner_crm.finalizer import PartnerCrmFinalizer
+from modules.partner_crm.poller import PartnerCrmPoller
+from modules.partner_crm.routes import router as partner_crm_router
+from modules.partner_crm.service import PartnerCrmService
 from modules.peer_profile.service import PeerProfileService
 from modules.transcription.service import TranscriptionService
 from modules.worker_auto_runner.routes import router as auto_runner_router
@@ -104,6 +112,50 @@ async def lifespan(app: FastAPI):
     peer_profile_task = asyncio.create_task(peer_profile_service.run())
     app.state.peer_profile_task = peer_profile_task
 
+    # LeadEvaluator: LLM-судья закрытых диалогов + извлечение полей.
+    # Consumer слушает autochat.finished_by_llm. Не зависит от других
+    # сервисов кроме openrouter и dialog_statuses (через прямой импорт).
+    lead_evaluator_service = LeadEvaluatorService()
+    app.state.lead_evaluator_service = lead_evaluator_service
+    lead_evaluator_task = asyncio.create_task(lead_evaluator_service.run())
+    app.state.lead_evaluator_task = lead_evaluator_task
+
+    # ReportConsumer: слушает dialog.status_changed, при терминальном
+    # пузыре собирает HTML-отчёт и кладёт в MinIO в одну из трёх папок
+    # (success/failed/archive). Заменил старый трюк "сразу после
+    # <finishdialog/>" — теперь дожидаемся вердикта оценщика.
+    report_consumer = ReportConsumer()
+    app.state.report_consumer = report_consumer
+    report_consumer_task = asyncio.create_task(report_consumer.run())
+    app.state.report_consumer_task = report_consumer_task
+
+    # SilenceWatcher: фоновый процесс переходов "Общение→Обрыв" по 4ч
+    # тишины и "Первый контакт/Обрыв → Завершен провал" по 48ч.
+    # Не зависит от lead_evaluator кроме общего settings/dialog_statuses.
+    silence_watcher = SilenceWatcher()
+    app.state.silence_watcher = silence_watcher
+    silence_watcher_task = asyncio.create_task(silence_watcher.run())
+    app.state.silence_watcher_task = silence_watcher_task
+
+    # PartnerCrm: HTTP-клиент партнёрской CRM + локальный пул лидов.
+    # Сервис держит httpx-клиент (keep-alive), poller докачивает пул из
+    # CRM раз в `partner_crm.poll_interval_sec` если есть активные
+    # CRM-воркеры и пул просел ниже `partner_crm.pool_low_threshold`.
+    partner_crm_service = PartnerCrmService()
+    app.state.partner_crm_service = partner_crm_service
+    partner_crm_poller = PartnerCrmPoller(partner_crm_service)
+    app.state.partner_crm_poller = partner_crm_poller
+    partner_crm_poller_task = asyncio.create_task(partner_crm_poller.run())
+    app.state.partner_crm_poller_task = partner_crm_poller_task
+
+    # Финалайзер: слушает dialog.status_changed, при терминальном пузыре
+    # и from_crm=TRUE пушит финальный статус в CRM. Реактивный, не
+    # имеет состояния — может быть остановлен в любой момент.
+    partner_crm_finalizer = PartnerCrmFinalizer(partner_crm_service)
+    app.state.partner_crm_finalizer = partner_crm_finalizer
+    partner_crm_finalizer_task = asyncio.create_task(partner_crm_finalizer.run())
+    app.state.partner_crm_finalizer_task = partner_crm_finalizer_task
+
     # WorkerAutoRunner: per-account автомат старта диалогов из очереди.
     # Создаётся ПОСЛЕ AutoChat, потому что зовёт его create_session.
     # При старте сбрасывает is_running у всех — после рестарта не
@@ -111,6 +163,7 @@ async def lifespan(app: FastAPI):
     auto_runner_service = WorkerAutoRunnerService(
         get_wrapper=app.state.worker_manager.get_wrapper,
         autochat_service=autochat_service,
+        partner_crm_service=partner_crm_service,
     )
     app.state.auto_runner_service = auto_runner_service
     await auto_runner_service.reset_on_boot()
@@ -159,6 +212,66 @@ async def lifespan(app: FastAPI):
             await peer_profile_task
         except asyncio.CancelledError:
             pass
+
+        try:
+            await silence_watcher.stop()
+        except Exception:
+            log.exception("silence_watcher stop error")
+
+        silence_watcher_task.cancel()
+        try:
+            await silence_watcher_task
+        except asyncio.CancelledError:
+            pass
+
+        try:
+            await report_consumer.stop()
+        except Exception:
+            log.exception("report_consumer stop error")
+
+        report_consumer_task.cancel()
+        try:
+            await report_consumer_task
+        except asyncio.CancelledError:
+            pass
+
+        try:
+            await lead_evaluator_service.stop()
+        except Exception:
+            log.exception("lead_evaluator_service stop error")
+
+        lead_evaluator_task.cancel()
+        try:
+            await lead_evaluator_task
+        except asyncio.CancelledError:
+            pass
+
+        try:
+            await partner_crm_finalizer.stop()
+        except Exception:
+            log.exception("partner_crm_finalizer stop error")
+
+        partner_crm_finalizer_task.cancel()
+        try:
+            await partner_crm_finalizer_task
+        except asyncio.CancelledError:
+            pass
+
+        try:
+            await partner_crm_poller.stop()
+        except Exception:
+            log.exception("partner_crm_poller stop error")
+
+        partner_crm_poller_task.cancel()
+        try:
+            await partner_crm_poller_task
+        except asyncio.CancelledError:
+            pass
+
+        try:
+            await partner_crm_service.shutdown()
+        except Exception:
+            log.exception("partner_crm_service shutdown error")
 
         try:
             await app.state.worker_manager.shutdown()
@@ -252,3 +365,5 @@ app.include_router(autochat_router)
 app.include_router(dialog_autochat_router)
 app.include_router(dialog_statuses_router)
 app.include_router(auto_runner_router)
+app.include_router(partner_crm_router)
+app.include_router(lead_evaluator_router)

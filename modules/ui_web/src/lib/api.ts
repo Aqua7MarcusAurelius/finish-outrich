@@ -83,6 +83,9 @@ type BackendDialog = {
   phone: string | null;
   is_bot: boolean;
   is_contact: boolean;
+  // 10.10: CRM-метаданные
+  from_crm?: boolean;
+  gender?: "female" | "male" | null;
   status: { id: number; label: string; color: string } | null;
   last_message: { date: string; text: string | null; is_outgoing: boolean } | null;
 };
@@ -98,6 +101,8 @@ function adaptDialog(d: BackendDialog): DialogSummary {
     phone: d.phone,
     is_bot: d.is_bot,
     is_contact: d.is_contact,
+    from_crm: d.from_crm === true,
+    gender: d.gender ?? null,
     status: d.status,
     last_message: d.last_message
       ? {
@@ -267,6 +272,15 @@ export const api = {
       { method: "DELETE" },
     ),
 
+  // Принудительная регенерация ответа — пропускает reply_timer и
+  // in_chat, дёргает обычный _generate_and_enqueue. Под UI-кнопку
+  // "оживить диалог". Требует активной autochat-сессии на диалоге.
+  regenerateDialogAutochat: (dialogId: number) =>
+    request<{ session_id: number; dialog_id: number | null; queued: boolean }>(
+      `/dialogs/${dialogId}/autochat/regenerate`,
+      { method: "POST" },
+    ),
+
   listMessages: async (dialogId: number, cursor?: string, limit = 50): Promise<Paginated<Message>> => {
     const raw = await request<{ messages: BackendMessage[]; next_cursor: string | null }>(
       `/dialogs/${dialogId}/messages${qs({ cursor, limit })}`,
@@ -415,6 +429,58 @@ export const api = {
     request<{ session: { id: number; status: string; dialog_id: number | null; [k: string]: unknown } }>(
       "/autochat/start",
       { method: "POST", body: JSON.stringify(body) },
+    ),
+
+  // ── system settings (10.11: ключи partner_crm.*, lead_evaluator.*) ─
+  listSettings: (prefix?: string) =>
+    request<{ items: Array<{ key: string; value: string; description: string | null; updated_at: string | null }> }>(
+      `/system/settings${qs({ prefix })}`,
+    ),
+  patchSettings: (updates: Record<string, string>) =>
+    request<{ updated: number }>(
+      "/system/settings",
+      { method: "PATCH", body: JSON.stringify({ updates }) },
+    ),
+
+  // ── lead-settings (10.9: lead_source + target_gender) ──────────────
+  patchLeadSettings: (
+    accountId: number,
+    body: { lead_source?: "manual" | "partner_crm"; target_gender?: "any" | "female" | "male" },
+  ) =>
+    request<{ id: number; lead_source: string; target_gender: string }>(
+      `/accounts/${accountId}/lead-settings`,
+      { method: "PATCH", body: JSON.stringify(body) },
+    ),
+
+  // ── partner_crm (10.9: статус подключения + операции с пулом) ──────
+  partnerCrmHealth: () =>
+    request<{ configured: boolean; pool_size: number }>("/partner-crm/health"),
+  partnerCrmPool: () =>
+    request<{ items: Array<{ id: number; username: string; gender: string | null; fetched_at: string }>; count: number }>(
+      "/partner-crm/pool",
+    ),
+  partnerCrmRefill: (count: number) =>
+    request<{ requested: number; fetched: number; inserted: number; skipped_duplicates: number }>(
+      "/partner-crm/pool/refill",
+      { method: "POST", body: JSON.stringify({ count }) },
+    ),
+
+  // ── lead_evaluator (10.10/10.11) ────────────────────────────────────
+  getEvaluation: (dialogId: number) =>
+    request<{ evaluation: import("@/types/api").LeadEvaluation | null }>(
+      `/lead-evaluator/dialogs/${dialogId}/evaluation`,
+    ),
+  evaluateDialog: (dialogId: number) =>
+    request<import("@/types/api").LeadEvaluation>(
+      `/lead-evaluator/dialogs/${dialogId}/evaluate`,
+      { method: "POST" },
+    ),
+  getEvaluatorPrompt: () =>
+    request<{ path: string; content: string }>("/lead-evaluator/prompt"),
+  saveEvaluatorPrompt: (content: string) =>
+    request<{ path: string; bytes_written: number }>(
+      "/lead-evaluator/prompt",
+      { method: "PUT", body: JSON.stringify({ content }) },
     ),
 
   // ── events ──────────────────────────────────────────────────────────

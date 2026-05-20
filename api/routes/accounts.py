@@ -74,10 +74,20 @@ async def list_accounts(request: Request) -> list[dict[str, Any]]:
                 ids,
             )
         }
+        # Lead-настройки (10.9): источник и фильтр пола.
+        lead_settings = {
+            r["id"]: (r["lead_source"], r["target_gender"])
+            for r in await conn.fetch(
+                "SELECT id, lead_source, target_gender FROM accounts "
+                "WHERE id = ANY($1::int[])",
+                ids,
+            )
+        }
 
     out: list[dict[str, Any]] = []
     for w in workers:
         acc_id = w["account_id"]
+        ls = lead_settings.get(acc_id, ("manual", "any"))
         out.append({
             "id": acc_id,
             "name": w["name"],
@@ -86,8 +96,63 @@ async def list_accounts(request: Request) -> list[dict[str, Any]]:
             "is_active": w["is_active"],
             "dialogs_count": dialog_counts.get(acc_id, 0),
             "last_event_at": _iso(last_event_times.get(acc_id)),
+            "lead_source": ls[0],
+            "target_gender": ls[1],
         })
     return out
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Lead-settings: источник лидов и фильтр пола (10.9)
+# ─────────────────────────────────────────────────────────────────────
+
+class LeadSettingsPatch(BaseModel):
+    lead_source: str | None = Field(default=None, pattern=r"^(manual|partner_crm)$")
+    target_gender: str | None = Field(default=None, pattern=r"^(any|female|male)$")
+
+
+@router.patch("/accounts/{account_id}/lead-settings")
+async def patch_lead_settings(account_id: int, payload: LeadSettingsPatch):
+    """
+    Менять lead_source / target_gender аккаунта.
+
+    - lead_source: 'manual' (свой queue) | 'partner_crm' (общий пул)
+    - target_gender: 'any' | 'female' | 'male' (фильтр при подборе из пула)
+
+    Хотя бы одно поле должно быть передано.
+    """
+    if payload.lead_source is None and payload.target_gender is None:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {
+                "code": "EMPTY_PATCH",
+                "message": "Передайте хотя бы одно поле для обновления",
+            }},
+        )
+
+    pool = db.get_pool()
+    async with pool.acquire() as conn:
+        exists = await conn.fetchval(
+            "SELECT 1 FROM accounts WHERE id = $1", account_id,
+        )
+        if not exists:
+            return _account_not_found()
+
+        sets: list[str] = ["updated_at = NOW()"]
+        params: list[Any] = [account_id]
+        if payload.lead_source is not None:
+            params.append(payload.lead_source)
+            sets.append(f"lead_source = ${len(params)}")
+        if payload.target_gender is not None:
+            params.append(payload.target_gender)
+            sets.append(f"target_gender = ${len(params)}")
+
+        row = await conn.fetchrow(
+            f"UPDATE accounts SET {', '.join(sets)} "
+            f"WHERE id = $1 RETURNING id, lead_source, target_gender",
+            *params,
+        )
+    return dict(row)
 
 
 # ─────────────────────────────────────────────────────────────────────

@@ -31,6 +31,9 @@ export type WorkerStatus =
 export type MediaType = "photo" | "video" | "voice" | "video_note" | "document" | "audio" | "sticker" | "animation";
 export type AsyncJobStatus = "none" | "pending" | "done" | "failed";
 
+export type LeadSource = "manual" | "partner_crm";
+export type TargetGender = "any" | "female" | "male";
+
 export interface Account {
   id: number;
   name: string;
@@ -39,6 +42,37 @@ export interface Account {
   is_active: boolean;
   dialogs_count: number;
   last_event_at: string | null;
+  // 10.9: настройки источника лидов
+  lead_source: LeadSource;
+  target_gender: TargetGender;
+}
+
+// Информация о состоянии партнёрского CRM-модуля (для бэйджа).
+export interface PartnerCrmHealth {
+  configured: boolean;
+  pool_size: number;
+}
+
+export interface PartnerCrmPoolItem {
+  id: number;
+  username: string;
+  gender: "female" | "male" | null;
+  fetched_at: string;
+}
+
+export interface LeadEvaluation {
+  id: number;
+  dialog_id: number;
+  verdict: "success" | "archive";
+  extracted_name: string | null;
+  extracted_age: number | null;
+  extracted_city: string | null;
+  extracted_workplace: string | null;
+  extracted_interests: string | null;
+  evaluator_model: string | null;
+  parse_succeeded: boolean;
+  evaluated_at: string;
+  updated_at: string;
 }
 
 // Per-worker AutoChat промт-конфиг (account_prompts).
@@ -70,6 +104,9 @@ export interface DialogSummary {
   phone: string | null;
   is_bot: boolean;
   is_contact: boolean;
+  // 10.10: CRM-метки на диалоге.
+  from_crm: boolean;
+  gender: "female" | "male" | null;
   status: DialogStatusRef | null;
   last_message: { text: string | null; date: string; type: string } | null;
 }

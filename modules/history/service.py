@@ -176,12 +176,18 @@ class HistoryService:
 
         reply_to_tg = data.get("reply_to_telegram_message_id")
 
+        # Метаданные партнёрской CRM (если воркер забрал лида из crm_lead_pool).
+        # Пишутся только при ПЕРВОМ создании dialog'а — _upsert_dialog
+        # передаёт их в INSERT и не трогает на UPDATE.
+        partner_crm_meta = data.get("partner_crm_meta")
+
         pool = db.get_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
                 # 1. Upsert dialog
                 dialog_id, dialog_was_inserted = await self._upsert_dialog(
                     conn, account_id, telegram_user_id, peer_profile,
+                    partner_crm_meta=partner_crm_meta,
                 )
 
                 # 2. Резолв reply → внутренний message.id (если ссылка на уже записанное)
@@ -301,11 +307,19 @@ class HistoryService:
         account_id: int,
         telegram_user_id: int,
         profile: dict | None,
+        *,
+        partner_crm_meta: dict | None = None,
     ) -> tuple[int, bool]:
         """
         Upsert диалога. Если peer_profile есть — обновляем поля профиля через
         COALESCE (не перетираем существующие данные NULL-ом), флаги is_bot/is_contact
         обновляем жёстко. Если peer_profile нет — просто освежаем updated_at.
+
+        partner_crm_meta (необязательный):
+          {gender: 'female'|'male'|None, from_crm: bool}
+        Используется при ПЕРВОМ INSERT диалога если воркер взял лида из
+        партнёрского CRM пула. На UPDATE поля не трогаются (CRM-флаг для
+        существующего диалога не задним числом не выставляем).
 
         Возвращает (dialog_id, was_inserted). `was_inserted` — True только когда
         строка реально INSERT'нулась (а не UPDATE по ON CONFLICT). Признак —
@@ -314,13 +328,21 @@ class HistoryService:
         чтобы один раз опубликовать `dialog.created` (запрос на дотяжку
         расширенного профиля).
         """
+        meta_gender: str | None = None
+        meta_from_crm: bool = False
+        if partner_crm_meta:
+            g = partner_crm_meta.get("gender")
+            if g in ("female", "male"):
+                meta_gender = g
+            meta_from_crm = bool(partner_crm_meta.get("from_crm", False))
+
         if profile is not None:
             row = await conn.fetchrow(
                 """
                 INSERT INTO dialogs (
                     account_id, telegram_user_id, username, first_name, last_name,
-                    phone, is_bot, is_contact, updated_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+                    phone, is_bot, is_contact, gender, from_crm, updated_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
                 ON CONFLICT (account_id, telegram_user_id) DO UPDATE SET
                     username    = COALESCE(EXCLUDED.username,    dialogs.username),
                     first_name  = COALESCE(EXCLUDED.first_name,  dialogs.first_name),
@@ -338,17 +360,20 @@ class HistoryService:
                 profile.get("phone"),
                 bool(profile.get("is_bot", False)),
                 bool(profile.get("is_contact", False)),
+                meta_gender,
+                meta_from_crm,
             )
         else:
             row = await conn.fetchrow(
                 """
-                INSERT INTO dialogs (account_id, telegram_user_id, updated_at)
-                VALUES ($1, $2, NOW())
+                INSERT INTO dialogs (
+                    account_id, telegram_user_id, gender, from_crm, updated_at
+                ) VALUES ($1, $2, $3, $4, NOW())
                 ON CONFLICT (account_id, telegram_user_id) DO UPDATE SET
                     updated_at = NOW()
                 RETURNING id, (xmax = 0) AS was_inserted
                 """,
-                account_id, telegram_user_id,
+                account_id, telegram_user_id, meta_gender, meta_from_crm,
             )
         return row["id"], bool(row["was_inserted"])
 

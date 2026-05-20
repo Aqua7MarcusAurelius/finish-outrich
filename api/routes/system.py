@@ -128,6 +128,75 @@ async def proxy_check(payload: ProxyCheckIn):
     return {"results": results}
 
 
+# ── Settings: чтение/запись таблицы `settings` ────────────────────
+# Используется UI на странице /settings (10.11) — редактируются
+# ключи partner_crm.* и lead_evaluator.*. Кладём в system, потому что
+# нет отдельного "settings"-модуля: таблица читается из многих мест,
+# а пишется только через эту ручку (UI).
+
+
+@router.get("/settings")
+async def list_settings(prefix: str | None = None):
+    """
+    Список настроек. Если задан `prefix` — фильтр (`prefix='partner_crm.'`).
+    """
+    pool = db.get_pool()
+    async with pool.acquire() as conn:
+        if prefix:
+            rows = await conn.fetch(
+                "SELECT key, value, description, updated_at FROM settings "
+                "WHERE key LIKE $1 ORDER BY key",
+                f"{prefix}%",
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT key, value, description, updated_at FROM settings "
+                "ORDER BY key",
+            )
+    return {
+        "items": [
+            {
+                "key": r["key"],
+                "value": r["value"],
+                "description": r["description"],
+                "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+            }
+            for r in rows
+        ]
+    }
+
+
+class SettingsPatch(BaseModel):
+    # `updates` — мап key→value (всё текстом, как и в БД).
+    updates: dict[str, str] = Field(default_factory=dict)
+
+
+@router.patch("/settings")
+async def patch_settings(payload: SettingsPatch):
+    """
+    Обновить несколько ключей одной транзакцией. Несуществующие ключи
+    игнорируются (только UPDATE, никакого INSERT — гарантия что
+    оператор не насоздаёт мусора).
+    """
+    if not payload.updates:
+        return {"updated": 0}
+
+    updated = 0
+    pool = db.get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            for key, value in payload.updates.items():
+                result = await conn.execute(
+                    "UPDATE settings SET value = $2, updated_at = NOW() "
+                    "WHERE key = $1",
+                    key, str(value),
+                )
+                # asyncpg execute returns 'UPDATE N'
+                if result.startswith("UPDATE ") and result != "UPDATE 0":
+                    updated += 1
+    return {"updated": updated}
+
+
 # ── Debug: эмит события руками (только в development) ────────────
 
 class EmitEventIn(BaseModel):
