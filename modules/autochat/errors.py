@@ -48,9 +48,41 @@ class UsernameUnavailableError(AutoChatError):
 
 
 class CannotWrite(AutoChatError):
+    """
+    Лид физически недоступен для написания: privacy, заблокировал,
+    Premium-only, и т.п. Категория «лид невалиден» для CRM-флоу.
+    НЕ используется для транзиентных проблем (см. FloodWait /
+    SendFailedTransient ниже).
+    """
     code = "CANNOT_WRITE"
-    message = "Не удалось отправить сообщение (privacy/blocked/прочее)"
+    message = "Лид недоступен для написания (privacy / блок / Premium-only)"
     status_code = 409
+
+
+class FloodWait(AutoChatError):
+    """
+    Telegram дросселит наши исходящие. Транзиент со стороны нашего
+    воркера — НЕ ошибка лида. CRM-флоу должен реинзертить лида в пул
+    и останавливать воркер.
+    """
+    code = "FLOOD_WAIT"
+    message = "TG ограничил исходящие сообщения — нужно подождать"
+    status_code = 429
+
+    def __init__(self, *, seconds: int | None = None, message: str | None = None):
+        self.seconds = seconds
+        super().__init__(message)
+
+
+class SendFailedTransient(AutoChatError):
+    """
+    Прочая транзиентная сетевая / RPC ошибка при `send_message`.
+    Безопасный дефолт для «всего непонятного» — лучше пустить лида
+    через транзиент, чем ошибочно закрыть как invalid у партнёра.
+    """
+    code = "SEND_FAILED_TRANSIENT"
+    message = "Не удалось отправить (сеть/RPC) — попробуем позже"
+    status_code = 502
 
 
 class GenerationFailed(AutoChatError):

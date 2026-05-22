@@ -30,12 +30,41 @@ from modules.worker.wrapper import (
     WrapperError,
 )
 
+# Telethon-исключения для гранулярной классификации ошибок send_message.
+# Раньше всё ловилось catch-all'ом → CannotWrite, из-за чего FloodWait
+# (наш troubleshooting) уходил у партнёра в CRM как `invalid` (вина лида).
+# См. docs/Fix/cannot_write_overclassifies_floodwait.md.
+from telethon.errors import FloodWaitError
+from telethon.errors.rpcerrorlist import (
+    ChatWriteForbiddenError,
+    PremiumAccountRequiredError,
+    UserBlockedError,
+    UserIsBlockedError,
+    UserNotMutualContactError,
+    UserPrivacyRestrictedError,
+    YouBlockedUserError,
+)
+
+# Те ошибки telethon, которые означают "лид физически недоступен" →
+# Категория А в worker_auto_runner → push в CRM `lead_status=invalid`.
+_TELETHON_CANNOT_WRITE_ERRORS: tuple[type[Exception], ...] = (
+    ChatWriteForbiddenError,
+    PremiumAccountRequiredError,
+    UserBlockedError,
+    UserIsBlockedError,
+    UserNotMutualContactError,
+    UserPrivacyRestrictedError,
+    YouBlockedUserError,
+)
+
 from .errors import (
     CannotWrite,
     DialogNotFound,
+    FloodWait,
     GenerationFailed,
     NoActiveSession,
     PromptNotConfigured,
+    SendFailedTransient,
     SessionAlreadyActive,
     SessionExpired as AutoSessionExpired,
     SessionNotFound,
@@ -413,15 +442,30 @@ class AutoChatService:
             },
         )
 
-        # Send первого сообщения
+        # Send первого сообщения.
+        # Гранулярная классификация (10.17) — раньше всё кроме SessionExpired
+        # сваливалось в CannotWrite, и FloodWait уходил в CRM как `invalid`
+        # из-за нашего же троттлинга. Теперь:
+        #   FloodWaitError → FloodWait (транзиент, reinsert + stop воркер)
+        #   privacy/blocked/Premium-only → CannotWrite (категория invalid)
+        #   прочее → SendFailedTransient (безопасный дефолт — транзиент)
         try:
             sent = await wrapper.send_message(telegram_user_id, initial_text)
         except WrapperSessionExpired as e:
             await self._mark_failed(session_id, "session_expired")
             raise AutoSessionExpired(str(e)) from e
+        except FloodWaitError as e:
+            seconds = getattr(e, "seconds", None)
+            await self._mark_failed(
+                session_id, f"flood_wait:{seconds}s: {e}",
+            )
+            raise FloodWait(seconds=seconds, message=str(e)) from e
+        except _TELETHON_CANNOT_WRITE_ERRORS as e:
+            await self._mark_failed(session_id, f"cannot_write: {e}")
+            raise CannotWrite(str(e)) from e
         except Exception as e:
             await self._mark_failed(session_id, f"send_failed: {e}")
-            raise CannotWrite(str(e)) from e
+            raise SendFailedTransient(str(e)) from e
 
         tg_msg_id = sent.get("telegram_message_id")
 
