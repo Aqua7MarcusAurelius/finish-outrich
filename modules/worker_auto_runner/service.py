@@ -520,6 +520,15 @@ class WorkerAutoRunnerService:
                 data={"reason": "loop_crashed"},
             )
 
+    # CRM-лид: коды ошибок autochat, означающие что лид физически
+    # недоступен (Невалид → invalid в CRM). Всё остальное — транзиент,
+    # лид кладём обратно в пул и останавливаем воркер.
+    _CRM_INVALID_ERROR_CODES: frozenset[str] = frozenset({
+        "USERNAME_NOT_FOUND",
+        "USERNAME_UNAVAILABLE",
+        "CANNOT_WRITE",
+    })
+
     async def _try_start_dialog(
         self,
         account_id: int,
@@ -529,12 +538,20 @@ class WorkerAutoRunnerService:
         from_crm: bool = False,
     ) -> None:
         """
-        Вызывает autochat.create_session. Любую ошибку превращает в SKIPPED.
+        Вызывает autochat.create_session. Поведение при ошибке зависит
+        от типа лида и кода ошибки:
 
-        Для CRM-лидов (from_crm=True) дополнительно:
-        - передаёт gender и from_crm в autochat → history запишет на dialog;
-        - после успешного старта пушит "беру в работу" в партнёрскую CRM
-          (POST /api/l1/leads/:username/start).
+        - Успех → LEAD_SENT, обычный flow.
+        - Любая ошибка → LEAD_SKIPPED.
+        - Если лид из CRM (from_crm=True):
+            • USERNAME_NOT_FOUND / USERNAME_UNAVAILABLE / CANNOT_WRITE
+              → пушим в CRM `lead_status=invalid`. Локально лид закрыт.
+            • Любая другая ошибка (FloodWait, OpenRouter, prompt пустой,
+              воркер упал и т.п.) → возвращаем лида в пул и
+              останавливаем этот воркер (есть проблема, нужна реакция
+              оператора).
+
+        `/start` в CRM здесь не зовём — он сделан на этапе рефилла пула.
         """
         try:
             session = await self._autochat.create_session(
@@ -555,10 +572,13 @@ class WorkerAutoRunnerService:
                     "gender": gender,
                 },
             )
+            return
         except Exception as e:
+            err_code = getattr(e, "code", None) or type(e).__name__
+            err_msg = str(e)[:300]
             log.warning(
-                "auto_runner[%s]: start_dialog skipped username=%s err=%s",
-                account_id, username, e,
+                "auto_runner[%s]: start_dialog skipped username=%s code=%s err=%s",
+                account_id, username, err_code, e,
             )
             await bus.publish(
                 module=Module.WORKER_AUTO_RUNNER,
@@ -567,14 +587,54 @@ class WorkerAutoRunnerService:
                 account_id=account_id,
                 data={
                     "username": username,
-                    "error": str(e)[:300],
+                    "error": err_msg,
+                    "error_code": err_code,
                     "from_crm": from_crm,
                 },
             )
 
-        # `/leads/:u/start` больше НЕ зовём здесь — это делается на этапе
-        # рефилла пула (см. partner_crm.service._take_into_pool). К моменту
-        # когда воркер взял лида из пула, у партнёра он уже in_progress.
+        # Не CRM-лид → больше ничего не делаем. Очередь ручных
+        # @username'ов — оператор сам разберётся.
+        if not from_crm or self._partner_crm is None:
+            return
+
+        is_invalid = err_code in self._CRM_INVALID_ERROR_CODES
+
+        if is_invalid:
+            # Категория А: тех-фейл → закрываем лид в CRM как invalid.
+            # В наш пул не возвращаем (его уже там нет).
+            try:
+                await self._partner_crm.push_lead_finalized(
+                    account_id=account_id,
+                    username=username,
+                    terminal_status="invalid",
+                )
+            except Exception as push_err:
+                log.warning(
+                    "auto_runner[%s]: push invalid failed for %s: %s",
+                    account_id, username, push_err,
+                )
+            return
+
+        # Категория Б: транзиентная ошибка → возвращаем лида в пул,
+        # останавливаем воркер. Оператор смотрит лог, фиксит причину,
+        # запускает заново.
+        try:
+            await self._partner_crm.reinsert_into_pool(
+                username=username, gender=gender,
+            )
+        except Exception as r_err:
+            log.warning(
+                "auto_runner[%s]: reinsert failed for %s: %s",
+                account_id, username, r_err,
+            )
+
+        # Стопаем фоном — текущий task будет cancel'ed, на нашей же
+        # стороне выйдем через CancelledError в _account_loop.
+        asyncio.create_task(
+            self.stop(account_id, reason=f"transient_error:{err_code}"),
+            name=f"auto-runner-self-stop-{account_id}",
+        )
 
     async def _chunked_sleep(self, account_id: int, delay: float) -> None:
         """

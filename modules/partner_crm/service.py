@@ -260,6 +260,34 @@ class PartnerCrmService:
 
         return "inserted" if inserted_id is not None else "skipped"
 
+    async def reinsert_into_pool(
+        self, *, username: str, gender: str | None,
+    ) -> bool:
+        """
+        Положить лида обратно в пул после неудачной попытки автостарта
+        (FloodWait, воркер упал, OpenRouter недоступен и т.п.).
+
+        CRM-статус НЕ трогаем — он уже `in_progress` (был выставлен при
+        первоначальном заборе в пул). Просто возвращаем лида в очередь
+        чтобы любой свободный воркер с подходящим target_gender его
+        подхватил.
+
+        Возвращает True если вставили, False если уже в пуле (race —
+        кто-то другой уже положил обратно).
+        """
+        pool = db.get_pool()
+        async with pool.acquire() as conn:
+            row_id = await conn.fetchval(
+                """
+                INSERT INTO crm_lead_pool (username, gender)
+                VALUES ($1, $2)
+                ON CONFLICT (username) DO NOTHING
+                RETURNING id
+                """,
+                username, gender,
+            )
+        return row_id is not None
+
     async def claim_lead_for_account(
         self,
         *,
