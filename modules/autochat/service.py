@@ -34,7 +34,7 @@ from modules.worker.wrapper import (
 # Раньше всё ловилось catch-all'ом → CannotWrite, из-за чего FloodWait
 # (наш troubleshooting) уходил у партнёра в CRM как `invalid` (вина лида).
 # См. docs/Fix/cannot_write_overclassifies_floodwait.md.
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, RPCError
 from telethon.errors.rpcerrorlist import (
     ChatWriteForbiddenError,
     PremiumAccountRequiredError,
@@ -55,6 +55,18 @@ _TELETHON_CANNOT_WRITE_ERRORS: tuple[type[Exception], ...] = (
     UserNotMutualContactError,
     UserPrivacyRestrictedError,
     YouBlockedUserError,
+)
+
+# Маркеры в тексте generic `RPCError`, которые означают "лид недоступен".
+# В нашей версии telethon `PrivacyPremiumRequiredError` /
+# `AllowPaymentRequiredError` отсутствуют как отдельные классы — приходят
+# как RPCError с этими словами в `.message`. См.
+# docs/Fix/transient_self_stop_and_privacy_misclassification.md.
+_RPC_CANNOT_WRITE_MARKERS: tuple[str, ...] = (
+    "PRIVACY_PREMIUM_REQUIRED",       # лид принимает DM только от Premium
+    "ALLOW_PAYMENT_REQUIRED",          # лид требует Stars за DM
+    "USER_BANNED_IN_CHANNEL",          # лид забанен/удалён на TG-стороне
+    "CHAT_RESTRICTED",
 )
 
 from .errors import (
@@ -463,6 +475,17 @@ class AutoChatService:
         except _TELETHON_CANNOT_WRITE_ERRORS as e:
             await self._mark_failed(session_id, f"cannot_write: {e}")
             raise CannotWrite(str(e)) from e
+        except RPCError as e:
+            # Generic RPCError — могут быть и invalid ("PRIVACY_PREMIUM_REQUIRED"),
+            # и транзиент. Матчим по тексту: если в сообщении есть один из
+            # известных маркеров "лид недоступен" — пушим CannotWrite.
+            # Прочее — транзиент (безопаснее, чем закрыть валидного лида).
+            msg = str(e)
+            if any(marker in msg for marker in _RPC_CANNOT_WRITE_MARKERS):
+                await self._mark_failed(session_id, f"cannot_write (rpc): {e}")
+                raise CannotWrite(str(e)) from e
+            await self._mark_failed(session_id, f"send_failed (rpc): {e}")
+            raise SendFailedTransient(str(e)) from e
         except Exception as e:
             await self._mark_failed(session_id, f"send_failed: {e}")
             raise SendFailedTransient(str(e)) from e

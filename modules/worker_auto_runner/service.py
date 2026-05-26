@@ -205,6 +205,10 @@ class WorkerAutoRunnerService:
         self._tasks: dict[int, asyncio.Task] = {}
         self._lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
+        # 10.19: self-stop по транзиентной ошибке. Загорается из
+        # _try_start_dialog, гасится в _account_loop — loop сам выходит,
+        # никаких create_task с race-condition'ами. Map account_id → reason.
+        self._self_stop_requested: dict[int, str] = {}
 
     # ─── Lifecycle (вызывается из api/main.py lifespan) ───────────────
 
@@ -496,6 +500,15 @@ class WorkerAutoRunnerService:
                         gender=gender, from_crm=from_crm,
                     )
 
+                # 2a. Самостоп после транзиентной ошибки CRM-лида (10.19).
+                # _try_start_dialog ставит флаг через self._self_stop_requested
+                # вместо create_task(self.stop()) — это устраняет race
+                # и гарантирует что воркер реально останавливается.
+                if account_id in self._self_stop_requested:
+                    reason = self._self_stop_requested.pop(account_id)
+                    await self._do_self_stop(account_id, reason)
+                    return
+
                 # 3. Sleep.
                 cfg = await _select_one(account_id)
                 if cfg is None:
@@ -629,12 +642,61 @@ class WorkerAutoRunnerService:
                 account_id, username, r_err,
             )
 
-        # Стопаем фоном — текущий task будет cancel'ed, на нашей же
-        # стороне выйдем через CancelledError в _account_loop.
-        asyncio.create_task(
-            self.stop(account_id, reason=f"transient_error:{err_code}"),
-            name=f"auto-runner-self-stop-{account_id}",
+        # Запрос на self-stop. Реально остановит сам loop_task на
+        # следующей проверке флага (после возврата из _try_start_dialog).
+        # До 10.19 здесь был asyncio.create_task(self.stop(...)), но он
+        # имел race с running task'ом и в проде не срабатывал —
+        # воркер продолжал крутиться. Флаг-схема убирает race полностью:
+        # текущий loop сам решает выйти, без cancel-машинерии.
+        self._self_stop_requested[account_id] = f"transient_error:{err_code}"
+        log.info(
+            "auto_runner[%s]: self-stop requested (reason=transient_error:%s)",
+            account_id, err_code,
         )
+
+    async def _do_self_stop(self, account_id: int, reason: str) -> None:
+        """
+        Самостоп loop-task'а изнутри (10.19). Используется когда поверх
+        транзиентной ошибки на CRM-лиде воркер решает что у него проблема
+        и нужно остановиться до вмешательства оператора.
+
+        Делаем то же что и публичный `stop()`, но БЕЗ cancel'а task'а —
+        loop сам сейчас вернётся, мы только апдейтим DB и публикуем
+        событие. Это убирает race между cancel и продолжающимся loop'ом.
+        """
+        log.info(
+            "auto_runner[%s]: self-stop start reason=%s", account_id, reason,
+        )
+        # Снимаем себя из _tasks, чтобы публичный stop()/start() видели
+        # консистентное состояние. lock не берём — мы внутри своего же
+        # task'а, под lock'ом сами себя ждать не нужно.
+        self._tasks.pop(account_id, None)
+
+        try:
+            await _set_running(
+                account_id, False, last_status=f"stopped ({reason})",
+            )
+        except Exception:
+            log.exception(
+                "auto_runner[%s]: self-stop failed to mark is_running=false",
+                account_id,
+            )
+
+        try:
+            await bus.publish(
+                module=Module.WORKER_AUTO_RUNNER,
+                type=EventType.AUTO_RUNNER_STOPPED,
+                status=Status.ERROR,
+                account_id=account_id,
+                data={"reason": reason},
+            )
+        except Exception:
+            log.exception(
+                "auto_runner[%s]: self-stop failed to publish AUTO_RUNNER_STOPPED",
+                account_id,
+            )
+
+        log.info("auto_runner[%s]: self-stop done", account_id)
 
     async def _chunked_sleep(self, account_id: int, delay: float) -> None:
         """
