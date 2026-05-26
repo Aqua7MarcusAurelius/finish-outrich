@@ -460,7 +460,15 @@ export const api = {
       "/partner-crm/pool",
     ),
   partnerCrmRefill: (count: number) =>
-    request<{ requested: number; fetched: number; inserted: number; skipped_duplicates: number }>(
+    request<{
+      requested: number;
+      phase: "assigned" | "empty";
+      from_assigned: number;
+      from_request_new: number;  // всегда 0 после 10.18 (request-new выключен)
+      inserted: number;
+      skipped_duplicates: number;
+      start_failed: number;
+    }>(
       "/partner-crm/pool/refill",
       { method: "POST", body: JSON.stringify({ count }) },
     ),

@@ -12,7 +12,7 @@ import { Button } from "@/components/ui/button";
 //   • селект lead_source (manual | partner_crm)
 //   • селект target_gender (any | female | male), активен только в CRM-режиме
 //   • статус подключения партнёрского CRM + размер пула
-//   • кнопка "Забрать N лидов сейчас" (ручной рефилл)
+//   • кнопка "Подтянуть назначенных" (ручной рефилл — только assigned)
 
 type Props = {
   account: Account;
@@ -71,10 +71,17 @@ export function LeadSettingsPanel({ account, onSaved }: Props) {
     setRefillBusy(true);
     try {
       const r = await api.partnerCrmRefill(refillCount);
-      toast.success(
-        "Лиды забраны",
-        `+${r.inserted} в пул (получено ${r.fetched} из CRM)`,
-      );
+      if (r.phase === "empty") {
+        toast.success(
+          "Нет назначенных",
+          "В CRM нет лидов со статусом new — ждём пока партнёр назначит",
+        );
+      } else {
+        toast.success(
+          "Подтянуто назначенных",
+          `+${r.inserted} в пул (из ${r.from_assigned} назначенных)`,
+        );
+      }
       // Обновим health на актуальный pool_size
       try {
         setHealth(await api.partnerCrmHealth());
@@ -160,7 +167,7 @@ export function LeadSettingsPanel({ account, onSaved }: Props) {
                 onClick={refill}
               >
                 {refillBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
-                <span className="ml-1.5">Забрать N лидов сейчас</span>
+                <span className="ml-1.5">Подтянуть назначенных</span>
               </Button>
             </>
           )}

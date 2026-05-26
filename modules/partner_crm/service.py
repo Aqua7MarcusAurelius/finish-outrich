@@ -83,65 +83,41 @@ class PartnerCrmService:
 
     async def refill_pool(self, count: int) -> dict[str, Any]:
         """
-        Рефилл пула — exclusive-or из двух источников:
+        Рефилл пула — только то что нам уже назначено в CRM и не в работе.
 
-        1. Сначала смотрим что у нас уже назначено в CRM и НЕ в работе
-           (`GET /api/l1/leads?status=new` → лиды с `lead_status=new`).
-           Если таких есть — забираем их ВСЕ. На этом останавливаемся.
+        `GET /api/l1/leads?status=new` → лиды с `lead_status=new` (партнёр
+        назначил их нам, мы ещё не двигали). Забираем ВСЕ. На каждого
+        сразу `POST /leads/:u/status {in_progress}` → CRM-статус становится
+        `lead_status=in_progress`, событие `partner_crm.lead_started`.
 
-        2. Если в CRM нет назначенных-не-в-работе — только тогда зовём
-           `POST /api/l1/leads/request-new {count: N}` и забираем
-           всё что прилетело.
+        `request-new` (общий пул партнёра) НЕ зовём — раньше зовли
+        как fallback когда `?status=new` пустой, но это «воровало» лидов
+        у других L1-операторов. Теперь только то что нам уже назначено.
 
-        Логика "не качать впрок": бережём квоту партнёра — если у нас
-        уже висит N свежих лидов на профиле, незачем дёргать request-new.
+        Параметр `count` остаётся в сигнатуре для API-совместимости с UI
+        и poller'ом, но логику не определяет — берём столько, сколько
+        прислал `?status=new`.
 
-        На каждого взятого лида сразу `POST /leads/:u/status {in_progress}` →
-        CRM-статус становится `lead_status=in_progress`, событие
-        `partner_crm.lead_started`. Если падает — лид в пул не кладём,
-        на следующем тике попробуем снова.
-
-        Возвращает агрегат с указанием какая фаза отработала.
+        Возвращает результат с `phase ∈ {"assigned", "empty"}`.
         Публикует `partner_crm.pool_refilled` / `partner_crm.refill_failed`.
         """
-        if count <= 0:
-            return {
-                "requested": 0,
-                "phase": "noop",
-                "from_assigned": 0,
-                "from_request_new": 0,
-                "inserted": 0,
-                "skipped_duplicates": 0,
-                "start_failed": 0,
-            }
-
-        # ── Фаза 1: уже назначенные нам, ещё не в работе ──────────────
+        # `count` сейчас не используется логикой, но кладём в результат
+        # чтобы UI / poller видели «вот столько было запрошено».
         try:
             assigned_new = await self._client.list_leads(status="new")
         except PartnerCrmError as e:
             await self._publish_failed(EventType.PARTNER_CRM_REFILL_FAILED, e)
             raise
 
-        if assigned_new:
-            inserted = 0
-            skipped = 0
-            start_failed = 0
-            for lead in assigned_new:
-                r = await self._take_into_pool(lead, origin="assigned")
-                if r == "inserted":
-                    inserted += 1
-                elif r == "skipped":
-                    skipped += 1
-                elif r == "start_failed":
-                    start_failed += 1
+        if not assigned_new:
             result = {
                 "requested": int(count),
-                "phase": "assigned",
-                "from_assigned": len(assigned_new),
+                "phase": "empty",
+                "from_assigned": 0,
                 "from_request_new": 0,
-                "inserted": inserted,
-                "skipped_duplicates": skipped,
-                "start_failed": start_failed,
+                "inserted": 0,
+                "skipped_duplicates": 0,
+                "start_failed": 0,
             }
             await bus.publish(
                 module=Module.PARTNER_CRM,
@@ -149,22 +125,17 @@ class PartnerCrmService:
                 status=Status.SUCCESS,
                 data=result,
             )
-            log.info("partner_crm: refill pool (assigned phase) result=%s", result)
+            log.info(
+                "partner_crm: refill pool — нет назначенных с lead_status=new, "
+                "ждём пока партнёр назначит",
+            )
             return result
 
-        # ── Фаза 2: ничего не висит — просим новых ────────────────────
-        try:
-            payload = await self._client.request_new_leads(count)
-        except PartnerCrmError as e:
-            await self._publish_failed(EventType.PARTNER_CRM_REFILL_FAILED, e)
-            raise
-
-        new_leads = payload.get("assigned") or payload.get("leads") or []
         inserted = 0
         skipped = 0
         start_failed = 0
-        for lead in new_leads:
-            r = await self._take_into_pool(lead, origin="request_new")
+        for lead in assigned_new:
+            r = await self._take_into_pool(lead, origin="assigned")
             if r == "inserted":
                 inserted += 1
             elif r == "skipped":
@@ -174,9 +145,9 @@ class PartnerCrmService:
 
         result = {
             "requested": int(count),
-            "phase": "request_new",
-            "from_assigned": 0,
-            "from_request_new": len(new_leads),
+            "phase": "assigned",
+            "from_assigned": len(assigned_new),
+            "from_request_new": 0,
             "inserted": inserted,
             "skipped_duplicates": skipped,
             "start_failed": start_failed,
@@ -187,7 +158,7 @@ class PartnerCrmService:
             status=Status.SUCCESS,
             data=result,
         )
-        log.info("partner_crm: refill pool (request_new phase) result=%s", result)
+        log.info("partner_crm: refill pool (assigned-only) result=%s", result)
         return result
 
     async def _take_into_pool(
