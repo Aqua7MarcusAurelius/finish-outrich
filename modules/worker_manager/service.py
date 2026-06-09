@@ -19,6 +19,7 @@ from typing import Any
 from core import bus, db
 from core import minio as minio_mod
 from core import redis as redis_mod
+from core.config import settings
 from core.events import EventType, Module, Status
 from modules.worker.wrapper import ProxyUnavailable, SessionExpired
 from modules.worker.worker import Worker
@@ -82,6 +83,12 @@ class ConfirmationRequired(ManagerError):
     status_code = 428
 
 
+class ServiceAccountNotStartable(ManagerError):
+    code = "SERVICE_ACCOUNT_NOT_STARTABLE"
+    message = "Сервисный аккаунт доставки не запускается как воркер"
+    status_code = 409
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Запись менеджера об одном воркере
 # ─────────────────────────────────────────────────────────────────────
@@ -139,9 +146,12 @@ class WorkerManager:
         """
         pool = db.get_pool()
         async with pool.acquire() as conn:
+            # Сервис-аккаунт доставки (report_delivery) скрыт из UI — он не
+            # лид-воркер, своим TG-подключением управляет модуль доставки.
             rows = await conn.fetch(
                 "SELECT id, name, phone, is_active "
-                "FROM accounts ORDER BY id"
+                "FROM accounts WHERE name <> $1 ORDER BY id",
+                settings.SERVICE_ACCOUNT_NAME,
             )
 
         out: list[dict[str, Any]] = []
@@ -179,6 +189,10 @@ class WorkerManager:
                 )
             if row is None:
                 raise AccountNotFound()
+            if row["name"] == settings.SERVICE_ACCOUNT_NAME:
+                # Сервис-аккаунт доставки держит своё подключение в
+                # report_delivery — второй коннект на ту же сессию запрещён.
+                raise ServiceAccountNotStartable()
             if not row["is_active"]:
                 raise AccountInactive()
 
