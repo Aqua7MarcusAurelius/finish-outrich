@@ -5,6 +5,7 @@
 Настройки поведения модулей (которые меняются без перезапуска) живут
 не здесь, а в таблице `settings` в БД — см. database_schema.md.
 """
+import json
 from typing import List
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -73,6 +74,19 @@ class Settings(BaseSettings):
     CRM_BASE_URL: str = ""
     CRM_API_TOKEN: str = ""
 
+    # ── Доставка success-отчётов в TG-группы (этап 10.20) ──────────────
+    # Сервисный Telegram-аккаунт, который состоит в группах выгрузки и
+    # заливает туда HTML-отчёты по удачным диалогам. Заводится обычным
+    # мастером «новый аккаунт»; здесь — только его имя (accounts.name),
+    # чтобы модуль report_delivery нашёл строку и скрыл аккаунт из UI.
+    SERVICE_ACCOUNT_NAME: str = "service"
+    # Карта «код воркера → chat_id группы выгрузки», JSON-объект.
+    # Ключ = accounts.name воркера (как в префиксе имени файла отчёта),
+    # значение = числовой id приватной группы (напр. -1001234567890).
+    # Пустая строка = доставка выключена. Пример:
+    #   REPORT_GROUP_MAP={"SAD_03_RU": -1001234567890, "JOKER_01_RU": -1009876543210}
+    REPORT_GROUP_MAP: str = ""
+
     # ── Вычисляемые свойства ─────────────────────────────────────────
 
     @property
@@ -102,6 +116,32 @@ class Settings(BaseSettings):
     @property
     def cors_origins_list(self) -> List[str]:
         return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
+
+    @property
+    def report_group_map(self) -> dict[str, int]:
+        """
+        Распарсенная карта `код_воркера → chat_id` из REPORT_GROUP_MAP.
+
+        Пустая строка / битый JSON / не-объект → пустой dict (доставка
+        просто молчит, приложение не роняем — модуль report_delivery
+        логирует факт пустой/битой карты на старте). Значения → int.
+        """
+        raw = (self.REPORT_GROUP_MAP or "").strip()
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        out: dict[str, int] = {}
+        for key, value in data.items():
+            try:
+                out[str(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        return out
 
 
 settings = Settings()

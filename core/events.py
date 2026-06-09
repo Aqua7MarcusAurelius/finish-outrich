@@ -27,6 +27,7 @@ class Module:
     PEER_PROFILE = "peer_profile"
     PARTNER_CRM = "partner_crm"
     LEAD_EVALUATOR = "lead_evaluator"
+    REPORT_DELIVERY = "report_delivery"
 
 
 class Status:
@@ -144,6 +145,14 @@ class EventType:
     # LLM не дал распарсить ответ даже после ретрая. Считаем archive,
     # отчёт уйдёт в папку archive/ для ручного разбора.
     LEAD_EVALUATOR_PARSE_FAILED = "lead_evaluator.parse_failed"
+
+    # ── Доставка отчётов в TG-группы (этап 10.20) ────────────────────
+    # Сервис-аккаунт залил success-отчёт в группу выгрузки воркера.
+    REPORT_DELIVERED = "report.delivered"
+    # Не смогли залить (сервис-аккаунт офлайн / ошибка отправки в TG).
+    REPORT_DELIVERY_FAILED = "report.delivery_failed"
+    # Пропущено осознанно: для воркера нет группы в REPORT_GROUP_MAP.
+    REPORT_DELIVERY_SKIPPED = "report.delivery_skipped"
 
     # ── Системные ────────────────────────────────────────────────────
     SYSTEM_ERROR = "system.error"

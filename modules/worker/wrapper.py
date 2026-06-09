@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 from typing import Any, Awaitable, Callable
 
@@ -483,6 +484,47 @@ class TelegramWrapper:
             return await self.client.send_message(
                 entity=dialog, message=text, reply_to=reply_to,
             )
+        msg = await self._guard(_do)
+        return {
+            "telegram_message_id": getattr(msg, "id", None),
+            "date": getattr(msg, "date", None),
+        }
+
+    async def send_file(
+        self,
+        dialog: int | str,
+        file: bytes,
+        *,
+        filename: str,
+        caption: str | None = None,
+        force_document: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Отправить файл (по умолчанию документом) в чат/группу.
+
+        `file` — байты содержимого, `filename` задаёт имя вложения:
+        при отправке из памяти Telethon берёт имя из `.name` потока.
+        `force_document=True` — не пытаться отрисовать как медиа (для HTML
+        это важно), шлём как документ. `caption` — подпись к сообщению.
+
+        Используется модулем report_delivery: сервис-аккаунт заливает
+        HTML-отчёт по удачному диалогу в группу выгрузки воркера.
+
+        SessionExpired — через `_guard`. Прочие ошибки (FloodWait,
+        нерезолвящийся chat и т.п.) пробрасываются наверх — что с ними
+        делать, решает caller.
+        """
+        buf = io.BytesIO(file)
+        buf.name = filename  # Telethon возьмёт имя файла отсюда
+
+        async def _do():
+            return await self.client.send_file(
+                entity=dialog,
+                file=buf,
+                caption=caption,
+                force_document=force_document,
+            )
+
         msg = await self._guard(_do)
         return {
             "telegram_message_id": getattr(msg, "id", None),
