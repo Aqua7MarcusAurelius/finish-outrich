@@ -55,6 +55,12 @@ OPENROUTER_API_KEY=
 OPENROUTER_MODEL_TRANSCRIPTION=openai/whisper
 OPENROUTER_MODEL_DESCRIPTION=openai/gpt-4o
 OPENROUTER_MODEL_AUTOCHAT=anthropic/claude-opus-4-7     # уточнить точное имя в каталоге OpenRouter
+
+# ───────────────────────────────
+# Доставка success-отчётов в TG-группы (report_delivery)
+# ───────────────────────────────
+SERVICE_ACCOUNT_NAME=service   # имя сервис-аккаунта (accounts.name), скрыт из UI
+REPORT_GROUP_MAP=              # JSON {код_воркера: chat_id группы}, пусто = выключено
 ```
 
 ---

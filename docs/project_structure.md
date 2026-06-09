@@ -96,6 +96,7 @@ tg-framework/
 | Транскрибация | `modules/transcription/service.py` |
 | Описание медиа / FFmpeg | `modules/media_description/service.py` |
 | Автодиалоги (AutoChat) | `modules/autochat/` |
+| Доставка success-отчётов в TG-группы | `modules/report_delivery/service.py` |
 | SSE потоки для дашборда | `api/sse.py` |
 | Подключение к базе | `core/db.py` |
 | Шина событий | `core/bus.py` |
