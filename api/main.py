@@ -46,6 +46,7 @@ from modules.partner_crm.poller import PartnerCrmPoller
 from modules.partner_crm.routes import router as partner_crm_router
 from modules.partner_crm.service import PartnerCrmService
 from modules.peer_profile.service import PeerProfileService
+from modules.report_delivery.service import ReportDeliveryService
 from modules.transcription.service import TranscriptionService
 from modules.worker_auto_runner.routes import router as auto_runner_router
 from modules.worker_auto_runner.service import WorkerAutoRunnerService
@@ -128,6 +129,15 @@ async def lifespan(app: FastAPI):
     app.state.report_consumer = report_consumer
     report_consumer_task = asyncio.create_task(report_consumer.run())
     app.state.report_consumer_task = report_consumer_task
+
+    # ReportDeliveryService: на autochat.report_saved с folder=success
+    # сервис-аккаунт заливает HTML-отчёт в группу выгрузки воркера. Держит
+    # своё TG-подключение (не через WorkerManager). Если карта групп пуста
+    # или сервис-аккаунт не настроен/не авторизован — тихо выключается.
+    report_delivery_service = ReportDeliveryService()
+    app.state.report_delivery_service = report_delivery_service
+    report_delivery_task = asyncio.create_task(report_delivery_service.run())
+    app.state.report_delivery_task = report_delivery_task
 
     # SilenceWatcher: фоновый процесс переходов "Общение→Обрыв" по 4ч
     # тишины и "Первый контакт/Обрыв → Завершен провал" по 48ч.
@@ -232,6 +242,17 @@ async def lifespan(app: FastAPI):
         report_consumer_task.cancel()
         try:
             await report_consumer_task
+        except asyncio.CancelledError:
+            pass
+
+        try:
+            await report_delivery_service.stop()
+        except Exception:
+            log.exception("report_delivery_service stop error")
+
+        report_delivery_task.cancel()
+        try:
+            await report_delivery_task
         except asyncio.CancelledError:
             pass
 
