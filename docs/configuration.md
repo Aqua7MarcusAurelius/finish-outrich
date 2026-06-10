@@ -60,7 +60,7 @@ OPENROUTER_MODEL_AUTOCHAT=anthropic/claude-opus-4-7     # уточнить то�
 # Доставка success-отчётов в TG-группы (report_delivery)
 # ───────────────────────────────
 SERVICE_ACCOUNT_NAME=service   # имя сервис-аккаунта (accounts.name), скрыт из UI
-REPORT_GROUP_MAP=              # JSON {код_воркера: chat_id группы}, пусто = выключено
+REPORT_GROUP_MAP=              # JSON {семейство_воркера: chat_id}, напр. {"SAD": -100...}; пусто = выключено
 ```
 
 ---

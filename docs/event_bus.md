@@ -159,10 +159,10 @@ data: {
 `stopped` — штатная остановка через API. `session_error` — фатальная ошибка (нас заблокировали, нельзя писать, критический сбой); сессия переводится в `status=failed`.
 
 ### `report.delivered` / `report.delivery_failed` / `report.delivery_skipped` — выгрузка отчёта в TG-группу
-Публикует модуль `report_delivery`. На `autochat.report_saved` с `folder=success` сервис-аккаунт заливает HTML-отчёт в группу выгрузки воркера (карта `REPORT_GROUP_MAP` в `.env`). Группа определяется по воркеру (`account_id` события → `accounts.name`).
+Публикует модуль `report_delivery`. На `autochat.report_saved` с `folder=success` сервис-аккаунт заливает HTML-отчёт в группу выгрузки. Группа определяется по **семейству** воркера: `account_id` события → `accounts.name` → префикс до `_` (`SAD_03_RU → SAD`) → `chat_id` из `REPORT_GROUP_MAP`.
 - `report.delivered` — файл ушёл в группу. `data: { dialog_id, worker, chat_id, minio_key, telegram_message_id }`
 - `report.delivery_failed` — сбой отправки (протухла сессия сервис-аккаунта / FloodWait / нерезолвящийся chat / MinIO). `data: { dialog_id, worker, chat_id, minio_key, reason }`
-- `report.delivery_skipped` — для воркера нет группы в карте. `data: { dialog_id, worker, reason: "no_group_mapped", minio_key }`
+- `report.delivery_skipped` — для семейства нет группы в карте. `data: { dialog_id, worker, family, reason: "no_group_mapped", minio_key }`
 
 ### `system.error` — системная ошибка
 Публикует любой модуль при технической ошибке не связанной с конкретным сообщением. Поле `account` может быть null если ошибка общесистемная.

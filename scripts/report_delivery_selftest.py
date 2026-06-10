@@ -51,7 +51,9 @@ class FakeRedis:
 
 
 FAKE_REDIS = FakeRedis()
-WORKER_BY_ACCOUNT = {7: "SAD_03_RU", 8: "UNMAPPED_99"}
+# account_id → имя воркера. 7 и 9 — разные воркеры одного семейства SAD;
+# 8 — семейство без группы в карте.
+WORKER_BY_ACCOUNT = {7: "SAD_03_RU", 8: "UNMAPPED_99", 9: "SAD_07_RU"}
 CAPTION_ROW = {
     "username": "lead_user",
     "first_name": "Ирина",
@@ -181,7 +183,8 @@ class FakeWrapper:
 
 
 def make_event(folder="success", account_id=7, dialog_id=101):
-    key = f"{folder}/SAD_03_RU_@lead_user_09-06-26_12-30.html"
+    worker = WORKER_BY_ACCOUNT.get(account_id, "SAD_03_RU")
+    key = f"{folder}/{worker}_@lead_user_09-06-26_12-30.html"
     return {
         "id": "e1",
         "type": events.EventType.AUTOCHAT_REPORT_SAVED,
@@ -210,7 +213,7 @@ def reset():
 
 def new_svc():
     svc = ReportDeliveryService()
-    svc._group_map = {"SAD_03_RU": -1001234567890}
+    svc._group_map = {"SAD": -1001234567890}   # ключ — СЕМЕЙСТВО воркера
     svc._wrapper = FakeWrapper()
     return svc
 
@@ -248,7 +251,18 @@ async def main():
     await svc._handle(make_event(dialog_id=101))
     check("C.дедуп: повторно не отправили", len(SENT) == 1)
 
-    # D. воркер без группы → skipped
+    # B2. другой воркер того же семейства (SAD_07_RU) → та же группа SAD
+    reset()
+    svc = new_svc()
+    await svc._handle(make_event(account_id=9, dialog_id=150))
+    check("B2.семейство: send_file 1 раз", len(SENT) == 1)
+    if SENT:
+        check("B2.семейство: та же группа SAD", SENT[0]["dialog"] == -1001234567890)
+        check("B2.семейство: имя файла этого воркера",
+              SENT[0]["filename"] == "SAD_07_RU_@lead_user_09-06-26_12-30.html",
+              SENT[0]["filename"])
+
+    # D. семейство без группы → skipped
     reset()
     svc = new_svc()
     await svc._handle(make_event(account_id=8, dialog_id=202))

@@ -7,9 +7,9 @@ minio_key, folder}`. Этот сервис ловит событие, и есл�
 сервисным Telegram-аккаунтом заливает тот же файл в группу выгрузки воркера.
 
 Группа определяется так: `account_id` → имя воркера (accounts.name) →
-`chat_id` из карты `settings.report_group_map` (она же — `REPORT_GROUP_MAP`
-в .env). Имя воркера совпадает с префиксом имени файла в MinIO — то есть
-«какая группа нужна, понятно по файлу».
+«семейство» (префикс имени до '_', напр. SAD_03_RU → SAD) → `chat_id` из
+карты `REPORT_GROUP_MAP` в .env. Одна группа обслуживает всех воркеров
+семейства; новые воркеры подхватываются без правки карты.
 
 Сервис держит СВОЁ подключение к сервис-аккаунту (не через WorkerManager):
 админскому аккаунту не нужны подписки на входящие и нагон истории, только
@@ -67,7 +67,11 @@ class ReportDeliveryService:
     # ─── Жизненный цикл ────────────────────────────────────────────
 
     async def run(self) -> None:
-        self._group_map = settings.report_group_map
+        # Ключи карты — «семейства» воркеров (префикс имени до '_'),
+        # нормализуем к ВЕРХНЕМУ регистру: в .env можно писать как удобно.
+        self._group_map = {
+            str(k).upper(): v for k, v in settings.report_group_map.items()
+        }
         raw = (settings.REPORT_GROUP_MAP or "").strip()
         if raw and not self._group_map:
             log.warning(
@@ -230,11 +234,14 @@ class ReportDeliveryService:
             )
             return
 
-        chat_id = self._group_map.get(worker_name)
+        # Группа — по «семейству» воркера: префикс имени до первого '_'
+        # (SAD_03_RU → SAD). Одна группа обслуживает всех воркеров семейства.
+        family = worker_name.split("_", 1)[0].upper()
+        chat_id = self._group_map.get(family)
         if chat_id is None:
             log.info(
-                "report_delivery: для воркера %s нет группы в карте — пропуск",
-                worker_name,
+                "report_delivery: для семейства %s (воркер %s) нет группы — пропуск",
+                family, worker_name,
             )
             await bus.publish(
                 module=Module.REPORT_DELIVERY,
@@ -244,6 +251,7 @@ class ReportDeliveryService:
                 data={
                     "dialog_id": int(dialog_id),
                     "worker": worker_name,
+                    "family": family,
                     "reason": "no_group_mapped",
                     "minio_key": minio_key,
                 },
