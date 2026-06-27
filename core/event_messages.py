@@ -70,6 +70,9 @@ _TEMPLATES: dict[str, Callable[[dict[str, Any]], str]] = {
     EventType.WORKER_CRASHED: lambda d: (
         f"воркер упал: {d.get('error', 'неизвестная ошибка')}"
     ),
+    EventType.WORKER_RESTARTED: lambda d: (
+        f"воркер упал и перезапущен: {d.get('error', 'неизвестная ошибка')}"
+    ),
 
     # ── Нагон ────────────────────────────────────────────────────────
     EventType.SYNC_STARTED: lambda d: "нагон истории запущен",

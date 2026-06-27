@@ -94,6 +94,12 @@ class EventType:
     WORKER_STARTED = "worker.started"
     WORKER_STOPPED = "worker.stopped"
     WORKER_CRASHED = "worker.crashed"
+    # Воркер упал, но был прозрачно перезапущен (одна попытка авторестарта).
+    # НЕ означает «офлайн»: auto-runner этот тип игнорирует и продолжает
+    # работать. Отдельный тип нужен, чтобы транзиентный сбой не глушил
+    # автодиалоги навсегда (worker.crashed → auto-runner.stop). Финальный
+    # крах (рестарт не удался/не делался) по-прежнему шлёт worker.crashed.
+    WORKER_RESTARTED = "worker.restarted"
 
     # ── Нагон истории ────────────────────────────────────────────────
     SYNC_STARTED = "sync.started"

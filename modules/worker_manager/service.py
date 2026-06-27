@@ -378,9 +378,8 @@ class WorkerManager:
             except Exception as e:
                 log.exception("worker account=%s crashed", account_id)
                 await self._set_status(account_id, STATUS_CRASHED, error=str(e))
-                await self._publish_crashed(account_id, str(e))
 
-                # Одна попытка авторестарта
+                # Одна попытка прозрачного авторестарта.
                 slot = self._slots.get(account_id)
                 if slot and slot.restart_count == 0 and not is_restart:
                     slot.restart_count = 1
@@ -395,11 +394,21 @@ class WorkerManager:
                             proxy_fallback=proxy_fallback,
                             is_restart=True,
                         )
+                        # Прозрачное восстановление: публикуем worker.restarted,
+                        # а НЕ worker.crashed. worker.crashed заставил бы
+                        # auto-runner посчитать воркер офлайн и навсегда
+                        # остановить автодиалоги, хотя воркер снова RUNNING.
+                        await self._publish_restarted(account_id, str(e))
                         return
                     except Exception:
                         log.exception(
                             "worker account=%s: restart failed", account_id,
                         )
+
+                # Финальный крах: рестарт не планировался (повторный крах после
+                # авторестарта) или сам рестарт не удался. Здесь auto-runner
+                # обязан остановиться — публикуем worker.crashed.
+                await self._publish_crashed(account_id, str(e))
             finally:
                 # Удаляем слот только если это финальное завершение
                 # (при авторестарте мы уже подставили новый слот выше)
@@ -424,6 +433,18 @@ class WorkerManager:
         await bus.publish(
             module=Module.WORKER,
             type=EventType.WORKER_CRASHED,
+            status=Status.ERROR,
+            account_id=account_id,
+            data={"error": error},
+        )
+
+    async def _publish_restarted(self, account_id: int, error: str) -> None:
+        # Транзиентный крах, восстановленный одним авторестартом. Отдельный
+        # тип события: auto-runner его игнорирует (в отличие от worker.crashed),
+        # поэтому автодиалоги продолжают работать после прозрачного рестарта.
+        await bus.publish(
+            module=Module.WORKER,
+            type=EventType.WORKER_RESTARTED,
             status=Status.ERROR,
             account_id=account_id,
             data={"error": error},
