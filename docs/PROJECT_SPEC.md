@@ -497,11 +497,15 @@ tg-framework/
 │   └── lead_evaluator_system.md    ← системный промпт оценки лида
 │
 ├── scripts/                     ← вспомогательные скрипты (запуск вручную)
+│   ├── register_account.py      ← CLI-регистрация аккаунта (fingerprint, one-shot)
+│   ├── proxy_diag.py            ← диагностика прокси: Telegram-DC vs 1.1.1.1
 │   ├── crm_probe.py             ← проба партнёрской CRM
 │   ├── report_delivery_selftest.py  ← офлайн-самопроверка логики доставки отчётов
 │   └── report_delivery_preflight.py ← пре-флайт групп сервис-аккаунта доставки
 │
-├── docs/                        ← вся проектная документация (этот набор файлов)
+├── tests/smoke/                 ← смоук-тесты (запуск: docker compose exec app python -m tests.smoke.<name>)
+│
+├── docs/                        ← только PROJECT_SPEC.md (единый источник истины) + recovered_prompts/
 │
 ├── alembic.ini                  ← настройки Alembic
 ├── docker-compose.yml           ← поднять всё окружение одной командой
