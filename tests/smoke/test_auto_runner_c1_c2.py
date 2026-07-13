@@ -1,11 +1,14 @@
-"""Smoke-тесты C1 + C2 (2026-07-13) для worker_auto_runner.
+"""Smoke-тесты C1 + C2 для worker_auto_runner (обновлено 2026-07-13).
 
-C1 — пропись не должна самостопиться после первого лида на повторном
-     старте: вердикт `_self_stop_requested` чистится на всех входах/выходах
-     (`start`, `stop`, `_do_self_stop`).
-C2 — `stop()`/`shutdown()` не должны падать с `asyncio.CancelledError`
-     (в Python 3.12+ он НЕ наследник Exception) при отмене loop-task'и;
-     единый helper `_cancel_and_wait` глушит его.
+C1 — самостоп по needs_operator. Раньше reason писался в долгоживущий словарь
+     `_self_stop_requested` и требовал ручной чистки на всех входах/выходах
+     (класс багов «вердикт пережил границу сессии»). Теперь `_try_start_dialog`
+     ВОЗВРАЩАЕТ reason значением, а `_account_loop` сам решает стопаться — side-
+     channel убран, класс багов исчез по построению. Тест проверяет контракт
+     возврата: needs_operator → reason, benign/success → None.
+C2 — `stop()`/`shutdown()` не падают с `asyncio.CancelledError` (в Python 3.12+
+     он НЕ наследник Exception) при отмене loop-task'и; helper `_cancel_and_wait`
+     его глушит.
 
 БД не трогаем: модульные DB-функции монкипатчим на async-заглушки.
 
@@ -28,29 +31,22 @@ def _patch_db(monkey: dict) -> None:
 
     async def _select_one(account_id):  # noqa: ANN001
         return {
-            "account_id": account_id,
-            "is_running": True,
-            "queue": [],
-            "window_hours": 12,
-            "min_leads": 15,
-            "max_leads": 18,
-            "warmup_minutes": 10,
-            "active_start_hour_msk": 8,
-            "active_end_hour_msk": 23,
-            "session_started_at": None,
-            "session_ends_at": None,
-            "schedule": [],
-            "cooldown_until": None,
-            "cooldown_reason": None,
-            "last_action_at": None,
-            "last_status": None,
-            "updated_at": None,
+            "account_id": account_id, "is_running": True, "queue": [],
+            "window_hours": 12, "min_leads": 15, "max_leads": 18,
+            "warmup_minutes": 10, "active_start_hour_msk": 8,
+            "active_end_hour_msk": 23, "session_started_at": None,
+            "session_ends_at": None, "schedule": [], "cooldown_until": None,
+            "cooldown_reason": None, "last_action_at": None,
+            "last_status": None, "updated_at": None,
         }
 
     async def _account_exists(account_id):  # noqa: ANN001
         return True
 
     async def _set_running(account_id, is_running, last_status=None):  # noqa: ANN001
+        return None
+
+    async def _touch_last_status(account_id, status):  # noqa: ANN001
         return None
 
     async def _clear_session(account_id):  # noqa: ANN001
@@ -67,6 +63,7 @@ def _patch_db(monkey: dict) -> None:
         ("_select_one", _select_one),
         ("_account_exists", _account_exists),
         ("_set_running", _set_running),
+        ("_touch_last_status", _touch_last_status),
         ("_clear_session", _clear_session),
         ("_write_session", _write_session),
     ):
@@ -84,13 +81,24 @@ def _unpatch_db(monkey: dict) -> None:
             setattr(ar, name, orig)
 
 
+class _FakeAutochat:
+    """create_session: если задан exc — бросает его, иначе возвращает сессию."""
+    def __init__(self, exc):
+        self._exc = exc
+
+    async def create_session(self, **kwargs):
+        if self._exc is not None:
+            raise self._exc
+        return {"id": 1}
+
+
 async def test_cancel_and_wait_swallows_cancelled() -> bool:
-    """`_cancel_and_wait` не даёт CancelledError утечь наверх."""
+    """`_cancel_and_wait` не даёт CancelledError утечь наверх (C2)."""
     async def _inf():
         await asyncio.Event().wait()
 
     task = asyncio.create_task(_inf())
-    await asyncio.sleep(0)  # дать задаче стартовать
+    await asyncio.sleep(0)
     try:
         await ar._cancel_and_wait(task)
     except BaseException as e:  # noqa: BLE001
@@ -99,9 +107,9 @@ async def test_cancel_and_wait_swallows_cancelled() -> bool:
     return task.done()
 
 
-async def test_stop_no_raise_and_clears_flag() -> bool:
-    """stop() отменяет живой loop-task БЕЗ CancelledError наверх и чистит
-    устаревший self-stop вердикт (C1 + C2 вместе)."""
+async def test_stop_no_raise_removes_task() -> bool:
+    """stop() отменяет живой loop-task БЕЗ CancelledError наверх и убирает его
+    из _tasks (C2)."""
     monkey: dict = {}
     _patch_db(monkey)
     try:
@@ -114,7 +122,6 @@ async def test_stop_no_raise_and_clears_flag() -> bool:
             await asyncio.Event().wait()
 
         svc._tasks[acc] = asyncio.create_task(_loop())
-        svc._self_stop_requested[acc] = "stale_verdict"
         await asyncio.sleep(0)
 
         try:
@@ -123,9 +130,6 @@ async def test_stop_no_raise_and_clears_flag() -> bool:
             print(f"  FAIL: stop() raised {type(e).__name__}")
             return False
 
-        if acc in svc._self_stop_requested:
-            print("  FAIL: stale self-stop flag not cleared by stop()")
-            return False
         if acc in svc._tasks:
             print("  FAIL: task not removed by stop()")
             return False
@@ -134,9 +138,48 @@ async def test_stop_no_raise_and_clears_flag() -> bool:
         _unpatch_db(monkey)
 
 
-async def test_do_self_stop_clears_flag() -> bool:
-    """_do_self_stop вычищает вердикт (C1) — иначе он переживёт границу
-    сессии и самостопнет следующий запуск после первого лида."""
+async def test_try_start_dialog_returns_reason() -> bool:
+    """C1 (return-value модель): `_try_start_dialog` возвращает
+    `needs_operator:<code>` когда автомат надо остановить, и `None` на
+    benign/success — без долгоживущего словаря-вердикта."""
+    from modules.autochat.errors import (
+        SessionExpired as AutoSessionExpired, AlreadyContacted,
+    )
+    monkey: dict = {}
+    _patch_db(monkey)
+    try:
+        svc = ar.WorkerAutoRunnerService(
+            get_wrapper=lambda a: object(), autochat_service=None,
+        )
+        acc = 999004
+
+        # needs_operator (SESSION_EXPIRED) → возвращается reason
+        svc._autochat = _FakeAutochat(AutoSessionExpired("expired"))  # type: ignore
+        r = await svc._try_start_dialog(acc, "u1", from_crm=False)
+        if not (isinstance(r, str) and r.startswith("needs_operator")):
+            print(f"  FAIL: needs_operator must return reason, got {r!r}")
+            return False
+
+        # benign ALREADY_CONTACTED → None (пропуск слота, не стоп)
+        svc._autochat = _FakeAutochat(AlreadyContacted())  # type: ignore
+        r = await svc._try_start_dialog(acc, "u2", from_crm=False)
+        if r is not None:
+            print(f"  FAIL: ALREADY_CONTACTED must return None, got {r!r}")
+            return False
+
+        # success → None
+        svc._autochat = _FakeAutochat(None)  # type: ignore
+        r = await svc._try_start_dialog(acc, "u3", from_crm=False)
+        if r is not None:
+            print(f"  FAIL: success must return None, got {r!r}")
+            return False
+        return True
+    finally:
+        _unpatch_db(monkey)
+
+
+async def test_do_self_stop_no_raise() -> bool:
+    """_do_self_stop отрабатывает без исключений (гасит task, ставит статус)."""
     monkey: dict = {}
     _patch_db(monkey)
     try:
@@ -144,46 +187,12 @@ async def test_do_self_stop_clears_flag() -> bool:
             get_wrapper=lambda a: None, autochat_service=None,
         )
         acc = 999002
-        svc._self_stop_requested[acc] = "session_completed"
-        await svc._do_self_stop(acc, "session_completed")
-        if acc in svc._self_stop_requested:
-            print("  FAIL: _do_self_stop did not clear flag")
+        try:
+            await svc._do_self_stop(acc, "session_completed")
+        except BaseException as e:  # noqa: BLE001
+            print(f"  FAIL: _do_self_stop raised {type(e).__name__}")
             return False
-        return True
-    finally:
-        _unpatch_db(monkey)
-
-
-async def test_start_clears_stale_flag() -> bool:
-    """start() стирает устаревший вердикт до создания loop-task — свежий
-    старт не должен унаследовать session_completed/needs_operator от прошлой
-    сессии (иначе самостоп после первого лида — исходный баг C1)."""
-    monkey: dict = {}
-    _patch_db(monkey)
-    try:
-        svc = ar.WorkerAutoRunnerService(
-            get_wrapper=lambda a: object(), autochat_service=None,
-        )
-        acc = 999003
-        svc._self_stop_requested[acc] = "session_completed"
-
-        # Подменяем сам loop на no-op, чтобы не крутить реальную итерацию.
-        async def _noop_loop(account_id):  # noqa: ANN001
-            return None
-
-        svc._account_loop = _noop_loop  # type: ignore
-
-        await svc.start(acc)
-
-        ok = acc not in svc._self_stop_requested
-        if not ok:
-            print("  FAIL: start() did not clear stale self-stop flag")
-
-        # cleanup: гасим созданную task
-        task = svc._tasks.pop(acc, None)
-        if task is not None and not task.done():
-            await ar._cancel_and_wait(task)
-        return ok
+        return acc not in svc._tasks
     finally:
         _unpatch_db(monkey)
 
@@ -192,12 +201,12 @@ async def _run_all() -> int:
     results = [
         ("C2: _cancel_and_wait swallows CancelledError",
          await test_cancel_and_wait_swallows_cancelled()),
-        ("C2+C1: stop() no raise + clears flag",
-         await test_stop_no_raise_and_clears_flag()),
-        ("C1: _do_self_stop clears flag",
-         await test_do_self_stop_clears_flag()),
-        ("C1: start() clears stale flag",
-         await test_start_clears_stale_flag()),
+        ("C2: stop() no raise + removes task",
+         await test_stop_no_raise_removes_task()),
+        ("C1: _try_start_dialog returns reason / None",
+         await test_try_start_dialog_returns_reason()),
+        ("C1: _do_self_stop no raise",
+         await test_do_self_stop_no_raise()),
     ]
     print()
     for name, ok in results:

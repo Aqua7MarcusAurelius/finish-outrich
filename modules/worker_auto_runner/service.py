@@ -525,10 +525,9 @@ class WorkerAutoRunnerService:
         self._tasks: dict[int, asyncio.Task] = {}
         self._lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
-        # 10.19: self-stop по транзиентной ошибке. Загорается из
-        # _try_start_dialog, гасится в _account_loop — loop сам выходит,
-        # никаких create_task с race-condition'ами. Map account_id → reason.
-        self._self_stop_requested: dict[int, str] = {}
+        # Самостоп по needs_operator: `_try_start_dialog` возвращает reason
+        # значением, `_account_loop` сам выходит через `_do_self_stop` — без
+        # долгоживущего словаря-side-channel (убрано 2026-07-13).
 
     # ─── Lifecycle (вызывается из api/main.py lifespan) ───────────────
 
@@ -811,10 +810,6 @@ class WorkerAutoRunnerService:
             cfg = await _select_one(account_id)
             assert cfg is not None
 
-            # C1 (2026-07-13): свежий старт — стираем любой устаревший вердикт
-            # self-stop, чтобы новый цикл не самостопнулся на первой итерации.
-            self._self_stop_requested.pop(account_id, None)
-
             now = _utcnow()
             schedule, ends_at = _generate_schedule(
                 now,
@@ -853,9 +848,6 @@ class WorkerAutoRunnerService:
     async def stop(self, account_id: int, *, reason: str = "manual") -> dict[str, Any]:
         async with self._lock:
             task = self._tasks.pop(account_id, None)
-        # C1 (2026-07-13): чистим любой устаревший self-stop вердикт, чтобы он
-        # не пережил границу сессии и не самостопнул следующий запуск.
-        self._self_stop_requested.pop(account_id, None)
 
         if task is not None and not task.done():
             await _cancel_and_wait(task)
@@ -1107,16 +1099,15 @@ class WorkerAutoRunnerService:
                         data={"lead_source": lead_source, "skipped_slot_at": next_at.isoformat()},
                     )
                 else:
-                    await self._try_start_dialog(
+                    stop_reason = await self._try_start_dialog(
                         account_id, username,
                         gender=gender, from_crm=from_crm,
                     )
-
-                # 6. Самостоп после транзиентной ошибки CRM-лида (10.19).
-                if account_id in self._self_stop_requested:
-                    reason = self._self_stop_requested.pop(account_id)
-                    await self._do_self_stop(account_id, reason)
-                    return
+                    # 6. needs_operator → самостоп. Reason возвращается прямо
+                    # значением (без долгоживущего _self_stop_requested).
+                    if stop_reason:
+                        await self._do_self_stop(account_id, stop_reason)
+                        return
 
         except asyncio.CancelledError:
             log.info("auto_runner[%s]: cancelled", account_id)
@@ -1300,9 +1291,17 @@ class WorkerAutoRunnerService:
         *,
         gender: str | None = None,
         from_crm: bool = False,
-    ) -> None:
+    ) -> str | None:
         """Вызывает autochat.create_session. Поведение при ошибке
-        определяется таксономией из ``_classify_send_error``:
+        определяется таксономией из ``_classify_send_error``.
+
+        Возвращает reason самостопа (`"needs_operator:<code>"`) если автомат
+        надо остановить, иначе `None` (продолжаем). Раньше reason писался в
+        долгоживущий словарь `_self_stop_requested` — заменено на прямой
+        возврат значением (нет side-channel, нет утечки вердикта за границу
+        сессии).
+
+        Таксономия:
 
         - **Успех** → LEAD_SENT, обычный flow.
         - **INVALID_LEAD** (`CANNOT_WRITE` / `USERNAME_NOT_FOUND` /
@@ -1315,8 +1314,8 @@ class WorkerAutoRunnerService:
           или нового лида, PEER_FLOOD часто снимается за 30-60 мин
           самим воркером ничего не делая.
         - **NEEDS_OPERATOR** (`SESSION_EXPIRED`, unknown) → LEAD_SKIPPED;
-          для CRM-лида reinsert в пул. Автомат ОСТАНАВЛИВАЕТСЯ через
-          `_self_stop_requested`, оператор разбирается.
+          для CRM-лида reinsert в пул. Метод возвращает reason самостопа,
+          автомат ОСТАНАВЛИВАЕТСЯ, оператор разбирается.
 
         Раньше все не-INVALID ошибки шли в NEEDS_OPERATOR ⇒ автомат
         сразу глушился. По данным событий 88% таких self-stop'ов
@@ -1426,12 +1425,12 @@ class WorkerAutoRunnerService:
         # смысла нет.
         if not from_crm or self._partner_crm is None:
             if verdict == "needs_operator":
-                self._self_stop_requested[account_id] = f"needs_operator:{err_code}"
                 log.info(
-                    "auto_runner[%s]: self-stop requested (needs_operator:%s)",
+                    "auto_runner[%s]: self-stop (needs_operator:%s)",
                     account_id, err_code,
                 )
-            elif verdict == "transient" and self._is_flood_error(err_code, err_msg):
+                return f"needs_operator:{err_code}"
+            if verdict == "transient" and self._is_flood_error(err_code, err_msg):
                 # Даже без CRM: flood от TG всё равно требует cooldown,
                 # иначе следующий слот тоже упрётся в PEER_FLOOD.
                 try:
@@ -1443,7 +1442,7 @@ class WorkerAutoRunnerService:
                         "auto_runner[%s]: flood recovery threw (manual queue), continuing",
                         account_id,
                     )
-            return
+            return None
 
         # CRM-лид: диспетчеризация по вердикту.
         if verdict == "invalid_lead":
@@ -1509,11 +1508,10 @@ class WorkerAutoRunnerService:
                 "auto_runner[%s]: reinsert failed for %s: %s",
                 account_id, username, r_err,
             )
-        self._self_stop_requested[account_id] = f"needs_operator:{err_code}"
         log.info(
-            "auto_runner[%s]: self-stop requested (needs_operator:%s)",
-            account_id, err_code,
+            "auto_runner[%s]: self-stop (needs_operator:%s)", account_id, err_code,
         )
+        return f"needs_operator:{err_code}"
 
     async def _do_self_stop(self, account_id: int, reason: str) -> None:
         """Самостоп loop-task'а изнутри.
@@ -1526,9 +1524,6 @@ class WorkerAutoRunnerService:
             "auto_runner[%s]: self-stop start reason=%s", account_id, reason,
         )
         self._tasks.pop(account_id, None)
-        # C1 (2026-07-13): вердикт отработан — чистим флаг, иначе он переживёт
-        # завершение сессии и самостопнет следующий запуск после первого лида.
-        self._self_stop_requested.pop(account_id, None)
 
         try:
             await _set_running(
