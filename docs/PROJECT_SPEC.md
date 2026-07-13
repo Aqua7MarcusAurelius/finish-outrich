@@ -877,6 +877,8 @@ docker compose exec postgres psql -U tgframework -d tgframework -c "SELECT key, 
 | `autochat_sessions` | Инициированные нами автодиалоги | autochat |
 | `autochat_reports` | HTML-отчёты по сессиям, завершённым штатным LLM-стопом (ссылка на файл в MinIO) | autochat (построитель отчётов) |
 | `crm_lead_pool` | Пул лидов, выгруженных из партнёрской CRM | partner_crm |
+| `contacted_leads` | Глобальный реестр «этому человеку уже писали» — корневой дедуп против кросс-аккаунт дублей | autochat (пишет на `create_session`) |
+| `invalid_leads` | Перманентный чёрный список лидов, которым реально нельзя написать | partner_crm |
 | `lead_evaluations` | Результаты LLM-оценки диалога как лида | lead_evaluator |
 
 ### Карта связей
@@ -898,6 +900,8 @@ messages
 settings        ← независимая, без связей
 events_archive  ← account_id → accounts (nullable для системных)
 crm_lead_pool   ← независимая, без FK
+contacted_leads ← независимая, без FK (ключ username; telegram_user_id для дедупа)
+invalid_leads   ← независимая, без FK (чёрный список по username)
 ```
 
 ---
@@ -1176,7 +1180,7 @@ CRM-интеграция (`0012`) добавила 7 ключей:
 | `created_at` | timestamp | |
 | `updated_at` | timestamp | |
 
-**Уникальность:** partial unique index по `(account_id, telegram_user_id)` при `status IN ('active','paused','starting')` — нельзя завести две активные сессии на одну пару.
+**Уникальность — два слоя.** (1) partial unique index по `(account_id, telegram_user_id)` при `status IN ('active','paused','starting')` — нельзя завести две активные сессии на одну пару у одного воркера. (2) Поверх него — **глобальный дедуп по личности**: `create_session` перед отправкой делает `SELECT 1 FROM contacted_leads WHERE telegram_user_id = $1`, и если этому человеку уже писал ЛЮБОЙ аккаунт — бросает `AlreadyContacted` (код `ALREADY_CONTACTED`, 409). Реестр `contacted_leads` пишется атомарно сразу после успешной отправки первого сообщения (ключ — `telegram_user_id`, а не изменчивый `username`), поэтому «один человек = одно касание навсегда, любым аккаунтом» держится и при рестартах, и при реинзерте лида в пул. Подробнее — в разделе «AutoChat» (13.2).
 
 ---
 
@@ -1208,6 +1212,47 @@ HTML-выгрузка по сессии, завершённой штатным L
 | `fetched_at` | timestamp | когда выгружен из CRM |
 
 Индекс `(gender, fetched_at)` — для быстрого подбора лида воркером. `username UNIQUE` защищает от повторной выгрузки одного лида: если CRM из-за гонки/ошибки вернёт его ещё раз, INSERT упадёт по unique, и это штатно (запись уже есть).
+**Модель раздачи — простая (2026-07-13, решение владельца): `claim = DELETE`.** `claim_lead_for_account` в одной транзакции выбирает самого старого подходящего лида (`ORDER BY fetched_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED`, с фильтром по полу и `NOT EXISTS` в `contacted_leads`) и **сразу удаляет** его из пула. Не удалось написать → `reinsert_into_pool` просто вставляет лида обратно (`ON CONFLICT (username) DO UPDATE SET fetched_at = NOW()` — уходит в конец очереди), без штрафов и счётчиков. Поэтому `pool_size` = `COUNT(*)` без фильтров, а `list_pool` отдаёт все строки — они все свободные.
+
+**Vestigial-колонки.** Физически в схеме ещё присутствуют `claimed_at TIMESTAMPTZ` и `assigned_account_id INTEGER` (миграция `0018`) и `attempts INTEGER` (миграция `0016`) — наследие прежней модели «claim помечает `claimed_at`, reinsert инкрементит `attempts`, reaper освобождает сирот». Простая `claim = DELETE`-модель их **не читает и не пишет**; частичный индекс `crm_lead_pool_free_idx (gender, fetched_at) WHERE claimed_at IS NULL` тоже больше не используется для подбора. Колонки и индекс оставлены как балласт и будут дропнуты отдельной миграцией после подтверждения простой модели живым прогоном. Механизмы `MAX_LEAD_ATTEMPTS`, `reap_stale_claims` и авто-push `invalid` по счётчику наших сбоёв из кода удалены.
+
+---
+
+### `contacted_leads` — глобальный реестр «уже писали»
+
+Единый на всю ферму реестр личностей, которым мы когда-либо отправили первое сообщение (любым аккаунтом). **Корень дедупа** против кросс-аккаунт дублей («2 воркера — один лид»): прежний дедуп при `create_session` был per-account, поэтому разные аккаунты свободно писали одному человеку. Writer — модуль autochat (миграция `0019`, источник бэкфилла переопределён миграцией `0021`).
+
+| Поле | Тип | Смысл |
+|---|---|---|
+| `username` | text | PK, хранится в нижнем регистре (`lower()`) |
+| `telegram_user_id` | bigint | tg id личности — по нему идёт железобетонный дедуп в `create_session` (nullable) |
+| `account_id` | int | каким аккаунтом впервые написали (nullable) |
+| `contacted_at` | timestamptz | `NOT NULL DEFAULT NOW()` — когда впервые написали |
+
+Индекс `(telegram_user_id)` — для дедупа по личности.
+
+**Как наполняется.** (1) Рантайм: `create_session` атомарно делает `INSERT ... ON CONFLICT (username) DO NOTHING` сразу после успешного `wrapper.send_message`, ещё **до** `bus.publish`. (2) Бэкфилл — из durable `events_archive` (события `type='autochat.started'`, содержат `username` + `telegram_user_id`), **а не** из `autochat_sessions`: миграция `0021` заменила подход `0019`, потому что сессии удаляются при wipe диалога → реестр терял записи (на проде разрыв ~69%: 1520 против 4845 фактических контактов), и партнёр переназначал уже-написанных, а дедуп их не узнавал.
+
+**Как используется.** `create_session` перед отправкой делает `SELECT 1 FROM contacted_leads WHERE telegram_user_id = $1` → если есть, `raise AlreadyContacted` (код `ALREADY_CONTACTED`, HTTP 409); в auto_runner это benign-skip (как `SESSION_ALREADY_ACTIVE`). Это в дополнение к per-account partial-unique индексу `(account_id, telegram_user_id)` на `autochat_sessions`. `claim_lead_for_account` и рефилл `_take_into_pool` дополнительно пропускают любого, кто уже в реестре (дешёвый пре-фильтр по `username`).
+
+---
+
+### `invalid_leads` — перманентный чёрный список
+
+Лиды, которым **реально нельзя написать** — чтобы партнёр не подсовывал их повторно пачками. Writer — модуль partner_crm (миграция `0018`).
+
+| Поле | Тип | Смысл |
+|---|---|---|
+| `username` | text | PK |
+| `reason` | text | причина занесения (`pushed_invalid_via_finalize`, `seeded_from_history`, …) |
+| `invalidated_at` | timestamptz | `NOT NULL DEFAULT NOW()` — когда занесён |
+| `attempts_seen` | int | `NOT NULL DEFAULT 0` — vestigial-счётчик от прежней attempts-модели, сейчас не наполняется |
+
+Индекс `(invalidated_at DESC)`.
+
+**Как наполняется — только по реальному «нельзя написать».** `push_lead_finalized(username, 'invalid')` при финальном push'е `invalid` партнёру делает `INSERT ... ON CONFLICT DO UPDATE`. Пуш `invalid` наружу происходит **только** по кодам `CANNOT_WRITE` / `USERNAME_NOT_FOUND` / `USERNAME_UNAVAILABLE` (ветка `invalid_lead` в auto_runner). Наши собственные сбои (`PEER_FLOOD`, `FLOOD_WAIT`, `GENERATION_FAILED`) лида в чёрный список **не** заносят — при них идёт reinsert без штрафа. Прежний авто-push `invalid` по счётчику наших неудач удалён, а миграция `0020` разблокировала уже ошибочно забракованных (`reason='max_attempts_exhausted'`), которых нет в `contacted_leads`. Сид при апгрейде — из `events_archive` (`partner_crm.status_pushed` со `status='invalid'` за 30 дней).
+
+**Как используется.** Рефилл `_take_into_pool`, поллер и `claim_lead_for_account` пропускают username'ы из `invalid_leads`.
 
 ---
 
@@ -1246,6 +1291,8 @@ HTML-выгрузка по сессии, завершённой штатным L
 | Реакции сообщения | `(message_id)` на `reactions` |
 | Диалоги из CRM | partial-индекс по `from_crm = TRUE` на `dialogs` |
 | Подбор лида | `(gender, fetched_at)` на `crm_lead_pool` |
+| Дедуп по личности | `(telegram_user_id)` на `contacted_leads` |
+| Лента чёрного списка | `(invalidated_at DESC)` на `invalid_leads` |
 
 
 ---
@@ -1650,8 +1697,8 @@ Telethon-fingerprint на всех воркерах — это маркер ав
 
 - **Персистентный `StringSession`.** Объект сессии создаётся один раз в `TelegramWrapper.__init__` (`self._session`) и переезжает во все последующие клиенты. Telethon эволюционирует его на месте — entity-кэш, updates-state (pts/qts/date) и server salt сохраняются между реконнектами. Клиент строится с `auto_reconnect=True`, `connection_retries` (генерозно, ~10), `retry_delay`, `catch_up=True`, `flood_sleep_threshold=60`, `receive_updates=True`.
 - **Сетевые блипы держит Telethon сам**, на том же клиенте, прозрачно — без событий `worker.restarted` и без потери приёма (хендлеры и кэш переживают внутренний авто-реконнект).
-- **Свитч прокси — строго последовательный.** Супервайзер в `Worker.run` вмешивается только когда активный прокси лёг надолго (Telethon исчерпал реконнект → `client.disconnected`). Тогда сначала полный `disconnect()` старого клиента, потом `connect_via()` нового с тем же `self._session`. **Никогда две живые сессии одновременно.**
-- **Живость прокси проверяется транспортом, а не сессией.** Пока воркер на fallback, фоновый `probe_proxy` делает TCP-connect через SOCKS до нейтрального хоста (`core.proxy.check_socks5`, `1.1.1.1:443`) — без `TelegramClient` и без auth-key. Ожил → супервайзер (единый владелец соединения) делает последовательный свитч обратно на основной. Между попытками реконнекта — бэкофф.
+- **Свитч прокси — строго последовательный.** Супервайзер в `Worker.run` вмешивается только когда активный прокси лёг надолго (Telethon исчерпал реконнект → `client.disconnected`). Перед свитчем — гистерезис `DROP_RETRIES=2`: сначала до 2 попыток реконнекта на ТЕКУЩЕМ прокси (пауза `DROP_RETRY_INTERVAL_SEC=15`с), и только если он действительно мёртв — переезд. Гасит churn на живых прокси, которые моргнули чуть дольше таймаута Telethon. При свитче — сначала полный `disconnect()` старого клиента, потом `connect_via()` нового с тем же `self._session`. **Никогда две живые сессии одновременно.**
+- **Живость прокси проверяется транспортом, а не сессией.** Пока воркер на fallback, фоновый `probe_proxy` делает TCP-connect через SOCKS до боевых Telegram-DC (`core.proxy.check_socks5`, цели `TELEGRAM_DC_TARGETS` = `149.154.167.51:443` (DC2) / `149.154.175.53:443` (DC1), ok если достижим хотя бы один) — без `TelegramClient` и без auth-key. Проверять живость по нейтральному хосту (`1.1.1.1:443`, `NEUTRAL_TARGET`) отказались: серверный прокси может отлично ходить в Telegram, но резать сторонние адреса — и тогда probe ложно объявлял хороший прокси мёртвым и воркер зря переезжал на fallback; `1.1.1.1` остался целью только для диагностики (`scripts/proxy_diag.py`). Ожил → супервайзер (единый владелец соединения) делает последовательный свитч обратно на основной. Между попытками реконнекта — бэкофф.
 
 ```
 Основной прокси ── блип ──▶ Telethon сам реконнектит (тот же клиент, приём не прерывается)
@@ -1659,6 +1706,8 @@ Telethon-fingerprint на всех воркерах — это маркер ав
                                     └── фоновый ТРАНСПОРТНЫЙ probe основного (без сессии)
                                     └── основной ожил → последовательный свитч обратно
 Оба прокси недоступны ──▶ супервайзер ретраит с бэкоффом (как TG Desktop «Connecting…»)
+                          └── раз в OUTAGE_ALERT_EVERY=5 кругов — SYSTEM_ERROR в шину
+                              (раньше статус залипал RUNNING/STARTING — мониторинг врал)
 ```
 
 > **Почему так (фон).** Раньше на каждый реконнект и каждый свитч создавался НОВЫЙ клиент из исходной строки сессии (сброс кэша/updates-state), а фоновый probe поднимал **вторую реальную сессию** через другой прокси. Telegram видел один auth-key с двух IP → `AUTH_KEY_DUPLICATED` → ревок → массовый разлогин. Костыли «warm-up entity-кэша», «re-subscribe handlers» и `force_catch_up` компенсировали сброс состояния. Часть A убрала фундамент проблемы: один клиент + авто-реконнект/`catch_up` Telethon + последовательный свитч + транспортный probe — три костыля удалены как класс.
@@ -1897,7 +1946,7 @@ class ReauthIn(BaseModel):
 
 - `parse_socks5(url)` → кортеж для Telethon `(socks.SOCKS5, host, port, rdns=True, user, pass)`; `rdns=True` — DNS резолвится на стороне прокси. Ошибка при не-`socks5` схеме или отсутствии host/port.
 - `mask(url)` → маскирует `user:pass` для логов и публикаций в шину: `socks5://***@host:port`.
-- `check_socks5(url, timeout=5.0)` → асинхронная TCP-проверка через `pysocks` (в `asyncio.to_thread`): открывает SOCKS5-коннект к `1.1.1.1:443` (`TEST_HOST`/`TEST_PORT`). Возврат `{"proxy": masked, "ok": True, "latency_ms": N}` либо `{"proxy": masked, "ok": False, "error": "..."}`. Используется в `/auth/start`, воркере (`wrapper.py`) и endpoint'е `/system/proxy-check`.
+- `check_socks5(url, timeout=5.0, targets=None)` → асинхронная TCP-проверка через `pysocks` (в `asyncio.to_thread`): открывает SOCKS5-коннект к боевым Telegram-DC (`TELEGRAM_DC_TARGETS` = `149.154.167.51:443` / `149.154.175.53:443`), ok если достижим **хотя бы один** (одиночный DC может быть на обслуживании). По нейтральному хосту (`1.1.1.1:443`, `NEUTRAL_TARGET`) больше не проверяем — серверный прокси может отлично ходить в Telegram, но резать сторонние адреса и потому ложно выглядеть мёртвым; `1.1.1.1` остался целью только для диагностики (`targets=[NEUTRAL_TARGET]`, `scripts/proxy_diag.py`). Возврат `{"proxy": masked, "ok": True, "latency_ms": N, "target": "host:port"}` либо `{"proxy": masked, "ok": False, "error": "..."}`. Используется в `/auth/start`, воркере (`wrapper.py`) и endpoint'е `/system/proxy-check`.
 
 #### Colon-формат во вводе (UI)
 
@@ -2242,7 +2291,7 @@ Pydantic-валидация PATCH: `queue: list[str]` (`max_length=1000`), `wind
 
 `_account_loop` на каждой итерации:
 1. Читает свежее состояние из БД (`schedule`, `session_ends_at`) **первым делом** и проверяет **естественный cap**: если `NOW() >= session_ends_at` — self-stop c `reason=session_completed`. Эта проверка идёт **до** ожидания воркера (M4, 2026-07-13): раньше для разлогиненного аккаунта, чей wrapper так и не поднимался, петля крутилась вечно и `is_running` залипал — теперь срок сессии жёстко её ограничивает.
-2. Проверяет живость воркера (`get_wrapper`) с grace-периодом (Fix #12/#18): пока wrapper ни разу не был виден живым — молча ждёт (стартовый race с `worker_manager`); после первого появления даёт до `MAX_WRAPPER_MISSES × WRAPPER_MISS_SLEEP_SEC` (≈9 мин), потом self-stop `reason=worker_offline`.
+2. Проверяет живость воркера (`get_wrapper`) с grace-периодом (Fix #12/#18, R-2): пока wrapper ни разу не был виден живым — ждёт стартовый race с `worker_manager`, но не молча: на каждом тике пишет честный `last_status='ожидание воркера (запуск)'` (R-2, 2026-07-13: раньше UI до `session_ends_at` показывал залипший `started`), и если воркер так и не поднялся за `STARTUP_MAX_WAIT_SEC` (~30 мин — разлогин / невалидная прокси / оператор не стартовал воркер) — честно self-stop с `last_status='воркер не поднялся (запуск)'` и `reason=worker_offline_startup`. После первого появления wrapper'а таймер переключается на «уже видели, но пропал»: до `MAX_WRAPPER_MISSES × WRAPPER_MISS_SLEEP_SEC` (≈9 мин), потом self-stop `reason=worker_offline`.
 3. Если расписание пусто (окно ещё не истекло, но лиды кончились) — self-stop c `reason=session_completed`.
 4. Спит до `schedule[0]` чанками по 5 сек (`_chunked_sleep`) с проверкой живости воркера. После сна: если воркер уже упал — на следующую итерацию.
 5. Атомарно снимает `schedule[0]` (`_pop_first_schedule`, `FOR UPDATE`). Достаёт лида: `manual` → `_pop_first_username` из `queue`; `partner_crm` → claim из общего пула с учётом `target_gender`. Пусто → `auto_runner.queue_empty` с `{skipped_slot_at}` и **следующая итерация без ожидания** (график двигается дальше, не сдвигается).
@@ -2267,8 +2316,8 @@ Pydantic-валидация PATCH: `queue: list[str]` (`max_length=1000`), `wind
 `_try_start_dialog` классифицирует ошибку autochat (`_classify_send_error`) в один из трёх вердиктов:
 
 - **`invalid_lead`** (`USERNAME_NOT_FOUND`, `USERNAME_UNAVAILABLE`, `CANNOT_WRITE`) — лид физически недоступен; для CRM финализируется как `invalid` у партнёра. Автомат **продолжает** со следующего слота.
-- **`transient`** (`SEND_FAILED_TRANSIENT`=PEER_FLOOD, `FLOOD_WAIT`, `GENERATION_FAILED`) — лид нормальный, но эта попытка не удалась. Для CRM лид возвращается в пул **со штрафом** (`reinsert_into_pool(count_attempt=True)` — инкремент `attempts`, при исчерпании `MAX_LEAD_ATTEMPTS` финализация `invalid`). При TG-флуде дополнительно триггерится SpamBot-recovery + cooldown. Автомат **продолжает**.
-- **`needs_operator`** (`SESSION_EXPIRED`, `WORKER_NOT_RUNNING`, неизвестные коды) — сломались **мы**. Для CRM лид возвращается в пул **без штрафа** (`reinsert_into_pool(count_attempt=False)` — H3, 2026-07-13: раньше наши простои жгли валидный лид как `invalid` и блокировали его навсегда). Автомат **останавливается** до вмешательства оператора.
+- **`transient`** (`SEND_FAILED_TRANSIENT`=PEER_FLOOD, `FLOOD_WAIT`, `GENERATION_FAILED`) — это **наши** причины (общий `api_id` → троттлинг TG; временная недоступность OpenRouter), а НЕ свойство лида. Для CRM лид возвращается в пул **без штрафа** (`reinsert_into_pool(account_id, username, gender)` — просто `INSERT … ON CONFLICT (username) DO UPDATE SET fetched_at=NOW()`), `invalid` партнёру **не пушится никогда**. При TG-флуде дополнительно триггерится SpamBot-recovery + cooldown. Автомат **продолжает**. Решение владельца (2026-07-13): механизм `attempts` / `MAX_LEAD_ATTEMPTS` и параметр `count_attempt` **убраны** — раньше на 3-й наш сбой валидный лид сгорал в `invalid` у партнёра (порча чужой воронки).
+- **`needs_operator`** (`SESSION_EXPIRED`, `WORKER_NOT_RUNNING`, неизвестные коды) — сломались **мы**. Для CRM лид возвращается в пул **без штрафа** (`reinsert_into_pool(account_id, username, gender)` — простая модель не штрафует лида вообще; `invalid` не пушится). Автомат **останавливается** до вмешательства оператора.
 
 Отдельный benign-случай: `SESSION_ALREADY_ACTIVE` (на паре уже есть активная сессия — лид уже прописан) — **пропускаем слот и продолжаем**, лид в пул не возвращаем, invalid не пушим, автомат НЕ стопаем (фикс дубля 2026-07-13: раньше это уходило в `needs_operator` self-stop и глушило весь авто-раннер аккаунта).
 
@@ -2959,6 +3008,7 @@ WHERE status IN ('active', 'paused', 'starting');
 ```
 
 Завершённые (`failed`, `stopped`) пары не блокируют повторный запуск с тем же собеседником.
+**Глобальный дедуп по личности (реестр `contacted_leads`).** Partial unique index выше защищает только пару *в пределах одного воркера* и только пока сессия жива — при смене `username`, удалении завершённых сессий (wipe) или реинзерте лида в пул он не мешал второму аккаунту написать тому же человеку. Поэтому корневой дедуп вынесен в отдельный durable-реестр `contacted_leads` (`username TEXT PK`, `telegram_user_id BIGINT` c индексом, `account_id INT`, `contacted_at TIMESTAMPTZ`). В `create_session` **перед** отправкой выполняется `SELECT 1 FROM contacted_leads WHERE telegram_user_id = $1` — если человеку уже писал любой аккаунт, бросается `AlreadyContacted` (409, код `ALREADY_CONTACTED`; в auto-runner это benign-skip, как `SESSION_ALREADY_ACTIVE`). Ключ дедупа — `telegram_user_id` (личность), а не изменчивый `@username`. Запись в реестр делается **атомарно сразу после** успешной `wrapper.send_message`, ДО любых `bus.publish` (`INSERT ... ON CONFLICT (username) DO NOTHING`): раньше запись шла в самом конце флоу, после нескольких `await bus.publish`, и если Redis моргал между отправкой и записью — человек оказывался «написан, но не зарегистрирован», лид реинзертился и его писал второй аккаунт.
 
 ### 13.3. State machine сессии
 
@@ -3014,6 +3064,7 @@ _media_ready  (asyncio.Event)  ← сигнал «медиа готово» → 
 **Зачем разделять planner и sender:** собеседник может написать, пока мы отправляем предыдущий ответ. С разделением новое сообщение запускает новый reply_timer → новая генерация идёт параллельно с текущим send → результат ложится в очередь, и sender доберётся до него, закончив текущий набор. Для пользователя это выглядит естественно: две пачки ответов подряд.
 
 **Зачем сериализовать отправку:** только один sender_loop на сессию, никогда два. Без этого при двух параллельных генерациях второй ответ начал бы печататься, пока первый ещё не дописан — в UI Telegram это глюк.
+**Зачем сериализовать генерацию (`self._generating`).** И `planner_loop`, и принудительная `force_generate_reply` (её дёргает догон missed-inbound по событию `worker.started` при рестарте воркера) теперь идут через ОДИН `asyncio.Lock` `self._generating`. Раньше `planner_loop` генерил без лока, и при рестарте воркера на одно inbound уходило ДВА ответа: `force_generate_reply` генерил ответ A, а `reply_timer` планнера через 30с — ответ B. Внутри лока — re-check: если `last_our_activity_at >= last_their_message_at` (кто-то уже ответил на последнее inbound), генерация пропускается. `last_our_activity_at` метится СРАЗУ после постановки сегментов в `send_queue` (а не только после реальной отправки в `_send_segment`), иначе селектор missed-inbound (`last_their > last_our`) продолжал бы выбирать эту сессию до конца отправки, и повторный `worker.started` регенерил бы дубль. Если генерация уже идёт, второй вызов `force_generate_reply` просто выходит (`skipped: already_generating`).
 
 #### Bump-pattern (дебаунс reply_timer)
 
@@ -3157,20 +3208,23 @@ _by_tg_user:     {(account_id, telegram_user_id): session_id}
 #### `create_session` — синхронный флоу `POST /autochat/start`
 
 ```
-1. проверка worker_running           (быстро; иначе 409 WORKER_NOT_RUNNING)
-2. resolve_username                   (1 сетевой; 404 USERNAME_NOT_FOUND / 400 USERNAME_UNAVAILABLE)
-3. проверка пустого initial-промта    (иначе 409 PROMPT_NOT_CONFIGURED)
-4. build_initial_messages + LLM       (5–30 сек)
-5. INSERT ... status='starting' ON CONFLICT DO NOTHING RETURNING *
-6. wrapper.send_message               (1 сетевой; 409 CANNOT_WRITE при блоке/privacy)
-7. publish autochat.started
-8. publish message.received           (history запишет)
-9. publish autochat.initial_sent
-10. UPDATE status='active'
-11. создать AutoChatSession, зарегистрировать в индексах, start()
+1. проверка worker_running            (быстро; иначе 409 WORKER_NOT_RUNNING)
+2. проверка пустого initial-промта     (иначе 409 PROMPT_NOT_CONFIGURED)
+3. resolve_username                    (1 сетевой; 404 USERNAME_NOT_FOUND / 400 USERNAME_UNAVAILABLE)
+4. дедуп per-account                    (active/paused/starting на пару → 409 SESSION_ALREADY_ACTIVE)
+5. ГЛОБАЛЬНЫЙ дедуп по личности         (SELECT 1 FROM contacted_leads WHERE telegram_user_id — писал любой аккаунт → 409 ALREADY_CONTACTED)
+6. build_initial_messages + LLM        (5–30 сек)
+7. INSERT ... status='starting' ON CONFLICT DO NOTHING RETURNING *
+8. publish autochat.started
+9. wrapper.send_message                (1 сетевой; 409 CANNOT_WRITE при блоке/privacy)
+10. АТОМАРНО INSERT contacted_leads     (username, telegram_user_id, account_id; сразу после успешной отправки, ДО любых publish)
+11. publish message.received           (history запишет)
+12. publish autochat.initial_sent
+13. UPDATE status='active'
+14. создать AutoChatSession, зарегистрировать в индексах, start()
 ```
 
-Клиент ждёт весь флоу — `/autochat/start` возвращает готовую сессию, 5–30с приемлемо. `status='starting'` ставится сразу после INSERT и переводится в `'active'` только после успешного send: инвариант «`status='active'` ⇒ есть запущенная задача» сохраняется (между INSERT и send может улететь исключение). Защита от гонки — partial unique index + `INSERT ... ON CONFLICT DO NOTHING RETURNING *`: при двух одновременных запросах второй получит `None` и вернёт `SessionAlreadyActive`.
+Клиент ждёт весь флоу — `/autochat/start` возвращает готовую сессию, 5–30с приемлемо. `status='starting'` ставится сразу после INSERT и переводится в `'active'` только после успешного send: инвариант «`status='active'` ⇒ есть запущенная задача» сохраняется (между INSERT и send может улететь исключение). Защита от гонки — partial unique index + `INSERT ... ON CONFLICT DO NOTHING RETURNING *`: при двух одновременных запросах второй получит `None` и вернёт `SessionAlreadyActive`. Поверх этого — глобальный дедуп по личности через реестр `contacted_leads` (см. 13.2): `SELECT ... WHERE telegram_user_id` перед LLM отсекает повторное касание человека любым аккаунтом (`AlreadyContacted`), а атомарная запись в `contacted_leads` сразу после успешной отправки (шаг 10, до `bus.publish`) закрывает окно «отправили, но не зарегистрировали».
 
 #### Иерархия ошибок (`errors.py`)
 
@@ -3180,7 +3234,8 @@ _by_tg_user:     {(account_id, telegram_user_id): session_id}
 AutoChatError (base)
 ├── AccountNotFound          404
 ├── WorkerNotRunning         409
-├── SessionAlreadyActive     409
+├── SessionAlreadyActive     409   ← активная сессия ЭТОГО аккаунта на пару
+├── AlreadyContacted         409   ← глобальный дедуп: человеку (telegram_user_id) уже писал ЛЮБОЙ аккаунт (реестр contacted_leads); в auto-runner — benign skip
 ├── UsernameNotFoundError    404
 ├── UsernameUnavailableError 400
 ├── CannotWrite              409   ← заблокировали / privacy / Premium-only (лид невалиден)
@@ -3655,6 +3710,9 @@ CRM поддерживает и WebSocket (`new_message`, `typing`, `user_status
 **`dialog_statuses`:** добавлено поле `partner_terminal_status TEXT` (NULL = промежуточный пузырь, иначе — код для CRM). Сиды переписаны с 4 (Общаемся/Ждём ответ/Готово/Провал) на 6 пузырей (см. ниже). Перезапись безопасная: каталог трогается, только если он пуст ИЛИ совпадает с дефолтом из миграции 0009; если оператор уже кастомил статусы — набор остаётся, несоответствие логируется на шину (система не угадывает, что слать в CRM).
 
 **`crm_lead_pool` (владелец — `partner_crm`):** `id PK`, `username TEXT UNIQUE`, `gender TEXT NULL`, `fetched_at timestamp`; индекс `(gender, fetched_at)` для быстрого подбора.
+**`contacted_leads` (владелец — `partner_crm`, реестр дедупа):** `username TEXT PK` (lower-case), `telegram_user_id BIGINT`, `account_id INT`, `contacted_at TIMESTAMPTZ`; индекс по `telegram_user_id`. Кросс-аккаунтный реестр «кому уже писали хоть с какого аккаунта» — корневая защита от повторного прописывания одного человека (см. §19.5). Пишется АТОМАРНО сразу после успешной `wrapper.send_message`, ДО `bus.publish`, через `INSERT ... ON CONFLICT (username) DO NOTHING` — окно «отправили, но не записали» закрыто. Источник бэкфилла реестра — durable `events_archive` (`type='autochat.started'`, содержит `username` + `telegram_user_id`), а НЕ `autochat_sessions` (сессии удаляются при wipe → реестр терял бы ~69% контактов; миграция 0021 заменила подход 0019).
+
+**`invalid_leads` (владелец — `partner_crm`, blacklist):** `username TEXT PK`, `reason TEXT`, `invalidated_at TIMESTAMPTZ`, `attempts_seen INT`. Наполняется в `push_lead_finalized` при `terminal_status='invalid'` (реальное «нельзя написать»: `CANNOT_WRITE` / `USERNAME_NOT_FOUND` / `USERNAME_UNAVAILABLE`). `poller`/`_take_into_pool`/`claim_lead_for_account` пропускают username'ы из этого списка, чтобы партнёр не мог подсунуть заведомо мёртвого лида повторно. Больше НЕ наполняется по счётчику наших сбоёв — механизм max-attempts удалён (2026-07-13).
 
 **`lead_evaluations` (владелец — `lead_evaluator`):**
 
@@ -3704,7 +3762,7 @@ lead_evaluations
 
 Единственная точка общения приложения с CRM. Файлы: `__init__.py`; `errors.py` (`PartnerCrmError` → `NotConfigured`/`CrmHttpError`/`InvalidStatus`); `client.py` (async httpx-обёртка над `/api/l1/*`); `service.py` (`PartnerCrmService`); `routes.py`; `poller.py`; `finalizer.py`. Один httpx-клиент на всё приложение (keep-alive); в lifespan создаётся один `PartnerCrmService`, владеющий клиентом и закрывающий его на shutdown.
 
-`PartnerCrmService` методы: `pool_size`, `list_pool`, `reap_stale_claims`, `refill_pool`, `claim_lead_for_account`, `reinsert_into_pool`, `push_lead_started`, `push_lead_finalized`, `get_preferences`. `pool_size` и `list_pool` считают/показывают **только свободных** лидов (`WHERE claimed_at IS NULL`) — согласованно с claim-семантикой Fix #13 (claim помечает `claimed_at`, а не DELETE). Иначе счётчик инфлировался бы лидами «в работе» и refill не срабатывал (H1, 2026-07-13).
+`PartnerCrmService` методы: `pool_size`, `list_pool`, `refill_pool`, `claim_lead_for_account`, `reinsert_into_pool`, `push_lead_started`, `push_lead_finalized`, `get_preferences`. **Простая модель (2026-07-13, решение владельца):** `claim_lead_for_account` СРАЗУ удаляет забранного лида из пула (`FOR UPDATE SKIP LOCKED` + `DELETE` в одной транзакции), поэтому ВСЕ строки `crm_lead_pool` — свободные: `pool_size` = `SELECT COUNT(*) FROM crm_lead_pool` без фильтра, `list_pool` показывает все строки. `reinsert_into_pool` просто вставляет лида обратно (`INSERT ... ON CONFLICT (username) DO UPDATE SET fetched_at=NOW()`, освежает позицию в очереди) — без attempts/штрафа, всегда возвращает `True`. `reap_stale_claims` УДАЛЁН: раз claim не оставляет `claimed_at`, зависших claim'ов не бывает и реапер не нужен. Колонки `claimed_at`/`assigned_account_id`/`attempts` остались в схеме как **vestigial** (не используются, дроп отдельной миграцией позже).
 
 #### Эндпоинты `/partner-crm/*`
 
@@ -3721,19 +3779,16 @@ lead_evaluations
 
 ```
 если модуль не сконфигурирован           → пропускаем
-reap_stale_claims()                       → вернуть в пул зависшие claim'ы (>2ч)
 если pool_size >= pool_low_threshold     → пропускаем
 если нет ни одного активного CRM-воркера → пропускаем
 иначе                                    → service.refill_pool(refill_batch_size)
 ```
 
-**Реапер осиротевших claim'ов** (`reap_stale_claims`, H1, 2026-07-13) зовётся первым на каждом тике, **до** подсчёта размера. Claim (Fix #13) помечает `claimed_at=NOW()`; освобождается через `reinsert_into_pool` или DELETE при финализации. Но claim, брошенный крахом воркера / рестартом app **между claim и `create_session`** (лид заклеймлен, но так и не прописан), сам не освобождается — навсегда «съедает» свободный лид, а `pool_size` (только свободные) проседает. Реапер возвращает такие сироты в пул. Симптом до фикса: ~187 повисших claim'ов после ночных рестартов, refill вхолостую, воркеры получали `queue_empty`.
-
-> **Критично (фикс дубля, 2026-07-13):** реапер освобождает только `claimed_at < NOW()-2h` **И** `NOT EXISTS` autochat-сессии по этому username. Успешно прописанный CRM-лид остаётся в пуле как `claimed` до терминальной финализации, а беседа легко длится дольше 2ч. Без условия «нет сессии» реапер освобождал бы уже-прописанного лида → воркер клеймил его заново → `create_session` (гейт блокирует только `starting/active/paused`, но **не** `stopped`) либо повторно писал человеку (дубль), либо на активной беседе бросал `SessionAlreadyActive` → авто-раннер уходил в needs_operator self-stop (аккаунт замолкал). Оставить лида claimed (лик) безопаснее, чем написать повторно; терминальная финализация уберёт его штатно.
+**Реапера осиротевших claim'ов больше нет** (`reap_stale_claims` удалён, 2026-07-13). В простой модели `claim_lead_for_account` СРАЗУ удаляет лида из пула (`DELETE`), поэтому «повисших» claim'ов физически не бывает — освобождать нечего, реапер не нужен. Раньше (Fix #13) claim помечал `claimed_at=NOW()`, и лид, брошенный крахом воркера / рестартом app между claim и `create_session`, навсегда «съедал» свободный лид (симптом: ~187 повисших claim'ов после ночных рестартов, refill вхолостую, `queue_empty`). Реапер такие сироты возвращал, но требовал ещё и guard'а «нет autochat-сессии по username», иначе воскрешал уже-прописанного лида и провоцировал повторную пропись (дубль). Отказ от `claimed_at` убрал сам класс проблемы. Защита от повторного прописывания теперь держится не на реапере, а на кросс-аккаунтном реестре `contacted_leads` + глобальном дедупе по `telegram_user_id` в `create_session` (см. §19.5).
 
 «Активный CRM-воркер» — аккаунт с `lead_source='partner_crm'`, `is_active=TRUE` и `worker_auto_runners.is_running=TRUE`. Проверка нужна, чтобы не выбирать чужую квоту `max_concurrent_leads` CRM, пока никто не работает. Тик через `wait_for(stop_event.wait(), timeout=interval)` — мгновенное пробуждение на shutdown. Ошибки тика гасятся (`except Exception` + `log.exception`), таска не падает. INFO — на «refill triggered», DEBUG — на скипы (против лог-спама раз в 60 с).
 
-`refill_pool` делает `GET /api/l1/leads?status=new` (забирает ВСЕ уже назначенные нам лиды с `lead_status=new`) и на каждого сначала `POST /api/l1/leads/:u/status {in_progress}`, затем `INSERT ... ON CONFLICT (username) DO NOTHING` (защита от повторной выдачи того же лида CRM). `request-new` (общий пул партнёра) больше не зовётся — раньше звался как fallback при пустом `?status=new`, но «воровал» лидов у других L1-операторов. Параметр `count` остаётся в сигнатуре для совместимости с UI/поллером, но логику не определяет — берётся столько, сколько прислал `?status=new`. Возвращает счётчики, публикуемые в событии.
+`refill_pool` делает `GET /api/l1/leads?status=new` (забирает ВСЕ уже назначенные нам лиды с `lead_status=new`) и на каждого сначала пропускает уже-контактированных (`contacted_leads`) и blacklist (`invalid_leads`), затем `POST /api/l1/leads/:u/status {in_progress}` и `INSERT ... ON CONFLICT (username) DO NOTHING` (защита от повторной выдачи того же лида CRM); счётчики `skipped_contacted` / `skipped_invalid` в результате отражают эти пропуски. `request-new` (общий пул партнёра) больше не зовётся — раньше звался как fallback при пустом `?status=new`, но «воровал» лидов у других L1-операторов. Параметр `count` остаётся в сигнатуре для совместимости с UI/поллером, но логику не определяет — берётся столько, сколько прислал `?status=new`. Возвращает счётчики, публикуемые в событии.
 
 #### Забор лида воркером (consume пула)
 
@@ -5309,6 +5364,19 @@ WHERE a.lead_source = 'partner_crm' AND war.is_running = TRUE
 | 7 | 1 день (миграция+wrapper) | Дополнительная защита fingerprint |
 
 Рекомендуемый порядок: 2 → 4 → 1 → 5 → 3 → 6 → 7. Без #6 ферма рассыпается раз в 1–2 недели.
+### 19.5. Повторное прописывание одного лида (дубли) — ЗАКРЫТО (2026-07-13)
+
+**Симптом.** Одному и тому же человеку уходило стартовое сообщение дважды (разными аккаунтами или после рестарта тем же). Наблюдалось как одиночные дубль-отправки после деплоя (`mad_black_fox`) и исторический хвост (~66 дублей более старым низкорейтовым путём — уже-прописанный лид возвращался в пул через error-reinsert).
+
+**Корневые причины (две).** (1) **Логика:** гейт уникальности в `create_session` был per-account (partial-unique `(account_id, telegram_user_id)` для статусов `starting/active/paused`) — разные аккаунты свободно писали одному человеку; реестр `contacted_leads` проверялся только в CRM-claim, а не в самом `create_session`. (2) **Данные:** реестр `contacted_leads` (подход 0019) бэкфилился из `autochat_sessions`, которые удаляются при wipe — после сброса реестр терял ~69% контактов (на проде 1520 vs 4845 реальных), и «забытые» лиды снова считались новыми. Смежный триггер — реапер осиротевших claim'ов (H1) мог воскресить уже-прописанного лида без guard'а «нет сессии».
+
+**Исправление (корневое).**
+- В `create_session` (`modules/autochat/service.py`) добавлен ГЛОБАЛЬНЫЙ дедуп ПЕРЕД отправкой: `SELECT 1 FROM contacted_leads WHERE telegram_user_id = $1` → если есть, `raise AlreadyContacted` (код `ALREADY_CONTACTED`, HTTP 409). Работает для ВСЕХ путей (не только CRM), поверх существующего per-account partial-unique индекса. В auto_runner `ALREADY_CONTACTED` — benign skip (как `SESSION_ALREADY_ACTIVE`): слот пропускаем, лид в пул не возвращаем, invalid не пушим, автомат не стопаем.
+- `contacted_leads` пишется АТОМАРНО сразу после успешной `wrapper.send_message`, ДО `bus.publish` (`INSERT ON CONFLICT (username) DO NOTHING`) — окно «отправили, но не записали» закрыто.
+- Источник бэкфилла реестра переведён на durable `events_archive` (`autochat.started`: username + telegram_user_id), а НЕ на удаляемые сессии (миграция 0021 заменила 0019). Живьём реестр перестроен: 1520 → 4849.
+- Реапер `reap_stale_claims` удалён вместе с переходом на простую модель пула (claim = `DELETE`), устранив класс «воскрешения уже-прописанного» на корню (см. §15, поллер пула).
+
+**Текущее состояние.** Закрыто. Дедуп «никогда повторно одному человеку» держится на двух уровнях: железобетонный — глобальный `telegram_user_id` в `create_session`; дешёвый пре-фильтр — `contacted_leads` по username в `claim_lead_for_account` и `_take_into_pool` (не тратим цикл на заведомо контактированного). Реестр переживает wipe, потому что бэкфилится из durable-лога.
 
 
 ---
