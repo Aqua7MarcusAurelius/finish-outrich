@@ -7,15 +7,14 @@ import { api, describeApiError } from "@/lib/api";
 import { useToast } from "@/lib/toast";
 
 // Wizard-модалка для добавления нового Telegram-аккаунта через auth-flow:
-//   step "form"  — телефон + имя + прокси → POST /auth/start
-//   step "code"  — код из SMS/TG → POST /auth/code (может попросить 2FA)
-//   step "2fa"   — облачный пароль → POST /auth/2fa
+//   step "form"  — фингерпринт аккаунта целиком (телефон, имя, прокси,
+//                  api_id/hash, device-info, опц. 2FA-пароль) → POST /auth/start
+//   step "code"  — код из SMS/TG → POST /auth/code; если на /auth/start был
+//                  передан пароль, бэкенд сам подставит его при 2FA и вернёт
+//                  готовый аккаунт. Иначе — переход на шаг "2fa".
+//   step "2fa"   — облачный пароль, если оператор не указал его заранее
+//                  → POST /auth/2fa
 // На любом этапе отмена → DELETE /auth/{session_id} (если есть) + закрытие.
-//
-// Формат прокси: предпочтительный ввод — `host:port:user:pass`
-// (то, как обычно отдают провайдеры). В URL `socks5://user:pass@host:port`
-// конвертирует helper ниже — бэкенд и БД продолжают работать со старой
-// URL-формой, существующие аккаунты не трогаем.
 
 const PROXY_COLON_RE = /^([^:\s]+):(\d+):([^:\s]+):(.+)$/;
 
@@ -49,15 +48,31 @@ export function NewAccountDialog({ open, onClose, onCreated }: Props) {
   const [name, setName] = useState("");
   const [proxyPrimary, setProxyPrimary] = useState("");
   const [proxyFallback, setProxyFallback] = useState("");
-  const [code, setCode] = useState("");
+  // fingerprint (per-account)
+  const [apiId, setApiId] = useState("");
+  const [apiHash, setApiHash] = useState("");
+  const [deviceModel, setDeviceModel] = useState("");
+  const [systemVersion, setSystemVersion] = useState("");
+  const [appVersion, setAppVersion] = useState("");
+  const [langCode, setLangCode] = useState("ru");
+  const [systemLangCode, setSystemLangCode] = useState("ru");
+  const [langPack, setLangPack] = useState("");
+  // 2FA вперёд (опционально). Если задано — бэк применит сам при /auth/code.
   const [password, setPassword] = useState("");
+  // отдельный буфер для ввода пароля на шаге "2fa" (если оператор не указал
+  // его заранее и Telegram запросил 2FA после /auth/code)
+  const [late2fa, setLate2fa] = useState("");
+  const [code, setCode] = useState("");
 
   function reset() {
     setStep("form");
     setBusy(false);
     setSessionId(null);
     setPhone(""); setName(""); setProxyPrimary(""); setProxyFallback("");
-    setCode(""); setPassword("");
+    setApiId(""); setApiHash("");
+    setDeviceModel(""); setSystemVersion(""); setAppVersion("");
+    setLangCode("ru"); setSystemLangCode("ru"); setLangPack("");
+    setPassword(""); setLate2fa(""); setCode("");
   }
 
   async function handleClose() {
@@ -80,6 +95,11 @@ export function NewAccountDialog({ open, onClose, onCreated }: Props) {
       );
       return;
     }
+    const apiIdNum = Number(apiId.trim());
+    if (!Number.isInteger(apiIdNum) || apiIdNum <= 0) {
+      toast.error("api_id неверный", "Ожидается положительное целое число.");
+      return;
+    }
 
     setBusy(true);
     try {
@@ -88,6 +108,15 @@ export function NewAccountDialog({ open, onClose, onCreated }: Props) {
         name: name.trim(),
         proxy_primary: primaryUrl,
         proxy_fallback: fallbackUrl,
+        api_id: apiIdNum,
+        api_hash: apiHash.trim(),
+        device_model: deviceModel.trim(),
+        system_version: systemVersion.trim(),
+        app_version: appVersion.trim(),
+        lang_code: langCode.trim() || "en",
+        system_lang_code: systemLangCode.trim() || "en",
+        lang_pack: langPack.trim(),
+        password: password ? password : null,
       });
       setSessionId(res.session_id);
       setStep("code");
@@ -105,6 +134,7 @@ export function NewAccountDialog({ open, onClose, onCreated }: Props) {
     try {
       const res = await api.authCode(sessionId, code.trim());
       if (res.status === "2fa_required") {
+        // /auth/start без пароля — Telegram попросил 2FA, спросим у оператора.
         setStep("2fa");
       } else {
         toast.success("Аккаунт добавлен", res.account_id ? `account_id=${res.account_id}` : undefined);
@@ -114,6 +144,13 @@ export function NewAccountDialog({ open, onClose, onCreated }: Props) {
       }
     } catch (e) {
       const d = describeApiError(e);
+      // M8 (2026-07-13): оператор указал 2FA-пароль в /auth/start, но он не
+      // подошёл. Бэкенд уже перевёл сессию в фазу 2fa_required перед тем как
+      // бросить PASSWORD_INVALID — значит /auth/2fa примет правильный пароль.
+      // Раньше мастер тут просто показывал toast и застревал на шаге "код".
+      if (d.code === "PASSWORD_INVALID" || d.code === "BAD_PHASE") {
+        setStep("2fa");
+      }
       toast.error(`Auth code: ${d.title}`, d.detail);
     } finally {
       setBusy(false);
@@ -124,7 +161,7 @@ export function NewAccountDialog({ open, onClose, onCreated }: Props) {
     if (!sessionId) return;
     setBusy(true);
     try {
-      const res = await api.auth2fa(sessionId, password);
+      const res = await api.auth2fa(sessionId, late2fa);
       toast.success("Аккаунт добавлен", res.account_id ? `account_id=${res.account_id}` : undefined);
       reset();
       onCreated();
@@ -139,11 +176,14 @@ export function NewAccountDialog({ open, onClose, onCreated }: Props) {
 
   const formValid =
     phone.trim().length >= 5 && name.trim().length > 0 &&
-    proxyPrimary.trim().length > 0 && proxyFallback.trim().length > 0;
+    proxyPrimary.trim().length > 0 && proxyFallback.trim().length > 0 &&
+    apiId.trim().length > 0 && apiHash.trim().length > 0 &&
+    deviceModel.trim().length > 0 && systemVersion.trim().length > 0 &&
+    appVersion.trim().length > 0;
 
   return (
     <Dialog open={open} onOpenChange={(v) => { if (!v) handleClose(); }}>
-      <DialogContent className="max-w-md">
+      <DialogContent className="max-w-xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>
             Новый аккаунт
@@ -161,7 +201,7 @@ export function NewAccountDialog({ open, onClose, onCreated }: Props) {
             </div>
             <div className="flex flex-col gap-1">
               <Label htmlFor="acc-name">Имя (отображаемое)</Label>
-              <Input id="acc-name" placeholder="Валерия / Тест и т.п." value={name} onChange={(e) => setName(e.target.value)} />
+              <Input id="acc-name" placeholder="SAD_03_RU" value={name} onChange={(e) => setName(e.target.value)} />
             </div>
             <div className="flex flex-col gap-1">
               <Label htmlFor="acc-proxy1">Proxy (primary)</Label>
@@ -184,9 +224,113 @@ export function NewAccountDialog({ open, onClose, onCreated }: Props) {
               />
             </div>
             <div className="-mt-1 text-[11px] leading-tight text-muted-foreground">
-              Формат — <span className="mono">host:port:user:pass</span>.
+              Формат прокси — <span className="mono">host:port:user:pass</span>.
               Старый URL-вид <span className="mono">socks5://user:pass@host:port</span> тоже принимается.
             </div>
+
+            <div className="mt-2 text-xs font-medium text-muted-foreground">
+              Fingerprint (с my.telegram.org / индивидуально на аккаунт)
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="flex flex-col gap-1">
+                <Label htmlFor="acc-api-id">api_id</Label>
+                <Input
+                  id="acc-api-id"
+                  inputMode="numeric"
+                  placeholder="12345678"
+                  value={apiId}
+                  onChange={(e) => setApiId(e.target.value)}
+                  className="mono"
+                />
+              </div>
+              <div className="flex flex-col gap-1">
+                <Label htmlFor="acc-api-hash">api_hash</Label>
+                <Input
+                  id="acc-api-hash"
+                  placeholder="abcd…32 hex…"
+                  value={apiHash}
+                  onChange={(e) => setApiHash(e.target.value)}
+                  className="mono"
+                />
+              </div>
+            </div>
+            <div className="flex flex-col gap-1">
+              <Label htmlFor="acc-device-model">device_model</Label>
+              <Input
+                id="acc-device-model"
+                placeholder="Samsung Galaxy S23"
+                value={deviceModel}
+                onChange={(e) => setDeviceModel(e.target.value)}
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="flex flex-col gap-1">
+                <Label htmlFor="acc-system-version">system_version</Label>
+                <Input
+                  id="acc-system-version"
+                  placeholder="Android 14"
+                  value={systemVersion}
+                  onChange={(e) => setSystemVersion(e.target.value)}
+                />
+              </div>
+              <div className="flex flex-col gap-1">
+                <Label htmlFor="acc-app-version">app_version</Label>
+                <Input
+                  id="acc-app-version"
+                  placeholder="Telegram Android 10.5.4"
+                  value={appVersion}
+                  onChange={(e) => setAppVersion(e.target.value)}
+                />
+              </div>
+            </div>
+            <div className="grid grid-cols-3 gap-3">
+              <div className="flex flex-col gap-1">
+                <Label htmlFor="acc-lang-code">lang_code</Label>
+                <Input
+                  id="acc-lang-code"
+                  placeholder="ru"
+                  value={langCode}
+                  onChange={(e) => setLangCode(e.target.value)}
+                  className="mono"
+                />
+              </div>
+              <div className="flex flex-col gap-1">
+                <Label htmlFor="acc-system-lang">system_lang_code</Label>
+                <Input
+                  id="acc-system-lang"
+                  placeholder="ru"
+                  value={systemLangCode}
+                  onChange={(e) => setSystemLangCode(e.target.value)}
+                  className="mono"
+                />
+              </div>
+              <div className="flex flex-col gap-1">
+                <Label htmlFor="acc-lang-pack">lang_pack</Label>
+                <Input
+                  id="acc-lang-pack"
+                  placeholder="(обычно пусто)"
+                  value={langPack}
+                  onChange={(e) => setLangPack(e.target.value)}
+                  className="mono"
+                />
+              </div>
+            </div>
+
+            <div className="mt-2 text-xs font-medium text-muted-foreground">
+              2FA (опционально — если на аккаунте включён облачный пароль,
+              укажи его сейчас, бэк применит сам после кода)
+            </div>
+            <div className="flex flex-col gap-1">
+              <Label htmlFor="acc-2fa-up">Облачный пароль (2FA), если задан</Label>
+              <Input
+                id="acc-2fa-up"
+                type="password"
+                placeholder="оставь пустым если 2FA нет"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+              />
+            </div>
+
             <div className="flex justify-end gap-2 pt-1">
               <Button variant="ghost" size="sm" onClick={handleClose} disabled={busy}>Отмена</Button>
               <Button size="sm" onClick={submitForm} disabled={!formValid || busy}>
@@ -200,6 +344,7 @@ export function NewAccountDialog({ open, onClose, onCreated }: Props) {
           <div className="flex flex-col gap-3">
             <div className="text-xs text-muted-foreground">
               Код отправлен в Telegram / SMS на {phone}. Введи его ниже.
+              {password ? " 2FA-пароль уже передан — бэк применит его автоматически." : ""}
             </div>
             <div className="flex flex-col gap-1">
               <Label htmlFor="acc-code">Код</Label>
@@ -225,7 +370,8 @@ export function NewAccountDialog({ open, onClose, onCreated }: Props) {
         {step === "2fa" && (
           <div className="flex flex-col gap-3">
             <div className="text-xs text-muted-foreground">
-              На аккаунте включён облачный пароль. Введи его чтобы завершить вход.
+              На аккаунте включён облачный пароль, а в форме его не указали.
+              Введи его сейчас, чтобы завершить вход.
             </div>
             <div className="flex flex-col gap-1">
               <Label htmlFor="acc-2fa">Облачный пароль (2FA)</Label>
@@ -233,13 +379,13 @@ export function NewAccountDialog({ open, onClose, onCreated }: Props) {
                 id="acc-2fa"
                 type="password"
                 autoFocus
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
+                value={late2fa}
+                onChange={(e) => setLate2fa(e.target.value)}
               />
             </div>
             <div className="flex justify-end gap-2 pt-1">
               <Button variant="ghost" size="sm" onClick={handleClose} disabled={busy}>Отмена</Button>
-              <Button size="sm" onClick={submit2fa} disabled={!password || busy}>
+              <Button size="sm" onClick={submit2fa} disabled={!late2fa || busy}>
                 {busy ? "…" : "Войти"}
               </Button>
             </div>

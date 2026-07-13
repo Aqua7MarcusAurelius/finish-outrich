@@ -26,13 +26,16 @@ export class ApiError extends Error {
 
 // Вытащить человекочитаемое сообщение из { error: { code, message } } shape,
 // который возвращают FastAPI-ручки проекта. Фолбэк — general .message.
-export function describeApiError(e: unknown): { title: string; detail?: string } {
+// `code` (M8, 2026-07-13) — машинный код ошибки для ветвления в UI
+// (например перевод мастера на шаг 2FA при PASSWORD_INVALID/BAD_PHASE).
+export function describeApiError(e: unknown): { title: string; detail?: string; code?: string } {
   if (e instanceof ApiError) {
     const b = e.body as { error?: { code?: string; message?: string } } | string | null;
     if (b && typeof b === "object" && b.error) {
       return {
         title: b.error.message || b.error.code || `HTTP ${e.status}`,
         detail: b.error.code ? `${b.error.code} (HTTP ${e.status})` : `HTTP ${e.status}`,
+        code: b.error.code,
       };
     }
     return { title: `HTTP ${e.status}`, detail: typeof b === "string" ? b : undefined };
@@ -405,7 +408,21 @@ export const api = {
   // ── auth (добавление нового аккаунта) ───────────────────────────────
   // Возвращаемые поля — modules/auth/service.py: PHASE_CODE_SENT /
   // PHASE_2FA_REQUIRED / PHASE_DONE. `done` несёт account_id.
-  authStart: (body: { phone: string; name: string; proxy_primary: string; proxy_fallback: string }) =>
+  authStart: (body: {
+    phone: string;
+    name: string;
+    proxy_primary: string;
+    proxy_fallback: string;
+    api_id: number;
+    api_hash: string;
+    device_model: string;
+    system_version: string;
+    app_version: string;
+    lang_code?: string;
+    system_lang_code?: string;
+    lang_pack?: string;
+    password?: string | null;
+  }) =>
     request<{ session_id: string; status: "code_sent" }>("/auth/start", {
       method: "POST", body: JSON.stringify(body),
     }),

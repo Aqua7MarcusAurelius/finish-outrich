@@ -134,6 +134,14 @@ class AutoChatSession:
         self._enter_task: asyncio.Task | None = None
         self._idle_task: asyncio.Task | None = None
 
+        # M2 (2026-07-13): «замок» генерации. Форс-регенерация из
+        # `worker.started` (missed-inbound догон) может прийти дважды на
+        # двойном реконнекте. Селектор берёт сессии где last_their > last_our,
+        # а last_our двигался только ПОСЛЕ отправки → между генерацией и
+        # отправкой условие оставалось истинным и второй worker.started
+        # регенерил тот же ответ (дубль). Замок сериализует форс-регенерацию.
+        self._generating: asyncio.Lock = asyncio.Lock()
+
         self._stopped: asyncio.Event = asyncio.Event()
 
     # ─────────────────────────────────────────────────────────────────
@@ -401,13 +409,35 @@ class AutoChatSession:
                 if self._stopped.is_set() or not self.in_chat:
                     continue
 
-                # Перед генерацией — дождаться готовности всех транскрипций/
-                # описаний по всему диалогу (polling 30с, max 10 попыток).
-                await self._wait_for_transcriptions()
-
                 # Генерация и постановка сегментов в очередь на отправку.
+                # M2 (2026-07-13): и planner, и force_generate_reply
+                # (worker.started при рестарте воркера) теперь идут через ОДИН
+                # лок self._generating. Раньше planner генерил БЕЗ лока —
+                # поэтому при рестарте воркера на одно inbound уходило ДВА
+                # ответа (force сгенерил A, а reply_timer planner'а через 30с — B).
                 try:
-                    await self._generate_and_enqueue()
+                    async with self._generating:
+                        if self._stopped.is_set() or not self.in_chat:
+                            continue
+                        # После взятия лока перепроверяем: не ответил ли уже
+                        # кто-то (force_generate) на последнее inbound. Если наша
+                        # активность свежее их последнего сообщения — ответ не
+                        # нужен, второй не шлём.
+                        if (
+                            self.last_our_activity_at is not None
+                            and self.last_their_message_at is not None
+                            and self.last_our_activity_at >= self.last_their_message_at
+                        ):
+                            continue
+                        # Перед генерацией — дождаться готовности всех
+                        # транскрипций/описаний (polling 30с, max 10 попыток).
+                        await self._wait_for_transcriptions()
+                        await self._generate_and_enqueue()
+                        # Метим last_our СРАЗУ после enqueue (как force) — чтобы
+                        # параллельный триггер не сгенерил дубль.
+                        self.last_our_activity_at = _now()
+                        self.last_any_message_at = self.last_our_activity_at
+                        await self._persist_state()
                 except AutoSessionExpired:
                     # Сессия TG протухла — выходим и завершаем AutoChat-сессию.
                     await self._fail("session_expired")
@@ -525,14 +555,33 @@ class AutoChatSession:
                 f"session {self.id} stopped, cannot regenerate"
             )
 
-        # Дождёмся медиа (как делает обычный planner) — иначе LLM увидит
-        # сырое сообщение без транскрипции и ответит мимо темы.
-        await self._wait_for_transcriptions()
+        # M2: если генерация уже идёт (параллельный worker.started) — не
+        # дублируем. Второй вызов просто выходит, ответ сгенерит первый.
+        if self._generating.locked():
+            log.info(
+                "autochat session %s: force_generate skipped (already generating)",
+                self.id,
+            )
+            return {"session_id": self.id, "skipped": "already_generating"}
 
-        # _generate_and_enqueue сам ловит OpenRouterError → AUTOCHAT_SESSION_ERROR
-        # и просто возвращается, не валя сессию. Здесь добавим обёртку
-        # чтобы вернуть caller'у факт результата.
-        await self._generate_and_enqueue()
+        async with self._generating:
+            # Дождёмся медиа (как делает обычный planner) — иначе LLM увидит
+            # сырое сообщение без транскрипции и ответит мимо темы.
+            await self._wait_for_transcriptions()
+
+            # _generate_and_enqueue сам ловит OpenRouterError →
+            # AUTOCHAT_SESSION_ERROR и просто возвращается, не валя сессию.
+            await self._generate_and_enqueue()
+
+            # M2: метим last_our СРАЗУ после постановки в очередь (а не
+            # только после реальной отправки в _send_segment). Иначе селектор
+            # missed-inbound (last_their > last_our) продолжает выбирать эту
+            # сессию до окончания отправки → повторный worker.started
+            # регенерит дубль. _send_segment всё равно обновит метку позже.
+            self.last_our_activity_at = _now()
+            self.last_any_message_at = self.last_our_activity_at
+            await self._persist_state()
+
         return {
             "session_id": self.id,
             "dialog_id": self.dialog_id,
@@ -609,7 +658,10 @@ class AutoChatSession:
         await bus.publish(
             module=Module.AUTOCHAT,
             type=EventType.AUTOCHAT_GENERATION_DONE,
-            status=Status.SUCCESS if segments else Status.ERROR,
+            # M3 (2026-07-13): штатное завершение диалога (LLM прислала
+            # <finishdialog/> без текстовых сегментов) — это УСПЕХ, не ERROR.
+            # Раньше такой финиш засорял журнал ложными «ошибками генерации».
+            status=Status.SUCCESS if (segments or finish_requested) else Status.ERROR,
             parent_id=parent_id,
             account_id=self.account_id,
             data={

@@ -7,6 +7,14 @@ function formatTime(iso: string) {
   return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+function formatWhen(iso: string) {
+  // "12.07, 20:39" — дата и время под каждым сообщением.
+  const d = new Date(iso);
+  const day = d.toLocaleDateString([], { day: "2-digit", month: "2-digit" });
+  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return `${day}, ${time}`;
+}
+
 export function MessageBubble({ m }: { m: Message }) {
   const deleted = !!m.deleted_at;
   const edited = !!m.edited_at;
@@ -57,8 +65,8 @@ export function MessageBubble({ m }: { m: Message }) {
         {m.text && <div className="whitespace-pre-wrap break-words text-sm">{m.text}</div>}
 
         <div className="mt-1 flex items-center gap-2 text-[10px] text-muted-foreground">
-          <span className="mono">{formatTime(m.date)}</span>
-          {edited && <span className="italic">изменено {formatTime(m.edited_at!)}</span>}
+          <span className="mono">{formatWhen(m.date)}</span>
+          {edited && <span className="italic">изменено {formatWhen(m.edited_at!)}</span>}
         </div>
 
         {m.reactions.length > 0 && (

@@ -1,11 +1,20 @@
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
+import { useSseConnected } from "@/hooks/useLiveInvalidator";
+
+// L5 (2026-07-13): когда SSE открыт — push-обновления приходят мгновенно,
+// поллинг нужен лишь как редкий safety-net (60с). Когда SSE НЕ в состоянии
+// OPEN (обрыв/реконнект) — push молчит, поэтому поллим часто (12с), чтобы UI
+// не «замирал» на время реконнекта EventSource.
+const SLOW_POLL_MS = 60_000;
+const FAST_POLL_MS = 12_000;
 
 export function useAccounts() {
+  const sseOk = useSseConnected();
   return useQuery({
     queryKey: ["accounts"],
     queryFn: () => api.listAccounts(),
-    refetchInterval: 5_000, // worker status is live — poll it
+    refetchInterval: sseOk ? SLOW_POLL_MS : FAST_POLL_MS,
   });
 }
 
@@ -45,14 +54,16 @@ export function useDialogStatuses() {
   });
 }
 
-// Состояние авторежима для воркера. Поллится — потому что автомат
-// может сам выключиться (например, после worker.stopped), и UI должен
-// это отражать без рефреша страницы.
+// Состояние авторежима для воркера. Обновляется через SSE (события
+// auto_runner.*, worker.stopped итд — см. useLiveInvalidator). Polling
+// оставлен как safety-net на случай если SSE отвалится.
 export function useAutoRunner(accountId: number | null) {
+  const sseOk = useSseConnected();
   return useQuery({
     queryKey: ["auto-runner", accountId],
     queryFn: () => api.getAutoRunner(accountId!),
     enabled: accountId != null,
-    refetchInterval: 10_000,
+    // L5: медленный поллинг при живом SSE, быстрый — когда push молчит.
+    refetchInterval: sseOk ? SLOW_POLL_MS : FAST_POLL_MS,
   });
 }

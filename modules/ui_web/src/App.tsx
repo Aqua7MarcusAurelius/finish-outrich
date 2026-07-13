@@ -4,8 +4,13 @@ import { DialogsPage } from "@/pages/DialogsPage";
 import { EventLogPage } from "@/pages/EventLogPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { WorkerPromptPage } from "@/pages/WorkerPromptPage";
+import { useLiveInvalidator } from "@/hooks/useLiveInvalidator";
 
 export default function App() {
+  // Один SSE-подписчик на всё приложение — при каждом релевантном
+  // событии из шины инвалидирует соответствующий React-Query кэш.
+  // Заменяет polling refetchInterval в отдельных хуках.
+  useLiveInvalidator();
   return (
     <AppShell>
       <Routes>

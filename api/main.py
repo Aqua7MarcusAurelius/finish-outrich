@@ -166,10 +166,13 @@ async def lifespan(app: FastAPI):
     partner_crm_finalizer_task = asyncio.create_task(partner_crm_finalizer.run())
     app.state.partner_crm_finalizer_task = partner_crm_finalizer_task
 
-    # WorkerAutoRunner: per-account автомат старта диалогов из очереди.
+    # WorkerAutoRunner: per-account автомат старта диалогов по окну.
     # Создаётся ПОСЛЕ AutoChat, потому что зовёт его create_session.
-    # При старте сбрасывает is_running у всех — после рестарта не
-    # возобновляется автоматически, оператор включает заново.
+    # При старте:
+    #   * reset_on_boot гасит is_running у сессий, чьё session_ends_at
+    #     истекло пока app лежал (или NULL — legacy-ряды);
+    #   * resume_running_loops поднимает loop-task'и на оставшихся
+    #     моментах для сессий, у которых session_ends_at ещё в будущем.
     auto_runner_service = WorkerAutoRunnerService(
         get_wrapper=app.state.worker_manager.get_wrapper,
         autochat_service=autochat_service,
@@ -177,6 +180,7 @@ async def lifespan(app: FastAPI):
     )
     app.state.auto_runner_service = auto_runner_service
     await auto_runner_service.reset_on_boot()
+    await auto_runner_service.resume_running_loops()
     auto_runner_task = asyncio.create_task(auto_runner_service.run())
     app.state.auto_runner_task = auto_runner_task
 

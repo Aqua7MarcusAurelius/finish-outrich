@@ -21,7 +21,11 @@ from core import minio as minio_mod
 from core import redis as redis_mod
 from core.config import settings
 from core.events import EventType, Module, Status
-from modules.worker.wrapper import ProxyUnavailable, SessionExpired
+from modules.worker.wrapper import (
+    ProxyUnavailable,      # noqa: F401 (legacy auth-flow всё ещё использует)
+    SessionExpired,
+    TelethonDisconnected,  # noqa: F401 (тип оставлен для обратной совместимости)
+)
 from modules.worker.worker import Worker
 
 log = logging.getLogger(__name__)
@@ -86,6 +90,15 @@ class ConfirmationRequired(ManagerError):
 class ServiceAccountNotStartable(ManagerError):
     code = "SERVICE_ACCOUNT_NOT_STARTABLE"
     message = "Сервисный аккаунт доставки не запускается как воркер"
+    status_code = 409
+
+
+class AccountFingerprintMissing(ManagerError):
+    code = "ACCOUNT_FINGERPRINT_MISSING"
+    message = (
+        "У аккаунта нет api_id / api_hash / device-info — "
+        "переавторизуй через мастер добавления аккаунта"
+    )
     status_code = 409
 
 
@@ -184,7 +197,10 @@ class WorkerManager:
             async with pool.acquire() as conn:
                 row = await conn.fetchrow(
                     "SELECT id, name, session_data, proxy_primary, "
-                    "proxy_fallback, is_active FROM accounts WHERE id = $1",
+                    "proxy_fallback, is_active, api_id, api_hash, "
+                    "device_model, system_version, app_version, "
+                    "lang_code, system_lang_code, lang_pack "
+                    "FROM accounts WHERE id = $1",
                     account_id,
                 )
             if row is None:
@@ -195,6 +211,15 @@ class WorkerManager:
                 raise ServiceAccountNotStartable()
             if not row["is_active"]:
                 raise AccountInactive()
+            if (not row["api_id"] or not row["api_hash"]
+                    or not row["device_model"]
+                    or not row["system_version"]
+                    or not row["app_version"]):
+                # У worker-аккаунта обязан быть индивидуальный api_id/hash
+                # и device-info (фиксируем уникальный fingerprint, см. §9 SPEC).
+                # Если NULL — это либо старая запись до миграции 0013, либо
+                # ошибка при регистрации; запускать опасно — свалится при connect.
+                raise AccountFingerprintMissing()
 
             await self._set_status(account_id, STATUS_STARTING)
             await self._spawn(
@@ -203,6 +228,14 @@ class WorkerManager:
                 session_data=row["session_data"],
                 proxy_primary=row["proxy_primary"],
                 proxy_fallback=row["proxy_fallback"],
+                api_id=int(row["api_id"]),
+                api_hash=row["api_hash"],
+                device_model=row["device_model"],
+                system_version=row["system_version"],
+                app_version=row["app_version"],
+                lang_code=row["lang_code"] or "en",
+                system_lang_code=row["system_lang_code"] or "en",
+                lang_pack=row["lang_pack"] or "",
             )
 
         return {"account_id": account_id, "status": STATUS_STARTING}
@@ -342,14 +375,37 @@ class WorkerManager:
         session_data: bytes | None,
         proxy_primary: str,
         proxy_fallback: str | None,
+        api_id: int,
+        api_hash: str,
+        device_model: str,
+        system_version: str,
+        app_version: str,
+        lang_code: str = "en",
+        system_lang_code: str = "en",
+        lang_pack: str = "",
         is_restart: bool = False,
     ) -> None:
+        # Колбэк для Worker.run: вызывается один раз после успешного connect'а.
+        # Флипаем статус в Redis STARTING → RUNNING только тут, чтобы UI/
+        # get_wrapper() не показывали "живой" воркер до реального подключения.
+        async def _on_ready() -> None:
+            await self._set_status(account_id, STATUS_RUNNING)
+
         worker = Worker(
             account_id=account_id,
             account_name=account_name,
             session_data=session_data,
             proxy_primary=proxy_primary,
             proxy_fallback=proxy_fallback,
+            api_id=api_id,
+            api_hash=api_hash,
+            device_model=device_model,
+            system_version=system_version,
+            app_version=app_version,
+            lang_code=lang_code,
+            system_lang_code=system_lang_code,
+            lang_pack=lang_pack,
+            on_ready=_on_ready,
         )
 
         async def _runner():
@@ -369,45 +425,72 @@ class WorkerManager:
                     "worker account=%s session expired: %s", account_id, e,
                 )
                 # account.session_expired уже опубликован враппером
-            except ProxyUnavailable as e:
-                await self._set_status(account_id, STATUS_CRASHED, error=str(e))
-                # system.error уже опубликован враппером
-                await self._publish_crashed(account_id, str(e))
+            # Fix #12: TelethonDisconnected больше НЕ пробрасывается из
+            # Worker.run — новая resilient схема сама ретраит без exception'а
+            # (как Telegram Desktop с "Connecting..."). ProxyUnavailable —
+            # тоже: connect_via уже per-proxy, а старый connect() который
+            # его бросал используется только в auth-flow. Runtime сетевые
+            # ошибки → Worker.run ретраит и не выходит из run().
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 log.exception("worker account=%s crashed", account_id)
-                await self._set_status(account_id, STATUS_CRASHED, error=str(e))
 
                 # Одна попытка прозрачного авторестарта.
-                slot = self._slots.get(account_id)
-                if slot and slot.restart_count == 0 and not is_restart:
-                    slot.restart_count = 1
-                    log.info("worker account=%s: attempting one restart", account_id)
-                    # Запустим новый таск и заменим слот
-                    try:
-                        await self._spawn(
-                            account_id=account_id,
-                            account_name=account_name,
-                            session_data=session_data,
-                            proxy_primary=proxy_primary,
-                            proxy_fallback=proxy_fallback,
-                            is_restart=True,
+                # L1 (2026-07-13): мутация _slots + спавн task под self._lock,
+                # с перепроверкой что слот всё ещё принадлежит ЭТОМУ воркеру
+                # (не перебит параллельным stop()/start()). L3: на время
+                # восстановления статус STARTING, а не CRASHED — иначе UI
+                # мигает «crashed» при живом авторестарте.
+                restart_attempted = False
+                spawned = False
+                async with self._lock:
+                    slot = self._slots.get(account_id)
+                    if (
+                        slot and slot.worker is worker
+                        and slot.restart_count == 0 and not is_restart
+                    ):
+                        slot.restart_count = 1
+                        restart_attempted = True
+                        await self._set_status(account_id, STATUS_STARTING)
+                        log.info(
+                            "worker account=%s: attempting one restart", account_id,
                         )
-                        # Прозрачное восстановление: публикуем worker.restarted,
-                        # а НЕ worker.crashed. worker.crashed заставил бы
-                        # auto-runner посчитать воркер офлайн и навсегда
-                        # остановить автодиалоги, хотя воркер снова RUNNING.
-                        await self._publish_restarted(account_id, str(e))
-                        return
-                    except Exception:
-                        log.exception(
-                            "worker account=%s: restart failed", account_id,
-                        )
+                        try:
+                            await self._spawn(
+                                account_id=account_id,
+                                account_name=account_name,
+                                session_data=session_data,
+                                proxy_primary=proxy_primary,
+                                proxy_fallback=proxy_fallback,
+                                api_id=api_id,
+                                api_hash=api_hash,
+                                device_model=device_model,
+                                system_version=system_version,
+                                app_version=app_version,
+                                lang_code=lang_code,
+                                system_lang_code=system_lang_code,
+                                lang_pack=lang_pack,
+                                is_restart=True,
+                            )
+                            spawned = True
+                        except Exception:
+                            log.exception(
+                                "worker account=%s: restart failed", account_id,
+                            )
+
+                if restart_attempted and spawned:
+                    # Прозрачное восстановление: публикуем worker.restarted,
+                    # а НЕ worker.crashed. worker.crashed заставил бы
+                    # auto-runner посчитать воркер офлайн и навсегда
+                    # остановить автодиалоги, хотя воркер снова RUNNING.
+                    await self._publish_restarted(account_id, str(e))
+                    return
 
                 # Финальный крах: рестарт не планировался (повторный крах после
                 # авторестарта) или сам рестарт не удался. Здесь auto-runner
                 # обязан остановиться — публикуем worker.crashed.
+                await self._set_status(account_id, STATUS_CRASHED, error=str(e))
                 await self._publish_crashed(account_id, str(e))
             finally:
                 # Удаляем слот только если это финальное завершение
@@ -425,9 +508,11 @@ class WorkerManager:
             restart_count=1 if is_restart else 0,
         )
 
-        # Сразу выставим running — событие worker.started публикует сам Worker
-        # после успешного connect
-        await self._set_status(account_id, STATUS_RUNNING)
+        # Статус RUNNING писать здесь НЕЛЬЗЯ — connect ещё не отработал,
+        # а get_wrapper()/UI решат что воркер живой (сценарий #1 из аудита
+        # рассинхрона). RUNNING ставится из Worker._on_ready-колбэка после
+        # успешного connect'а. Здесь остаётся STARTING (был выставлен в
+        # start() выше).
 
     async def _publish_crashed(self, account_id: int, error: str) -> None:
         await bus.publish(

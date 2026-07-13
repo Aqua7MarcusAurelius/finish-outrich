@@ -35,6 +35,19 @@ class SessionAlreadyActive(AutoChatError):
     status_code = 409
 
 
+class AlreadyContacted(AutoChatError):
+    """
+    Этому человеку (по telegram_user_id) уже писал КАКОЙ-ТО аккаунт.
+    Корневой глобальный дедуп по личности: один человек = одно касание
+    навсегда, любым аккаунтом, при любом рестарте/реинсерте. Отличие от
+    SessionAlreadyActive — та про активную сессию ЭТОГО аккаунта, а эта
+    про факт «писали когда-либо любым аккаунтом» (реестр contacted_leads).
+    """
+    code = "ALREADY_CONTACTED"
+    message = "Этому собеседнику уже писали ранее — повторно не пишем"
+    status_code = 409
+
+
 class UsernameNotFoundError(AutoChatError):
     code = "USERNAME_NOT_FOUND"
     message = "Такой @username не найден"

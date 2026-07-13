@@ -1,15 +1,22 @@
 """
 Клиент OpenRouter.
 
-Используем chat-completions (/api/v1/chat/completions) — у OpenRouter нет
-отдельных endpoint'ов под Whisper STT или vision, всё идёт через единый
-multimodal-интерфейс.
+Два эндпоинта используются:
+- chat-completions (/api/v1/chat/completions) — vision, документы, autochat.
+- audio/transcriptions (/api/v1/audio/transcriptions) — STT-модели вроде
+  `openai/gpt-4o-mini-transcribe` и `openai/whisper-1`, у которых нет
+  chat.completions-совместимости.
 
-- Транскрипция  → gpt-4o-audio-preview (input_audio)
-- Описание фото → gpt-4o (image_url с data-URL)
-- Описание PDF  → Gemini (file с file_data), опционально плагин file-parser
+- Транскрипция  → gpt-4o-mini-transcribe (input_audio → dedicated endpoint)
+- Описание фото → gpt-4o (image_url с data-URL, chat.completions)
+- Описание PDF  → Gemini (file с file_data, chat.completions)
 
-См. https://openrouter.ai/docs/guides/overview/multimodal/pdfs
+Формат STT-эндпоинта:
+    POST /api/v1/audio/transcriptions
+    Content-Type: application/json
+    {"model": "...", "input_audio": {"data": "<b64>", "format": "wav"}}
+Ответ: {"text": "...", "usage": {...}}
+См. https://openrouter.ai/docs/guides/overview/multimodal/stt
 """
 from __future__ import annotations
 
@@ -24,14 +31,9 @@ from core.config import settings
 log = logging.getLogger(__name__)
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_TRANSCRIPTIONS_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
 
 # ── Промпты ──────────────────────────────────────────────────────────
-
-TRANSCRIPTION_PROMPT = (
-    "Transcribe the audio verbatim. Return only the spoken text, "
-    "without any prefixes, comments or descriptions. If the audio is "
-    "silent or unintelligible, return an empty string."
-)
 
 # Для фото / стикеров / кадров из видео / GIF / video_note.
 IMAGE_DESCRIPTION_PROMPT = (
@@ -126,34 +128,56 @@ async def transcribe_audio(
     model: str | None = None,
 ) -> str:
     """
-    Отправить аудио-байты в OpenRouter и получить текстовую транскрипцию.
+    Отправить аудио-байты на OpenRouter STT-эндпоинт и получить текстовую
+    транскрипцию.
 
-    `audio_format` — значение поля format у input_audio. gpt-4o-audio-preview
-    формально принимает "wav" и "mp3", но провайдер OpenAI на mp3 иногда
-    отвечает "not of valid mp3 format" — поэтому по умолчанию wav.
+    Используется `/api/v1/audio/transcriptions` (OpenAI-совместимый) — под
+    транскрипционные модели `openai/gpt-4o-mini-transcribe` /
+    `openai/whisper-1`, которые не работают через chat.completions.
+
+    `audio_format` — значение поля format у input_audio. Поддерживаются
+    wav, mp3, flac, m4a, ogg, webm, aac.
 
     Возвращает строку. Пустая строка — валидный результат (тишина/невнятно).
     """
+    if not settings.OPENROUTER_API_KEY:
+        raise OpenRouterError("OPENROUTER_API_KEY is not set")
+
     model_name = model or settings.OPENROUTER_MODEL_TRANSCRIPTION
     b64 = base64.b64encode(audio_bytes).decode("ascii")
 
     payload: dict[str, Any] = {
         "model": model_name,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": TRANSCRIPTION_PROMPT},
-                    {
-                        "type": "input_audio",
-                        "input_audio": {"data": b64, "format": audio_format},
-                    },
-                ],
-            }
-        ],
+        "input_audio": {"data": b64, "format": audio_format},
         "temperature": 0,
     }
-    return await _post(payload)
+
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            resp = await client.post(
+                OPENROUTER_TRANSCRIPTIONS_URL, json=payload, headers=_headers(),
+            )
+    except httpx.HTTPError as e:
+        raise OpenRouterError(f"network error: {e}") from e
+
+    if resp.status_code >= 400:
+        body = resp.text[:500]
+        raise OpenRouterError(f"HTTP {resp.status_code}: {body}")
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        raise OpenRouterError(f"invalid JSON: {e}") from e
+
+    text = data.get("text")
+    if text is None:
+        err = data.get("error")
+        if err:
+            raise OpenRouterError(f"openrouter error: {err}")
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+    return text.strip()
 
 
 async def describe_images(

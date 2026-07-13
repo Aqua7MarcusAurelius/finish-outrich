@@ -65,6 +65,28 @@ _SESSION_EXPIRED_ERRORS: tuple[type[Exception], ...] = (
 )
 
 
+# Маркеры в тексте RPCError, которые Telethon НЕ имеет как отдельные классы
+# в rpcerrorlist, но которые сервер отдаёт с HTTP-кодом 406. В Telethon
+# 1.36 generic 406-ошибка приходит как `AuthKeyError` (базовый класс для
+# code=406, т.к. исторически 406 = auth-related). Это ложно триггерит
+# нашу ветку `_SESSION_EXPIRED_ERRORS` в `_guard`, хотя реально это
+# просто "лид не принимает бесплатные сообщения" или "privacy для не-Premium".
+#
+# Проверяем маркеры В ТЕКСТЕ ошибки ПЕРЕД мапингом в SessionExpired.
+# Если совпало — пропускаем ошибку наверх как есть (autochat/service.py
+# поймает через `except RPCError` + `_RPC_CANNOT_WRITE_MARKERS` и правильно
+# классифицирует как CannotWrite → CRM invalid, а не как session_expired
+# → self-stop воркера с рестартом ферм).
+#
+# Синхронизировано с `modules/autochat/service.py::_RPC_CANNOT_WRITE_MARKERS`.
+_NOT_SESSION_ERROR_MARKERS: tuple[str, ...] = (
+    "ALLOW_PAYMENT_REQUIRED",
+    "PRIVACY_PREMIUM_REQUIRED",
+    "USER_BANNED_IN_CHANNEL",
+    "CHAT_RESTRICTED",
+)
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Свои исключения
 # ─────────────────────────────────────────────────────────────────────
@@ -79,6 +101,19 @@ class SessionExpired(WrapperError):
 
 class ProxyUnavailable(WrapperError):
     """Оба прокси недоступны — воркер должен остановиться."""
+
+
+class TelethonDisconnected(WrapperError):
+    """Telethon-клиент отвалился в фоне после успешного connect'а.
+
+    Telethon сам не эскалирует такой disconnect (сетевой RST, TG-side
+    close, исчерпание connection_retries) в exception нашего кода —
+    просто ``client.is_connected()`` тихо становится False. Supervisor
+    в ``Worker.run`` детектит это через ``wrapper.wait_until_disconnected``
+    и бросает это исключение наружу, чтобы ``WorkerManager._runner``
+    мог правильно обработать (возможно авто-restart, публикация
+    ``worker.stopped`` c ``reason=telethon_disconnect``).
+    """
 
 
 class NotConnected(WrapperError):
@@ -343,11 +378,25 @@ class TelegramWrapper:
         session_data: bytes | None,
         proxy_primary: str,
         proxy_fallback: str | None = None,
-        connection_retries: int = 2,
+        device_model: str | None = None,
+        system_version: str | None = None,
+        app_version: str | None = None,
+        lang_code: str = "en",
+        system_lang_code: str = "en",
+        lang_pack: str = "",
+        connection_retries: int = 10,
+        retry_delay: int = 3,
         connection_timeout: int = 20,
     ):
+        # api_id/api_hash идентифицируют зарегистрированное приложение
+        # Telegram — без них Telethon не сможет даже подключиться.
+        # device_model / system_version / app_version — формируют fingerprint
+        # клиента. Если переданы непустыми — попадают в TelegramClient(),
+        # иначе используются дефолты Telethon (для service-аккаунта это OK;
+        # для рабочих аккаунтов уникальность гарантирует worker_manager:
+        # AccountFingerprintMissing на старте, если поля пустые).
         if not api_id or not api_hash:
-            raise ValueError("TELEGRAM_API_ID / TELEGRAM_API_HASH не заданы в .env")
+            raise ValueError("api_id / api_hash не заданы у аккаунта")
         if not proxy_primary:
             raise ValueError("proxy_primary обязателен")
 
@@ -356,14 +405,38 @@ class TelegramWrapper:
         self.api_hash = api_hash
         self.proxy_primary = proxy_primary
         self.proxy_fallback = proxy_fallback
+        self.device_model = device_model or None
+        self.system_version = system_version or None
+        self.app_version = app_version or None
+        self.lang_code = lang_code or "en"
+        self.system_lang_code = system_lang_code or "en"
+        self.lang_pack = lang_pack or ""
         self.connection_retries = connection_retries
+        self.retry_delay = retry_delay
         self.connection_timeout = connection_timeout
 
         self._initial_session: str = (
             session_data.decode("utf-8") if session_data else ""
         )
+        # Часть A (2026-07-13): ПЕРСИСТЕНТНЫЙ объект сессии, создаётся ОДИН раз
+        # и переезжает во все последующие TelegramClient'ы (при смене прокси).
+        # Раньше `_make_client` пересоздавал `StringSession(self._initial_session)`
+        # на каждый connect — каждый реконнект сбрасывал накопленное состояние
+        # (entity-кэш, updates-state pts/qts/date, server salt), из-за чего
+        # приходилось прогревать кэш и форсить catch_up костылями. Telethon
+        # эволюционирует ОДИН объект сессии на месте — состояние сохраняется.
+        self._session: StringSession = StringSession(self._initial_session)
         self._client: TelegramClient | None = None
         self._active_proxy: str | None = None
+
+        # Часть A: хранимые регистрации хендлеров. Воркер регистрирует их
+        # ОДИН раз; при пересоздании клиента (последовательный свитч прокси)
+        # `connect_via` сам перевешивает их на новый клиент. При внутреннем
+        # авто-реконнекте Telethon (тот же клиент) хендлеры и так переживают.
+        self._msg_handler: Callable[..., Awaitable[None]] | None = None
+        self._msg_incoming: bool = True
+        self._msg_outgoing: bool = True
+        self._typing_observer_enabled: bool = False
 
     # ─── Свойства ──────────────────────────────────────────────────
 
@@ -380,84 +453,205 @@ class TelegramWrapper:
     def is_connected(self) -> bool:
         return self._client is not None and self._client.is_connected()
 
+    # (force_catch_up удалён 2026-07-13 — мёртвый код Fix #21; его роль забрал
+    #  catch_up=True в конструкторе клиента, см. _make_client.)
+
+    async def wait_until_disconnected(self) -> None:
+        """
+        Ждать пока Telethon-клиент не отвалится от Telegram.
+
+        Возвращается когда:
+          * TG-сервер закрыл соединение и Telethon исчерпал попытки
+            переподключения (`connection_retries=2` в конструкторе);
+          * прокси отвалился на transport-уровне после начального
+            connect'а (Telethon не эскалирует это в exception);
+          * `disconnect()` был вызван явно.
+
+        Используется `Worker.run` как один из ко-сигналов остановки:
+        Telethon сам никаких exception'ов при этом не бросает в наш
+        код, поэтому без этого метода воркер бесконечно висел бы в
+        `stop_event.wait()`, а его broken recv-loop продолжал бы
+        сжигать event-loop.
+
+        Если клиент ещё не подключён — возвращает мгновенно (нечего
+        ждать). Если клиент подключён — прокидывает наружу собственный
+        `client.disconnected` awaitable Telethon'а.
+        """
+        if self._client is None or not self._client.is_connected():
+            return
+        try:
+            await self._client.disconnected
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Telethon может кинуть на выходе из disconnect() — для нас
+            # это тот же сигнал "отвалились", проглатываем.
+            log.debug(
+                "wrapper: disconnected awaitable raised, treating as disconnect",
+                exc_info=True,
+            )
+
     def get_session_data(self) -> bytes:
-        """Текущая строка сессии в байтах — для записи в accounts.session_data."""
-        if self._client is not None:
-            try:
-                s = self._client.session.save()
-                if s:
-                    return s.encode("utf-8")
-            except Exception:
-                log.exception("wrapper: failed to save session account=%s", self.account_id)
+        """Текущая строка сессии в байтах — для записи в accounts.session_data.
+
+        Часть A: читаем из ПЕРСИСТЕНТНОГО `self._session` — он тот же объект,
+        что и `client.session`, и живёт даже после disconnect (когда
+        `self._client is None`). Так снапшот сессии всегда актуален.
+        """
+        try:
+            s = self._session.save()
+            if s:
+                return s.encode("utf-8")
+        except Exception:
+            log.exception("wrapper: failed to save session account=%s", self.account_id)
         return self._initial_session.encode("utf-8")
 
     # ─── Подключение ───────────────────────────────────────────────
 
-    async def connect(self, *, require_authorized: bool = True) -> None:
+    async def connect_via(
+        self, proxy_url: str, *, require_authorized: bool = True,
+    ) -> None:
+        """Подключиться через КОНКРЕТНЫЙ прокси (не пробуя fallback).
+
+        Fix #12 (2026-07-12): Worker.run сам управляет какой прокси
+        активен (main или fallback), сам решает когда переключаться,
+        сам крутит retry-loop. Wrapper.connect_via — тонкая обёртка над
+        одной попыткой connect'а к TG через указанный прокси.
+
+        SessionExpired (реальный auth-fail) пробрасывается наружу — это
+        терминально. Всё остальное (ProxyConnectionError, TimeoutError,
+        сетевой RST) — тоже наружу как есть, Worker.run сам решит.
+        """
+        client: TelegramClient | None = None
+        try:
+            client = self._make_client(proxy_url)
+            await asyncio.wait_for(client.connect(), timeout=self.connection_timeout)
+
+            if require_authorized:
+                if not await client.is_user_authorized():
+                    await client.disconnect()
+                    await self._publish_session_expired("is_user_authorized=False")
+                    raise SessionExpired("Сессия не авторизована")
+
+            self._client = client
+            self._active_proxy = proxy_url
+            # Часть A: перевешиваем сохранённые хендлеры на новый клиент.
+            # Воркер регистрирует их один раз; при последовательном свитче
+            # прокси создаётся новый TelegramClient, и хендлеры нужно
+            # привязать к нему (внутренний авто-реконнект Telethon этого не
+            # требует — там клиент тот же).
+            self._reattach_handlers()
+            log.info(
+                "wrapper connected account=%s proxy=%s",
+                self.account_id, mask_proxy(proxy_url),
+            )
+            return
+        except SessionExpired:
+            raise
+        except _SESSION_EXPIRED_ERRORS as e:
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+            if any(m in str(e) for m in _NOT_SESSION_ERROR_MARKERS):
+                raise
+            await self._publish_session_expired(str(e))
+            raise SessionExpired(str(e)) from e
+        except Exception:
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+            raise
+
+    async def probe_proxy(self, proxy_url: str, *, timeout: float = 10.0) -> bool:
+        """Проверить живость прокси ТРАНСПОРТНО, без поднятия реальной сессии TG.
+
+        C3 (2026-07-13): раньше probe поднимал полноценный TelegramClient с
+        РЕАЛЬНЫМ auth-key через второй прокси, пока основной клиент работал
+        через fallback. Telegram видел один auth-key с двух IP →
+        `AUTH_KEY_DUPLICATED` → ревок сессии → массовый разлогин аккаунтов.
+        FAQ Telethon прямо: «If you need two clients, use two sessions».
+
+        Теперь — транспортный TCP-connect через SOCKS до нейтрального хоста
+        (`core.proxy.check_socks5`: `socksocket().connect(("1.1.1.1", 443))`),
+        без TelegramClient и без auth-key. `self._client`/`self._session` не
+        трогаем вообще.
+
+        Возвращает True если прокси доступен, False если любая ошибка.
+        """
+        from core.proxy import check_socks5
+        try:
+            res = await check_socks5(proxy_url, timeout=timeout)
+            ok = bool(res.get("ok"))
+            if not ok:
+                log.debug(
+                    "wrapper probe failed account=%s proxy=%s err=%s",
+                    self.account_id, mask_proxy(proxy_url), res.get("error"),
+                )
+            return ok
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.debug(
+                "wrapper probe failed account=%s proxy=%s err=%s",
+                self.account_id, mask_proxy(proxy_url), e,
+            )
+            return False
+
+    async def connect(
+        self, *, require_authorized: bool = True, publish_error: bool = True,
+    ) -> None:
+        """Обратно-совместимый connect: пробует main → fallback.
+
+        Оставлен для совместимости с auth-flow и service-аккаунтом
+        report_delivery. Worker.run теперь напрямую зовёт `connect_via()`
+        и сам управляет ретраями/переключением.
+
+        M1 (2026-07-13): `publish_error=False` подавляет публикацию
+        `system.error` в шину при недоступности прокси. Нужно вызывающим,
+        которые сами ретраят в цикле (report_delivery коннектится каждые
+        N секунд) — иначе каждая неудачная попытка спамит шину (~2880
+        событий/сутки при мёртвом прокси). Такой вызывающий ловит
+        `ProxyUnavailable` и решает сам, логировать ли и как часто.
+        """
         proxies: list[str] = [self.proxy_primary]
         if self.proxy_fallback:
             proxies.append(self.proxy_fallback)
 
         last_error: Exception | None = None
-
         for proxy_url in proxies:
-            client: TelegramClient | None = None
             try:
-                client = self._make_client(proxy_url)
-                await asyncio.wait_for(client.connect(), timeout=self.connection_timeout)
-
-                if require_authorized:
-                    if not await client.is_user_authorized():
-                        await client.disconnect()
-                        await self._publish_session_expired("is_user_authorized=False")
-                        raise SessionExpired("Сессия не авторизована")
-
-                self._client = client
-                self._active_proxy = proxy_url
-                log.info(
-                    "wrapper connected account=%s proxy=%s",
-                    self.account_id, mask_proxy(proxy_url),
-                )
+                await self.connect_via(proxy_url, require_authorized=require_authorized)
                 return
-
             except SessionExpired:
                 raise
-            except _SESSION_EXPIRED_ERRORS as e:
-                if client is not None:
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
-                await self._publish_session_expired(str(e))
-                raise SessionExpired(str(e)) from e
             except Exception as e:
                 log.warning(
                     "wrapper connect failed account=%s proxy=%s error=%s",
                     self.account_id, mask_proxy(proxy_url), e,
                 )
                 last_error = e
-                if client is not None:
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
                 continue
 
         err_text = (
             f"оба прокси недоступны (последняя ошибка: {last_error})"
             if last_error else "оба прокси недоступны"
         )
-        await bus.publish(
-            module=Module.WRAPPER,
-            type=EventType.SYSTEM_ERROR,
-            status=Status.ERROR,
-            account_id=self.account_id,
-            data={
-                "message": err_text,
-                "proxy_primary": mask_proxy(self.proxy_primary),
-                "proxy_fallback": mask_proxy(self.proxy_fallback),
-            },
-        )
+        if publish_error:
+            await bus.publish(
+                module=Module.WRAPPER,
+                type=EventType.SYSTEM_ERROR,
+                status=Status.ERROR,
+                account_id=self.account_id,
+                data={
+                    "message": err_text,
+                    "proxy_primary": mask_proxy(self.proxy_primary),
+                    "proxy_fallback": mask_proxy(self.proxy_fallback),
+                },
+            )
         raise ProxyUnavailable(err_text)
 
     async def disconnect(self) -> None:
@@ -593,6 +787,11 @@ class TelegramWrapper:
                 if uid is not None:
                     ids.add(int(uid))
         except _SESSION_EXPIRED_ERRORS as e:
+            # См. _NOT_SESSION_ERROR_MARKERS в начале файла: generic 406
+            # (AuthKeyError без специфичного класса) с cannot-write маркером
+            # — это НЕ протухшая сессия, а privacy лида. Пропускаем наверх.
+            if any(m in str(e) for m in _NOT_SESSION_ERROR_MARKERS):
+                raise
             await self._publish_session_expired(str(e))
             raise SessionExpired(str(e)) from e
         return ids
@@ -735,6 +934,11 @@ class TelegramWrapper:
                     "last_message_date": getattr(last_msg, "date", None) if last_msg else None,
                 })
         except _SESSION_EXPIRED_ERRORS as e:
+            # См. _NOT_SESSION_ERROR_MARKERS в начале файла: generic 406
+            # (AuthKeyError без специфичного класса) с cannot-write маркером
+            # — это НЕ протухшая сессия, а privacy лида. Пропускаем наверх.
+            if any(m in str(e) for m in _NOT_SESSION_ERROR_MARKERS):
+                raise
             await self._publish_session_expired(str(e))
             raise SessionExpired(str(e)) from e
         return out
@@ -763,6 +967,11 @@ class TelegramWrapper:
             ):
                 out.append(m)
         except _SESSION_EXPIRED_ERRORS as e:
+            # См. _NOT_SESSION_ERROR_MARKERS в начале файла: generic 406
+            # (AuthKeyError без специфичного класса) с cannot-write маркером
+            # — это НЕ протухшая сессия, а privacy лида. Пропускаем наверх.
+            if any(m in str(e) for m in _NOT_SESSION_ERROR_MARKERS):
+                raise
             await self._publish_session_expired(str(e))
             raise SessionExpired(str(e)) from e
         return out
@@ -828,6 +1037,11 @@ class TelegramWrapper:
     ) -> None:
         if self._client is None:
             raise NotConnected("Сначала вызвать connect()")
+        # Часть A: запоминаем регистрацию, чтобы перевесить на новый клиент
+        # при последовательном свитче прокси (см. _reattach_handlers).
+        self._msg_handler = handler
+        self._msg_incoming = incoming
+        self._msg_outgoing = outgoing
         self._client.add_event_handler(
             handler,
             events.NewMessage(incoming=incoming, outgoing=outgoing),
@@ -843,10 +1057,47 @@ class TelegramWrapper:
         """
         if self._client is None:
             raise NotConnected("Сначала вызвать connect()")
+        self._typing_observer_enabled = True
         self._client.add_event_handler(
             self._on_user_update,
             events.UserUpdate(),
         )
+
+    def _reattach_handlers(self) -> None:
+        """Перевесить сохранённые хендлеры на текущий `self._client`.
+
+        Часть A: вызывается из `connect_via` после установки нового клиента
+        (последовательный свитч прокси создаёт новый TelegramClient). Воркер
+        регистрирует хендлеры один раз — здесь мы гарантируем что они висят
+        на актуальном клиенте. Внутренний авто-реконнект Telethon (тот же
+        клиент) хендлеры сохраняет сам, повторная привязка там не нужна.
+        """
+        if self._client is None:
+            return
+        if self._msg_handler is not None:
+            self._client.add_event_handler(
+                self._msg_handler,
+                events.NewMessage(
+                    incoming=self._msg_incoming, outgoing=self._msg_outgoing,
+                ),
+            )
+        if self._typing_observer_enabled:
+            self._client.add_event_handler(
+                self._on_user_update,
+                events.UserUpdate(),
+            )
+
+    async def get_me(self) -> Any:
+        """Вернуть свой профиль (высокоуровневый запрос).
+
+        Часть A: воркер зовёт его один раз сразу после connect — первый
+        high-level запрос заставляет TG начать слать апдейты этому клиенту
+        (иначе push-updates могут не пойти до первого запроса). Ошибки сессии
+        мапятся в SessionExpired через `_guard`.
+        """
+        async def _do():
+            return await self.client.get_me()
+        return await self._guard(_do)
 
     async def _on_user_update(self, event: Any) -> None:
         """
@@ -885,14 +1136,47 @@ class TelegramWrapper:
     # ─── Внутренности ──────────────────────────────────────────────
 
     def _make_client(self, proxy_url: str) -> TelegramClient:
-        return TelegramClient(
-            StringSession(self._initial_session),
-            self.api_id,
-            self.api_hash,
-            proxy=parse_socks5(proxy_url),
-            connection_retries=self.connection_retries,
-            timeout=self.connection_timeout,
-        )
+        # device-поля передаём в TelegramClient только если они заданы.
+        # Если не заданы (service-аккаунт) — Telethon применит свои дефолты.
+        # NB: `lang_pack` хранится в `accounts` для документации, но в
+        # `TelegramClient.__init__` его нет (внутреннее MTProto-поле в
+        # initConnection, не публичный аргумент конструктора).
+        #
+        # Часть A (2026-07-13): передаём ПЕРСИСТЕНТНЫЙ `self._session` (а не
+        # свежий из строки) и отдаём реконнект/догон самому Telethon:
+        #   * auto_reconnect=True + connection_retries + retry_delay —
+        #     сетевые блипы Telethon переживает сам, на том же клиенте,
+        #     прозрачно, без событий worker.restarted и без потери приёма
+        #     (хендлеры переживают внутренний реконнект). Дохлый прокси
+        #     исчерпывает retries → `client.disconnected` разрешается →
+        #     супервайзер делает последовательный свитч на fallback.
+        #   * catch_up=True — пропущенные апдейты Telethon догоняет сам
+        #     на connect (замена костыля force_catch_up).
+        #   * flood_sleep_threshold — короткие FloodWait Telethon пересыпает
+        #     сам, не эскалируя их в наш код.
+        kwargs: dict[str, Any] = {
+            "session": self._session,
+            "api_id": self.api_id,
+            "api_hash": self.api_hash,
+            "proxy": parse_socks5(proxy_url),
+            "auto_reconnect": True,
+            "connection_retries": self.connection_retries,
+            "retry_delay": self.retry_delay,
+            "request_retries": 5,
+            "timeout": self.connection_timeout,
+            "flood_sleep_threshold": 60,
+            "receive_updates": True,
+            "catch_up": True,
+            "lang_code": self.lang_code,
+            "system_lang_code": self.system_lang_code,
+        }
+        if self.device_model:
+            kwargs["device_model"] = self.device_model
+        if self.system_version:
+            kwargs["system_version"] = self.system_version
+        if self.app_version:
+            kwargs["app_version"] = self.app_version
+        return TelegramClient(**kwargs)
 
     async def _guard(self, coro_fn: Callable[[], Awaitable[Any]]) -> Any:
         if self._client is None:
@@ -900,6 +1184,13 @@ class TelegramWrapper:
         try:
             return await coro_fn()
         except _SESSION_EXPIRED_ERRORS as e:
+            # 406-fallback защита: если это generic AuthKeyError с одним из
+            # cannot-write-маркеров в тексте — это НЕ session expired,
+            # а "лид не принимает сообщения". Пропускаем наверх без подмены,
+            # autochat/service.py::except RPCError отсеивает и делает
+            # CannotWrite → CRM invalid. См. _NOT_SESSION_ERROR_MARKERS выше.
+            if any(m in str(e) for m in _NOT_SESSION_ERROR_MARKERS):
+                raise
             await self._publish_session_expired(str(e))
             raise SessionExpired(str(e)) from e
 

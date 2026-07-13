@@ -10,7 +10,7 @@
 > (настоящее время, «как работает сейчас»); раздел 20 — **хронологическая история
 > изменений** по всем этапам (1 → 10.27), отвечающая на вопрос «что и когда меняли».
 >
-> **Обновлено:** 2026-06-27.
+> **Обновлено:** 2026-07-13.
 >
 > **Регламент поддержки** (держим документ всегда актуальным):
 > 1. Любое изменение в коде сразу отражаем здесь; отдельные `.md` в `docs/` не заводим.
@@ -191,7 +191,7 @@ Telegram Automation Framework — система управления пулом
 | `media_description` | `service.py` | Визуальный контент → текст: FFmpeg (нарезка кадров) + OpenRouter. Картинки/кадры описываются через GPT-4o (`openai/gpt-4o`), документы — через Gemini (`google/gemini-2.5-flash`). |
 | `autochat` | `service.py`, `routes.py`, `report_consumer.py` | Автодиалоги: инициированные переписки через LLM с имитацией живого поведения. `report_consumer` слушает `dialog.status_changed`, при терминальном статусе собирает HTML-отчёт диалога и кладёт в MinIO в одну из трёх папок (`success`/`failed`/`archive`). |
 | `dialog_statuses` | `service.py`, `routes.py` | Каталог операторских статусов диалога (пузыри жизненного цикла: первый контакт, общение, обрыв, завершён успех/провал и т.п.). К нему обращаются `lead_evaluator` и `silence_watcher` через прямой импорт. |
-| `worker_auto_runner` | `service.py`, `routes.py` | Per-account автомат: подбирает лида из пула и по таймеру запускает автодиалог через `autochat.create_session`. При старте приложения сбрасывает `is_running` у всех — после рестарта сам не возобновляется, оператор включает заново. |
+| `worker_auto_runner` | `service.py`, `routes.py` | Per-account автомат: при `start()` строит расписание из N лидов в окне 12ч (uniform, с гарантированным прогревом), в каждый момент вызывает `autochat.create_session`. Расписание в БД — переживает рестарт app (`resume_running_loops`). |
 | `peer_profile` | `service.py` | Ленивая дозагрузка профиля собеседника: фоновый consumer на каждый `dialog.created` дотягивает bio и день рождения через `GetFullUserRequest` (нужен `get_wrapper`). |
 | `lead_evaluator` | `service.py`, `routes.py`, `silence_watcher.py` | LLM-оценка закрытого диалога как лида (судья на `autochat.finished_by_llm`) + извлечение полей. `silence_watcher` — таймеры тишины: переходы «Общение → Обрыв» по 4 ч и «Первый контакт/Обрыв → Завершён провал» по 48 ч. |
 | `partner_crm` | `service.py`, `routes.py`, `poller.py`, `finalizer.py` | Интеграция с внешней CRM партнёра. `service` — httpx-клиент (keep-alive) + локальный пул лидов; `poller` докачивает пул из CRM по интервалу, если есть активные CRM-воркеры и пул просел ниже порога; `finalizer` слушает `dialog.status_changed` и при терминальном пузыре с `from_crm=TRUE` пушит финальный статус обратно в CRM. |
@@ -218,7 +218,7 @@ Telegram Automation Framework — система управления пулом
 - **lead-evaluator** — `LeadEvaluatorService` + `SilenceWatcher` (модуль `lead_evaluator`): LLM-судья закрытых диалогов и таймеры тишины (4 ч / 48 ч).
 - **partner-crm** — `PartnerCrmService` + `PartnerCrmPoller` (докачка пула лидов) + `PartnerCrmFinalizer` (финализация статуса в CRM).
 - **report-delivery** — `ReportDeliveryService` (модуль `report_delivery`): доставка success-отчётов сервис-аккаунтом в TG-группы.
-- **worker-auto-runner** — `WorkerAutoRunnerService` (модуль `worker_auto_runner`): per-account автозапуск диалогов; на старте делает `reset_on_boot()` (сбрасывает `is_running`).
+- **worker-auto-runner** — `WorkerAutoRunnerService` (модуль `worker_auto_runner`): per-account автозапуск диалогов по расписанию окна; на старте `reset_on_boot()` гасит только «мёртвые» сессии (истёкшие / без окна), затем `resume_running_loops()` подхватывает живые.
 
 Кроме того в `lifespan` создаются (без отдельной фоновой петли как consumer) `AuthService` и `WorkerManager`. Порядок остановки обратный порядку запуска зависимостей: сначала гасится `worker_auto_runner` (перестаёт звать `autochat.create_session`), затем `autochat`, `peer_profile` и остальные сервисы, и лишь потом закрываются `WorkerManager`, пулы БД и Redis.
 
@@ -662,7 +662,7 @@ MINIO_REPORTS_BUCKET=autochat-reports   # отдельный бакет для H
 
 # OpenRouter
 OPENROUTER_API_KEY=
-OPENROUTER_MODEL_TRANSCRIPTION=openai/whisper
+OPENROUTER_MODEL_TRANSCRIPTION=openai/gpt-4o-mini-transcribe
 OPENROUTER_MODEL_DESCRIPTION=openai/gpt-4o
 OPENROUTER_MODEL_DESCRIPTION_DOCUMENTS=google/gemini-2.5-flash   # документы (PDF и др.) — модель с нативной поддержкой файлов
 OPENROUTER_MODEL_AUTOCHAT=anthropic/claude-opus-4.7   # уточнить точное имя в каталоге OpenRouter
@@ -690,7 +690,7 @@ REPORT_GROUP_MAP=             # JSON {семейство_воркера: chat_id
 | PostgreSQL | `POSTGRES_HOST/PORT/DB/USER/PASSWORD` | подключение к БД |
 | Redis | `REDIS_HOST/PORT` | подключение к шине/статусам |
 | MinIO | `MINIO_HOST/PORT`, `MINIO_ROOT_USER/PASSWORD`, `MINIO_BUCKET`, `MINIO_REPORTS_BUCKET` | подключение и имена bucket'ов (`MINIO_BUCKET` — медиа с TTL; `MINIO_REPORTS_BUCKET` — HTML-отчёты автодиалогов, хранятся долго). Пароль — минимум 8 символов (требование MinIO) |
-| OpenRouter | `OPENROUTER_API_KEY`, `OPENROUTER_MODEL_TRANSCRIPTION/DESCRIPTION/DESCRIPTION_DOCUMENTS/AUTOCHAT/EVALUATOR` | ключ и модели для транскрибации (Whisper), описания медиа (GPT-4o), описания документов (Gemini 2.5 Flash), автодиалогов и оценщика лидов |
+| OpenRouter | `OPENROUTER_API_KEY`, `OPENROUTER_MODEL_TRANSCRIPTION/DESCRIPTION/DESCRIPTION_DOCUMENTS/AUTOCHAT/EVALUATOR` | ключ и модели для транскрибации (`gpt-4o-mini-transcribe` через `/api/v1/audio/transcriptions`), описания медиа (GPT-4o), описания документов (Gemini 2.5 Flash), автодиалогов и оценщика лидов |
 | Telegram API | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | общие креды для всех аккаунтов с my.telegram.org |
 | CRM коллеги | `CRM_BASE_URL`, `CRM_API_TOKEN` | адрес и токен партнёрской CRM (модуль `partner_crm` / `scripts/crm_probe.py`) |
 | report_delivery | `SERVICE_ACCOUNT_NAME`, `REPORT_GROUP_MAP` | сервис-аккаунт доставки отчётов (скрыт из UI) и карта семейство воркера → `chat_id` группы; пустая карта выключает доставку (см. раздел «report_delivery») |
@@ -917,12 +917,22 @@ crm_lead_pool   ← независимая, без FK
 | `is_active` | bool | активен ли аккаунт |
 | `lead_source` | text NOT NULL DEFAULT `'manual'` | откуда берёт лидов: `manual` \| `partner_crm` |
 | `target_gender` | text NOT NULL DEFAULT `'any'` | целевой пол собеседников для подбора из CRM: `any` \| `female` \| `male` |
+| `api_id` | integer NULL | индивидуальный `api_id` приложения, зарегистрированного на my.telegram.org для этого аккаунта |
+| `api_hash` | text NULL | индивидуальный `api_hash` (парный с `api_id`) |
+| `device_model` | text NULL | напр. «Samsung Galaxy S23» — попадёт в Telethon как `device_model` |
+| `system_version` | text NULL | напр. «Android 14» |
+| `app_version` | text NULL | напр. «Telegram Android 10.5.4» |
+| `lang_code` | text NULL | язык интерфейса, например `ru` |
+| `system_lang_code` | text NULL | язык системы, например `ru` |
+| `lang_pack` | text NULL | пак языка (`tdesktop` / `android` / пусто) — хранится для документации; в `TelegramClient.__init__` Telethon его не принимает, поле уезжает в initConnection через сам Telethon |
 | `created_at` | timestamp | когда добавлен |
 | `updated_at` | timestamp | когда обновлялся |
 
 Оперативный статус воркера (`running` / `stopped` / `crashed`) хранится только в Redis, не в этой таблице — это runtime-данные.
 
 `lead_source` и `target_gender` добавлены под CRM-интеграцию (миграция `0012_crm_integration.py`) и управляют тем, как воркер подбирает себе новых собеседников из `crm_lead_pool`.
+
+Восемь fingerprint-полей (`api_id`/`api_hash` + 6 device-полей) добавлены миграцией `0013_account_fingerprint.py`. До неё на всю ферму использовался один глобальный `TELEGRAM_API_ID/HASH` из `.env` и дефолтный device-fingerprint Telethon — это маркер автоматизации, по которому Telegram группировал аккаунты и применял batch-action'ы (см. §20 — запись «2026-06-29»). Теперь каждый рабочий аккаунт несёт собственные значения; auth-флоу (`/auth/start`) принимает их от оператора и сохраняет в БД, а wrapper при каждом `connect()` подставляет их в `TelegramClient(...)`. Колонки NULL-able: служебный аккаунт доставки отчётов (`service`) их не использует — он держит своё подключение в `report_delivery` с глобальными credentials и дефолтным fingerprint'ом Telethon. Worker-аккаунт без заполненных fingerprint-полей не стартует — `worker_manager` возвращает `ACCOUNT_FINGERPRINT_MISSING`.
 
 ---
 
@@ -1290,7 +1300,7 @@ HTML-выгрузка по сессии, завершённой штатным L
 | `peer-profile-fetcher` | `PEER_PROFILE_GROUP` — `peer_profile/service.py` | Догружает профиль собеседника через враппер (consumer-loop как фоновая задача в lifespan). |
 | `lead-evaluator` | `EVALUATOR_GROUP` — `lead_evaluator/service.py` | Оценивает диалог через LLM, маппит verdict в terminal-статус / метку лида. |
 | `partner-crm-finalizer` | `FINALIZER_GROUP` — `partner_crm/finalizer.py` | Bus-consumer terminal-статуса: финализирует запись в Partner CRM. |
-| `auto-runner-worker` | `AUTO_RUNNER_GROUP` — `worker_auto_runner/service.py` | Авто-планировщик стартов воркеров с интервалом и джиттером. |
+| `auto-runner-worker` | `AUTO_RUNNER_GROUP` — `worker_auto_runner/service.py` | Слушает `worker.stopped`/`worker.crashed`, гасит соответствующий per-account автомат. Сами стартовые тики автомата — не через шину, а через локальный `asyncio.Task` со сном до `schedule[0]`. |
 | `report-delivery` | `GROUP` — `report_delivery/service.py` | На `autochat.report_saved` (folder=success) заливает HTML-отчёт в TG-группу по семейству воркера. |
 
 Имена групп подтверждены по константам в коде: `AUTOCHAT_GROUP = "autochat-worker"`, `REPORT_GROUP = "autochat-report-builder"`, `PEER_PROFILE_GROUP = "peer-profile-fetcher"`, `EVALUATOR_GROUP = "lead-evaluator"`, `FINALIZER_GROUP = "partner-crm-finalizer"`, `AUTO_RUNNER_GROUP = "auto-runner-worker"`, `GROUP = "report-delivery"` (в `report_delivery/service.py`).
@@ -1605,15 +1615,53 @@ Observer включается для ВСЕХ воркеров: в `Worker.run()
 
 Публикация события защищена try/except с `log.debug`: typing-события идут часто (примерно каждые ~5 сек, пока собеседник печатает), и ошибка в handler'е не должна вывалить весь Telethon dispatch loop воркера.
 
-### 8.7. Управление прокси
+### 8.6.1. Индивидуальный fingerprint аккаунта
 
-Каждый воркер работает через свой прокси (SOCKS5); враппер следит за его состоянием. При недоступности — переключение на запасной прокси, при недоступности обоих — воркер останавливается:
+Wrapper подставляет в `TelegramClient(...)` поля, уникальные для каждого
+аккаунта: `api_id`, `api_hash`, `device_model`, `system_version`,
+`app_version`, `lang_code`, `system_lang_code`, `lang_pack`. Значения
+хранятся в `accounts` (см. §6) и читаются `worker_manager` при `start()`
+вместе с `session_data`/`proxy_*`. До миграции `0013_account_fingerprint`
+ферма использовала одни глобальные `TELEGRAM_API_ID/HASH` и дефолтный
+Telethon-fingerprint на всех воркерах — это маркер автоматизации, по
+которому Telegram батч-банил группу аккаунтов разом (см. §20 — запись
+«2026-06-29»).
+
+Контракт wrapper'а:
+
+- `api_id` / `api_hash` — обязательны, без них `__init__` падает с
+  `ValueError`;
+- `device_model` / `system_version` / `app_version` — опциональны на
+  уровне wrapper'а (если пусто, в `TelegramClient(...)` не передаются —
+  Telethon применяет свои дефолты, как для service-аккаунта доставки);
+- но для **рабочих** аккаунтов их непустота проверяется уровнем выше — в
+  `worker_manager.start()`: пустые поля → `ACCOUNT_FINGERPRINT_MISSING`
+  (HTTP 409). Это страховка от запуска воркера, который мог бы выдать
+  Telegram «дефолтный» fingerprint и спалить всю ферму.
+
+Значения никогда не меняются после регистрации аккаунта: реавторизация
+(`/auth/reauth`) перезаписывает только `session_data`, остальные поля
+остаются как были — Telegram должен видеть «тот же клиент» при каждом
+переподключении.
+
+### 8.7. Управление прокси (один персистентный клиент + авто-реконнект Telethon)
+
+Каждый воркер работает через свой прокси (SOCKS5). Слой соединения построен на **одном персистентном `TelegramClient` на аккаунт**, живущем всё время работы воркера, а реконнект и догон отданы самому Telethon (переписано 2026-07-13, «Часть A»):
+
+- **Персистентный `StringSession`.** Объект сессии создаётся один раз в `TelegramWrapper.__init__` (`self._session`) и переезжает во все последующие клиенты. Telethon эволюционирует его на месте — entity-кэш, updates-state (pts/qts/date) и server salt сохраняются между реконнектами. Клиент строится с `auto_reconnect=True`, `connection_retries` (генерозно, ~10), `retry_delay`, `catch_up=True`, `flood_sleep_threshold=60`, `receive_updates=True`.
+- **Сетевые блипы держит Telethon сам**, на том же клиенте, прозрачно — без событий `worker.restarted` и без потери приёма (хендлеры и кэш переживают внутренний авто-реконнект).
+- **Свитч прокси — строго последовательный.** Супервайзер в `Worker.run` вмешивается только когда активный прокси лёг надолго (Telethon исчерпал реконнект → `client.disconnected`). Тогда сначала полный `disconnect()` старого клиента, потом `connect_via()` нового с тем же `self._session`. **Никогда две живые сессии одновременно.**
+- **Живость прокси проверяется транспортом, а не сессией.** Пока воркер на fallback, фоновый `probe_proxy` делает TCP-connect через SOCKS до нейтрального хоста (`core.proxy.check_socks5`, `1.1.1.1:443`) — без `TelegramClient` и без auth-key. Ожил → супервайзер (единый владелец соединения) делает последовательный свитч обратно на основной. Между попытками реконнекта — бэкофф.
 
 ```
-Основной прокси → недоступен → Запасной прокси → недоступен → воркер останавливается
-                                                              └── публикует system.error на шину
-                                                              └── is_active = false в accounts
+Основной прокси ── блип ──▶ Telethon сам реконнектит (тот же клиент, приём не прерывается)
+Основной прокси ── лёг надолго ──▶ disconnect старого → connect на fallback (последовательно)
+                                    └── фоновый ТРАНСПОРТНЫЙ probe основного (без сессии)
+                                    └── основной ожил → последовательный свитч обратно
+Оба прокси недоступны ──▶ супервайзер ретраит с бэкоффом (как TG Desktop «Connecting…»)
 ```
+
+> **Почему так (фон).** Раньше на каждый реконнект и каждый свитч создавался НОВЫЙ клиент из исходной строки сессии (сброс кэша/updates-state), а фоновый probe поднимал **вторую реальную сессию** через другой прокси. Telegram видел один auth-key с двух IP → `AUTH_KEY_DUPLICATED` → ревок → массовый разлогин. Костыли «warm-up entity-кэша», «re-subscribe handlers» и `force_catch_up` компенсировали сброс состояния. Часть A убрала фундамент проблемы: один клиент + авто-реконнект/`catch_up` Telethon + последовательный свитч + транспортный probe — три костыля удалены как класс.
 
 ### 8.8. Протухшая сессия и обработка ошибок
 
@@ -1648,25 +1696,37 @@ Observer включается для ВСЕХ воркеров: в `Worker.run()
 
 ### 9.1. Таблица accounts
 
-В таблицу `accounts` пишет только модуль авторизации (создание/переавторизация) и воркер (сброс `is_active` при протухшей сессии). Схема (миграция `0001_initial`):
+В таблицу `accounts` пишет только модуль авторизации (создание/переавторизация) и воркер (сброс `is_active` при протухшей сессии). Схема (миграция `0001_initial`, расширена `0012_crm_integration` и `0013_account_fingerprint`):
 
 ```sql
 CREATE TABLE accounts (
-    id              SERIAL PRIMARY KEY,
-    name            TEXT NOT NULL,
-    phone           TEXT NOT NULL UNIQUE,
-    session_data    BYTEA,
-    proxy_primary   TEXT NOT NULL,
-    proxy_fallback  TEXT NOT NULL,
-    is_active       BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    id               SERIAL PRIMARY KEY,
+    name             TEXT NOT NULL,
+    phone            TEXT NOT NULL UNIQUE,
+    session_data     BYTEA,
+    proxy_primary    TEXT NOT NULL,
+    proxy_fallback   TEXT NOT NULL,
+    is_active        BOOLEAN NOT NULL DEFAULT FALSE,
+    lead_source      TEXT NOT NULL DEFAULT 'manual',
+    target_gender    TEXT NOT NULL DEFAULT 'any',
+    -- индивидуальный fingerprint (0013) — заполняется при auth
+    api_id           INTEGER,
+    api_hash         TEXT,
+    device_model     TEXT,
+    system_version   TEXT,
+    app_version      TEXT,
+    lang_code        TEXT,
+    system_lang_code TEXT,
+    lang_pack        TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 ```
 
 - `session_data` — строка Telethon-сессии (`StringSession`), сохранённая через `client.session.save()` и закодированная в UTF-8 байты. Хранится `BYTEA`.
 - `proxy_primary` / `proxy_fallback` — прокси в URL-форме `socks5://user:pass@host:port` (см. §9.7).
 - `phone` — уникален (`UNIQUE`); один номер = один аккаунт.
+- 8 fingerprint-полей (`api_id`/`api_hash` + 6 device-полей) — индивидуальные на каждый воркер; заполняются при `/auth/start`, на переавторизации (`/auth/reauth`) сохраняются как есть. Колонки NULL-able специально, чтобы служебный аккаунт доставки (`service`) их не использовал — он держит своё подключение в `report_delivery` с глобальными credentials.
 
 ### 9.2. Состояние сессии авторизации
 
@@ -1678,12 +1738,15 @@ CREATE TABLE accounts (
    |---|---|
    | `phase` | текущая фаза: `code_sent` / `2fa_required` / `done` / `failed` |
    | `phone`, `name`, `proxy_primary`, `proxy_fallback` | данные из `/auth/start` |
+   | `api_id`, `api_hash`, `device_model`, `system_version`, `app_version`, `lang_code`, `system_lang_code`, `lang_pack` | fingerprint аккаунта из `/auth/start` — переносятся в `accounts` на финале |
    | `reauth_account_id` | `id` переавторизуемого аккаунта или `null` |
    | `created_at` | ISO-метка создания |
    | `error` | текст ошибки (для фазы `failed`) или `null` |
    | `account_id` | проставляется при `done` |
 
-2. **Память процесса** — `dataclass _Live` (поля `client: TelegramClient`, `phone_code_hash`, `reauth_account_id`), индексируется по `session_id` в `AuthService._live`. Здесь живут открытое подключение Telethon и `phone_code_hash`, который нельзя сериализовать. Если процесс перезапустился — активные авторизации теряются (Redis-состояние есть, но `_live` пуст), и `submit_code` / `submit_password` вернут `SESSION_EXPIRED` («Клиент не найден в памяти процесса»). Клиент начинает заново. При штатной остановке приложения `shutdown()` закрывает все активные клиенты.
+   2FA-пароль из `/auth/start` (опциональный) в Redis **не пишется** — он живёт только в памяти процесса (см. ниже), чтобы не утекать в хранилище.
+
+2. **Память процесса** — `dataclass _Live` (поля `client: TelegramClient`, `phone_code_hash`, `reauth_account_id`, `password`), индексируется по `session_id` в `AuthService._live`. Здесь живут открытое подключение Telethon, `phone_code_hash` (нельзя сериализовать) и опциональный 2FA-пароль, переданный оператором заранее. Если процесс перезапустился — активные авторизации теряются (Redis-состояние есть, но `_live` пуст), и `submit_code` / `submit_password` вернут `SESSION_EXPIRED` («Клиент не найден в памяти процесса»). Клиент начинает заново. При штатной остановке приложения `shutdown()` закрывает все активные клиенты.
 
 Фазы заданы константами в `service.py`: `PHASE_CODE_SENT="code_sent"`, `PHASE_2FA_REQUIRED="2fa_required"`, `PHASE_DONE="done"`, `PHASE_FAILED="failed"`.
 
@@ -1691,14 +1754,15 @@ CREATE TABLE accounts (
 
 #### Шаг 1 — `/auth/start`: данные, проверка прокси, запрос кода
 
-`start()` принимает 4 поля и выполняет последовательно:
+`start()` принимает 12+ полей (полный fingerprint аккаунта + опциональный 2FA-пароль) и выполняет последовательно:
 
 1. **Валидация телефона** — regex `^\+\d{5,20}$` (`_PHONE_RX`); иначе `PHONE_INVALID`.
-2. **Валидация API-кредов** — `settings.TELEGRAM_API_ID` и `TELEGRAM_API_HASH` должны быть заданы в `.env` (получаются на https://my.telegram.org); иначе `AUTH_ERROR` / `API_CREDENTIALS_INVALID`.
-3. **Проверка обоих прокси** — `check_socks5(proxy_primary)`, затем `check_socks5(proxy_fallback)` (см. §9.7). Если хотя бы один недоступен — `PROXY_CHECK_FAILED`, флоу не начинается. Смысл: нет резона стартовать авторизацию через нерабочий прокси.
-4. **Подключение к Telegram через primary** — поднимается `TelegramClient(StringSession(), API_ID, API_HASH, proxy=parse_socks5(proxy_primary), connection_retries=2, timeout=20)`, `connect()` с тайм-аутом 20 с. Весь дальнейший флоу идёт через **этот же прокси** — Telegram должен видеть один IP на всех шагах.
-5. **Отправка кода** — `send_code_request(phone)`. `phone_code_hash` сохраняется в `_Live`. Обработка ошибок Telethon: `PhoneNumberInvalidError → PHONE_INVALID`, `PhoneNumberBannedError → PHONE_BANNED`, `ApiIdInvalidError → API_CREDENTIALS_INVALID`, `FloodWaitError →` сообщение с числом секунд.
-6. Запись состояния в Redis (фаза `code_sent`).
+2. **Валидация API-кредов** — `api_id` и `api_hash` (передаются в теле запроса; индивидуальные на каждый аккаунт, получаются на https://my.telegram.org). Пустые → `API_CREDENTIALS_INVALID`. Глобальные `TELEGRAM_API_ID/HASH` из `.env` больше не используются worker-аккаунтами — только service-аккаунтом доставки отчётов.
+3. **Валидация fingerprint'а** — `device_model`, `system_version`, `app_version` должны быть непустыми; иначе `FINGERPRINT_INVALID`. `lang_code` / `system_lang_code` дефолтятся на `'en'` если пусто, `lang_pack` остаётся пустой строкой.
+4. **Проверка обоих прокси** — `check_socks5(proxy_primary)`, затем `check_socks5(proxy_fallback)` (см. §9.7). Если хотя бы один недоступен — `PROXY_CHECK_FAILED`, флоу не начинается.
+5. **Подключение к Telegram через primary** — поднимается `TelegramClient(StringSession(), api_id, api_hash, proxy=parse_socks5(proxy_primary), connection_retries=2, timeout=20, device_model=..., system_version=..., app_version=..., lang_code=..., system_lang_code=..., lang_pack=...)` со всеми fingerprint-полями. `connect()` с тайм-аутом 20 с. Весь дальнейший флоу идёт через **этот же прокси** и **этот же fingerprint** — Telegram должен видеть единого клиента на всех шагах.
+6. **Отправка кода** — `send_code_request(phone)`. `phone_code_hash` сохраняется в `_Live`. Обработка ошибок Telethon: `PhoneNumberInvalidError → PHONE_INVALID`, `PhoneNumberBannedError → PHONE_BANNED`, `ApiIdInvalidError → API_CREDENTIALS_INVALID`, `FloodWaitError →` сообщение с числом секунд.
+7. Запись состояния в Redis (фаза `code_sent`) — туда уходят все fingerprint-поля. 2FA-пароль, если был передан, сохраняется только в `_Live.password` (в Redis не пишется).
 
 Возврат: `{"session_id": <hex>, "status": "code_sent"}`.
 
@@ -1708,7 +1772,9 @@ CREATE TABLE accounts (
 
 - `PhoneCodeInvalidError` / `PhoneCodeEmptyError → CODE_INVALID` — сессия остаётся в фазе `code_sent`, можно повторить ввод (ещё попытка).
 - `PhoneCodeExpiredError → CODE_EXPIRED` (410) — состояние помечается `failed`, нужно начинать заново с `/auth/start`.
-- `SessionPasswordNeededError` — на аккаунте включена 2FA; фаза → `2fa_required`, возврат `{"status": "2fa_required"}`.
+- `SessionPasswordNeededError` — на аккаунте включена 2FA:
+  - если оператор передал `password` в `/auth/start` → backend сам вызывает `client.sign_in(password=...)` (`_apply_password_inline`) и сразу финализирует аккаунт. Ответ: `{"status": "done", "account_id": N}`. Если пароль не подошёл — `PASSWORD_INVALID`, фаза переводится в `2fa_required`, оператор может прислать правильный пароль через `/auth/2fa`.
+  - если оператор пароль не передал — фаза → `2fa_required`, возврат `{"status": "2fa_required"}`, дальше ожидается `/auth/2fa`.
 - Успех без 2FA → `_finalize()`, возврат `{"status": "done", "account_id": N}`.
 
 #### Шаг 3 — `/auth/2fa`: облачный пароль (если включён)
@@ -1724,8 +1790,8 @@ CREATE TABLE accounts (
 
 1. `session_str = client.session.save()`, кодируется в UTF-8 байты.
 2. В одной транзакции:
-   - **новый аккаунт** (`reauth_account_id is None`): `INSERT INTO accounts (name, phone, session_data, proxy_primary, proxy_fallback, is_active, created_at, updated_at) VALUES (..., TRUE, NOW(), NOW())`; событие `account.created`.
-   - **переавторизация** (`reauth_account_id` задан): `UPDATE accounts SET session_data=$1, is_active=TRUE, updated_at=NOW() WHERE id=$2`; если строки нет — `ACCOUNT_NOT_FOUND`; событие `account.reauthorized`.
+   - **новый аккаунт** (`reauth_account_id is None`): `INSERT INTO accounts (name, phone, session_data, proxy_primary, proxy_fallback, is_active, api_id, api_hash, device_model, system_version, app_version, lang_code, system_lang_code, lang_pack, created_at, updated_at) VALUES (..., TRUE, ..., NOW(), NOW())`; все 8 fingerprint-полей пишутся из Redis-state; событие `account.created`.
+   - **переавторизация** (`reauth_account_id` задан): `UPDATE accounts SET session_data=$1, is_active=TRUE, updated_at=NOW() WHERE id=$2` — fingerprint-поля при reauth НЕ перезаписываются (Telegram должен видеть «тот же клиент»); если строки нет — `ACCOUNT_NOT_FOUND`; событие `account.reauthorized`.
 3. Публикация на шину (см. раздел «Шина событий») через `bus.publish(module=Module.AUTH, type=event_type, status=Status.SUCCESS, account_id=..., data={"account_id", "phone"})`.
 4. Redis-состояние → фаза `done` с `account_id`; клиент отключается и удаляется из `_live`.
 
@@ -1735,8 +1801,8 @@ CREATE TABLE accounts (
 
 | Метод + путь | Тело | Ответ |
 |---|---|---|
-| `POST /auth/start` | `{phone, name, proxy_primary, proxy_fallback}` | `{session_id, status:"code_sent"}` |
-| `POST /auth/code` | `{session_id, code}` | `{status:"2fa_required"}` или `{status:"done", account_id}` |
+| `POST /auth/start` | `{phone, name, proxy_primary, proxy_fallback, api_id, api_hash, device_model, system_version, app_version, lang_code, system_lang_code, lang_pack, password?}` | `{session_id, status:"code_sent"}` |
+| `POST /auth/code` | `{session_id, code}` | `{status:"2fa_required"}` или `{status:"done", account_id}` (если в `/auth/start` был передан `password` — сразу `done`) |
 | `POST /auth/2fa` | `{session_id, password}` | `{status:"done", account_id}` |
 | `GET /auth/status/{session_id}` | — | `{session_id, phase, phone, created_at, error}` |
 | `DELETE /auth/{session_id}` | — | `204 No Content` |
@@ -1750,6 +1816,15 @@ class AuthStartIn(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     proxy_primary: str
     proxy_fallback: str
+    api_id: int = Field(gt=0)
+    api_hash: str = Field(min_length=1)
+    device_model: str = Field(min_length=1, max_length=200)
+    system_version: str = Field(min_length=1, max_length=200)
+    app_version: str = Field(min_length=1, max_length=200)
+    lang_code: str = Field(default="en", min_length=1, max_length=20)
+    system_lang_code: str = Field(default="en", min_length=1, max_length=20)
+    lang_pack: str = Field(default="", max_length=50)
+    password: str | None = None  # опц. 2FA-пароль — применится автоматически
 
 class CodeIn(BaseModel):
     session_id: str
@@ -1780,7 +1855,8 @@ class ReauthIn(BaseModel):
 | `PASSWORD_INVALID` | 400 | неверный пароль 2FA |
 | `ACCOUNT_NOT_FOUND` | 404 | reauth по несуществующему `account_id` |
 | `BAD_PHASE` | 409 | операция вызвана не в той фазе |
-| `API_CREDENTIALS_INVALID` | 400 | неверные `TELEGRAM_API_ID/HASH` |
+| `API_CREDENTIALS_INVALID` | 400 | пустые / неверные `api_id`/`api_hash` |
+| `FINGERPRINT_INVALID` | 400 | пустые `device_model`/`system_version`/`app_version` |
 | `AUTH_ERROR` | 400 | прочее (FloodWait, неожиданные ошибки) |
 
 ### 9.5. Переавторизация протухшей сессии
@@ -1801,7 +1877,7 @@ class ReauthIn(BaseModel):
 
 #### Флоу переавторизации
 
-`POST /auth/reauth {account_id}` → `start_reauth()` читает из `accounts` `name`, `phone`, `proxy_primary`, `proxy_fallback` (если строки нет — `ACCOUNT_NOT_FOUND`) и запускает тот же `start()` с `reauth_account_id`. Дальше — обычный флоу `code → (2fa)`. Отличие только в финализации: новая `session_data` **перезаписывает** старую через `UPDATE`, остальные поля (прокси, имя, телефон) сохраняются, `is_active` снова `TRUE`, публикуется `account.reauthorized`. После этого менеджер воркеров может снова запустить воркер.
+`POST /auth/reauth {account_id}` → `start_reauth()` читает из `accounts` **все** поля fingerprint'а (`name`, `phone`, `proxy_primary`, `proxy_fallback`, `api_id`, `api_hash`, `device_model`, `system_version`, `app_version`, `lang_code`, `system_lang_code`, `lang_pack`); если строки нет — `ACCOUNT_NOT_FOUND`; если `api_id`/`api_hash` пусты — `API_CREDENTIALS_INVALID` («аккаунт до миграции 0013, пересоздай через мастер»). Дальше запускается тот же `start()` с `reauth_account_id`. Telegram должен видеть «тот же клиент» — поэтому fingerprint остаётся неизменным, перезаписывается только `session_data` через `UPDATE`, прочие поля (прокси, имя, телефон, api_id, device_*) сохраняются, `is_active` снова `TRUE`, публикуется `account.reauthorized`. После этого менеджер воркеров может снова запустить воркер.
 
 ### 9.6. События шины
 
@@ -1841,14 +1917,18 @@ class ReauthIn(BaseModel):
 
 | Шаг UI | Ручка | Ответ |
 |---|---|---|
-| 1 (form: phone / name / proxy_primary / proxy_fallback) | `POST /auth/start` | `{session_id, status:"code_sent"}` |
+| 1 (form: phone / name / proxy_primary / proxy_fallback / api_id / api_hash / device_model / system_version / app_version / lang_code / system_lang_code / lang_pack / опц. password) | `POST /auth/start` | `{session_id, status:"code_sent"}` |
 | 2 (code) | `POST /auth/code` | `{status:"2fa_required"}` или `{status:"done", account_id}` |
-| 3 (2fa) | `POST /auth/2fa` | `{status:"done", account_id}` |
+| 3 (2fa, только если password не был передан на шаге 1 и Telegram запросил 2FA) | `POST /auth/2fa` | `{status:"done", account_id}` |
 | отмена | `DELETE /auth/{session_id}` | 204 |
 
-- Все 4 поля формы обязательны (`formValid`). Прокси-поля моноширинным шрифтом. Полный формат прокси на фронте не валидируется кроме colon/URL-разбора (§9.7).
+- 9 полей шага 1 обязательны (телефон, имя, два прокси, `api_id`, `api_hash`, `device_model`, `system_version`, `app_version`). `lang_code`/`system_lang_code` дефолтятся в форме на `ru`, `lang_pack` пуст. Прокси-поля моноширинным шрифтом, формат — `host:port:user:pass` или URL `socks5://...` (см. §9.7). 2FA-пароль (`password`) — опционально: если задан, backend применит сам после кода; если не задан и Telegram запросит 2FA — wizard покажет шаг 3 для ввода.
 - При `status=done` порядок: тост «Аккаунт добавлен» → `reset()` формы → `onCreated()` (рефетч `/accounts`, новая карточка появляется на своём месте) → `onClose()`. `reset` до `close`, чтобы анимация закрытия не показывала пустые поля.
 - Отмена/закрытие модалки — best-effort `api.authCancel(session_id).catch(() => {})`, без блокирующего `await`; если `session_id` ещё нет или cancel упал — UI не застревает, висящую сессию добьёт Redis-TTL.
+
+#### CLI-альтернатива
+
+`scripts/register_account.py` — одношаговый CLI поверх тех же `/auth/start` → `/auth/code` (→ `/auth/2fa` если потребуется). Принимает все поля fingerprint'а как `--api-id`, `--device-model`, …, плюс опц. `--password`, и интерактивно запрашивает SMS-код после `/auth/start`. Полезен для bulk-регистрации и автоматизации; делает то же, что UI-мастер, ровно одной командой.
 
 ### 9.9. Состояния аккаунта и переходы
 
@@ -1991,7 +2071,7 @@ DTO одного элемента `GET /workers`:
 3. Если имя совпадает с `SERVICE_ACCOUNT_NAME` — `SERVICE_ACCOUNT_NOT_STARTABLE`; если `is_active = false` — `ACCOUNT_INACTIVE`.
 4. Ставит статус `starting`, вызывает `_spawn(...)`.
 
-`_spawn` создаёт `Worker(account_id, account_name, session_data, proxy_primary, proxy_fallback)`, оборачивает `worker.run()` в asyncio-таск (`_runner`), регистрирует слот и сразу выставляет статус `running`. Событие `worker.started` публикует сам `Worker` после успешного connect.
+`_spawn` создаёт `Worker(account_id, account_name, session_data, proxy_primary, proxy_fallback)`, оборачивает `worker.run()` в asyncio-таск (`_runner`) и регистрирует слот. Статус остаётся `starting` — в `running` его флипает колбэк `Worker._on_ready` **только после успешного connect** (чтобы UI/`get_wrapper()` не считали воркер живым до реального подключения). Событие `worker.started` публикует сам `Worker` (тонкий супервайзер поверх авто-реконнекта Telethon, см. §8.7): один раз подключается, один раз вешает хендлеры и делает `get_me()`/`get_dialogs()` (снапшот для нагона), запускает нагон, дальше супервизит последовательные свитчи прокси. Из `run()` управление выходит только при `stop()` или `SessionExpired`; сетевые сбои воркер ретраит сам и наружу не эскалирует.
 
 #### stop
 
@@ -2018,6 +2098,8 @@ DTO одного элемента `GET /workers`:
 #### Авторестарт при падении
 
 При неожиданном `Exception` менеджер делает **одну** попытку перезапуска: если у слота `restart_count == 0` и текущий запуск не сам является рестартом (`is_restart = False`), `restart_count` повышается до 1 и вызывается `_spawn(..., is_restart=True)`, подставляя новый слот. Если рестарт снова падает — статус остаётся `crashed`, больше попыток нет (чтобы не создавать петлю при системной проблеме).
+
+Мутация `_slots` + спавн рестарт-таска идут **под `self._lock`** с перепроверкой, что слот всё ещё принадлежит этому воркеру (`slot.worker is worker`) — иначе параллельный `stop()`/`start()` мог бы гоняться со слотом (L1, 2026-07-13). На время восстановления статус выставляется в `starting` (а не `crashed`), чтобы UI не мигал «crashed» при живом авторестарте; `crashed` пишется только на финальном крахе (L3, 2026-07-13).
 
 **Сигнал на шине зависит от исхода рестарта** (это важно для авто-раннера). При **успешном** прозрачном рестарте публикуется `worker.restarted`, а **не** `worker.crashed`. Авто-раннер (`worker_auto_runner`) реагирует только на `worker.stopped` / `worker.crashed` и в ответ останавливает автодиалоги по аккаунту; `worker.restarted` он игнорирует — поэтому транзиентный сбой с успешным восстановлением больше не глушит автодиалоги навсегда. `worker.crashed` публикуется только при финальном крахе (рестарт не планировался или не удался), и тогда останов авто-раннера корректен. Пользователь видит состояние через `GET /workers` и в Event Log.
 
@@ -2080,86 +2162,117 @@ async def reconcile_on_boot(self) -> None:
 
 ### 10.5. Авто-раннер воркеров (Worker Auto Runner)
 
-Авто-раннер — режим «сам себе оператор» для конкретного воркера: оператор вписывает очередь юзернеймов, нажимает Play, и воркер каждые N секунд ± jitter сам стартует новый автодиалог с очередной строкой (тот же flow, что у ручной кнопки «+ Новый автодиалог», т.е. `autochat.create_session`). Модуль `modules/worker_auto_runner`, класс `WorkerAutoRunnerService`, единственный писатель в таблицу `worker_auto_runners`.
+Авто-раннер — режим «сам себе оператор» для конкретного воркера: оператор вписывает очередь юзернеймов, задаёт окно сессии и диапазон лидов, нажимает Play — воркер разбрасывает N случайных моментов по окну и в каждый момент стартует автодиалог (`autochat.create_session`). Модуль `modules/worker_auto_runner`, класс `WorkerAutoRunnerService`, единственный писатель в таблицу `worker_auto_runners`.
 
 Модуль знает только о двух соседях, и только через callable'ы: `get_wrapper(account_id)` менеджера (проверка живости воркера) и `autochat_service.create_session(...)` (старт диалога). Опционально — `partner_crm_service` для воркеров с `accounts.lead_source = 'partner_crm'` (см. раздел «CRM / оценка лидов»). В чужие таблицы не обращается. Лог автомата — события шины (отдельной таблицы логов нет), читается на странице Event Log с фильтром `module=worker_auto_runner`.
 
-#### Таблица `worker_auto_runners` (миграция 0010)
+#### Модель сессии (миграция 0014)
+
+- **Окно** `window_hours` (дефолт 12ч, границы 1–48ч) — сколько длится одна сессия.
+- **Диапазон лидов** `[min_leads, max_leads]` (дефолты 15–18, верхняя граница 500). При `start()` выбирается `N = randint(min_leads, max_leads)`.
+- **Прогрев** `warmup_minutes` (дефолт 10мин, границы 0–240) — гарантированный отступ от момента включения до первого лида. Первый лид ложится в `[warmup_end, warmup_end + 15мин]` (константа `FIRST_LEAD_SPREAD_SEC=900`), ограниченный концом окна.
+- Остальные N−1 моментов — uniform по `[first_lead_at, session_ends_at]`, отсортированы; итоговый список пишется в `schedule TIMESTAMPTZ[]`.
+- По мере обработки первый элемент атомарно снимается (`_pop_first_schedule`, `SELECT ... FOR UPDATE`). Когда `schedule=[]` **или** `NOW() >= session_ends_at` → self-stop с `reason=session_completed`.
+
+#### Таблица `worker_auto_runners`
 
 ```sql
 CREATE TABLE worker_auto_runners (
-    account_id      INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
-    is_running      BOOLEAN NOT NULL DEFAULT FALSE,
-    queue           TEXT[] NOT NULL DEFAULT '{}',
-    interval_sec    INTEGER NOT NULL DEFAULT 1200,
-    jitter_sec      INTEGER NOT NULL DEFAULT 300,
-    last_action_at  TIMESTAMPTZ,
-    last_status     TEXT,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT auto_runner_interval_min  CHECK (interval_sec >= 60),
-    CONSTRAINT auto_runner_jitter_nonneg CHECK (jitter_sec >= 0),
-    CONSTRAINT auto_runner_queue_size    CHECK (
+    account_id         INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    is_running         BOOLEAN NOT NULL DEFAULT FALSE,
+    queue              TEXT[] NOT NULL DEFAULT '{}',
+    window_hours       INTEGER NOT NULL DEFAULT 12,
+    min_leads          INTEGER NOT NULL DEFAULT 15,
+    max_leads          INTEGER NOT NULL DEFAULT 18,  -- миграция 0017 (было 25)
+    warmup_minutes     INTEGER NOT NULL DEFAULT 10,
+    session_started_at TIMESTAMPTZ,
+    session_ends_at    TIMESTAMPTZ,
+    schedule           TIMESTAMPTZ[] NOT NULL DEFAULT '{}',
+    last_action_at     TIMESTAMPTZ,
+    last_status        TEXT,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT auto_runner_window_positive CHECK (window_hours >= 1 AND window_hours <= 48),
+    CONSTRAINT auto_runner_lead_range      CHECK (min_leads >= 1 AND max_leads >= min_leads AND max_leads <= 500),
+    CONSTRAINT auto_runner_warmup_nonneg   CHECK (warmup_minutes >= 0 AND warmup_minutes <= 240),
+    CONSTRAINT auto_runner_queue_size      CHECK (
         array_length(queue, 1) IS NULL OR array_length(queue, 1) <= 1000
     )
 );
 ```
 
-Один ряд на воркер (`PK = account_id`), CASCADE при удалении аккаунта. Ряд создаётся лениво (`_ensure_row`, `INSERT ... ON CONFLICT DO NOTHING`) при первом обращении. Сервисные константы: `DEFAULT_INTERVAL_SEC=1200`, `DEFAULT_JITTER_SEC=300`, `MIN_INTERVAL_SEC=60`, `MAX_QUEUE_LEN=1000`, `_SLEEP_CHUNK_SEC=5`.
+Один ряд на воркер (`PK = account_id`), CASCADE при удалении аккаунта. Ряд создаётся лениво (`_ensure_row`, `INSERT ... ON CONFLICT DO NOTHING`). Сервисные константы: `DEFAULT_WINDOW_HOURS=12`, `DEFAULT_MIN_LEADS=15`, `DEFAULT_MAX_LEADS=18` (синхронизировано с дефолтом БД миграции 0017; L2, 2026-07-13), `DEFAULT_WARMUP_MINUTES=10`, `FIRST_LEAD_SPREAD_SEC=900`, `MAX_QUEUE_LEN=1000`, `_SLEEP_CHUNK_SEC=5`.
 
 #### Endpoints авто-раннера (`modules/worker_auto_runner/routes.py`)
 
 | Метод + путь | Тело | Назначение |
 |---|---|---|
-| `GET /workers/{account_id}/auto-runner` | — | текущая конфигурация + state |
-| `PATCH /workers/{account_id}/auto-runner` | `{queue?, interval_sec?, jitter_sec?}` | обновить очередь / интервал / jitter |
-| `POST /workers/{account_id}/auto-runner/start` | — | Play |
-| `POST /workers/{account_id}/auto-runner/stop` | — | Pause |
+| `GET /workers/{account_id}/auto-runner` | — | текущая конфигурация + расписание + state |
+| `PATCH /workers/{account_id}/auto-runner` | `{queue?, window_hours?, min_leads?, max_leads?, warmup_minutes?}` | обновить конфиг |
+| `POST /workers/{account_id}/auto-runner/start` | — | Play — генерирует свежее расписание и стартует |
+| `POST /workers/{account_id}/auto-runner/stop` | — | Pause — гасит расписание |
 
-Pydantic-валидация PATCH: `queue: list[str]` (`max_length=1000`), `interval_sec: int` (`ge=60` → 422), `jitter_sec: int` (`ge=0`). Юзернеймы санитизируются (`_normalize_username`): `strip()`, удаляется лидирующий `@`, пустые отфильтровываются. DTO ответа (`_to_dto`):
+Pydantic-валидация PATCH: `queue: list[str]` (`max_length=1000`), `window_hours: int` (`ge=1, le=48`), `min_leads` / `max_leads: int` (`ge=1, le=500`), `warmup_minutes: int` (`ge=0, le=240`). Бэк дополнительно проверяет `min_leads <= max_leads` (учитывает и текущие в БД, и новые). Юзернеймы санитизируются (`_normalize_username`): `strip()`, удаляется лидирующий `@`, пустые отфильтровываются. DTO ответа (`_to_dto`):
 
 ```json
 {
   "account_id": 8,
-  "is_running": false,
+  "is_running": true,
   "queue": ["alice", "bob"],
-  "interval_sec": 1200,
-  "jitter_sec": 300,
+  "window_hours": 12,
+  "min_leads": 15,
+  "max_leads": 18,
+  "warmup_minutes": 10,
+  "session_started_at": "2026-06-30T12:00:00+00:00",
+  "session_ends_at":   "2026-06-30T24:00:00+00:00",
+  "schedule": ["2026-06-30T12:11:47+00:00", "2026-06-30T12:47:20+00:00", "..."],
+  "schedule_remaining": 21,
+  "next_dispatch_at": "2026-06-30T12:11:47+00:00",
   "last_action_at": null,
-  "last_status": null,
-  "updated_at": "2026-..."
+  "last_status": "started",
+  "updated_at": "2026-06-30T12:00:00+00:00"
 }
 ```
 
-Коды ошибок (`AutoRunnerError`): `ACCOUNT_NOT_FOUND` (404), `WORKER_NOT_RUNNING` (409, при start если `get_wrapper` вернул `None`), `QUEUE_TOO_LONG`, `INVALID_INTERVAL` (по 400).
+Коды ошибок (`AutoRunnerError`): `ACCOUNT_NOT_FOUND` (404), `WORKER_NOT_RUNNING` (409, при start если `get_wrapper` вернул `None`), `QUEUE_TOO_LONG`, `INVALID_CONFIG` (диапазон / min>max / warmup out of range, все 400).
 
 #### Цикл автомата
 
-`start(account_id)` проверяет, что аккаунт существует и воркер жив (`get_wrapper(account_id) is not None`, иначе `WORKER_NOT_RUNNING`), идемпотентно (если таск уже жив — просто возвращает конфиг), ставит `is_running=true`, создаёт per-account `asyncio.Task` `_account_loop` и публикует `auto_runner.started`. Каждый цикл — свой Task с try/except, падение одного не валит другие.
+`start(account_id)` проверяет, что аккаунт существует и воркер жив; идемпотентно (если таск уже жив — просто возвращает конфиг без пересборки расписания). Иначе читает актуальный конфиг, зовёт `_generate_schedule(now, window_hours, min_leads, max_leads, warmup_minutes)` (см. модель выше), пишет `session_started_at`, `session_ends_at`, `schedule` одной транзакцией, ставит `is_running=true`, создаёт `asyncio.Task` `_account_loop` и публикует `auto_runner.started` c `{leads_planned, window_hours, session_ends_at}`. Изменение конфига через PATCH пока сессия идёт **не** пересобирает расписание — новые значения применятся при следующем `start`.
 
 `_account_loop` на каждой итерации:
-1. Проверяет живость воркера (`get_wrapper`); если оффлайн — ставит `is_running=false`, публикует `auto_runner.stopped` (`reason=worker_offline`) и выходит.
-2. Достаёт следующего лида. Источник зависит от `accounts.lead_source`: `manual` → атомарный pop первого юзернейма из `queue` (`_pop_first_username`, `SELECT ... FOR UPDATE` в транзакции — без гонок с параллельным PATCH); `partner_crm` → claim из общего пула с учётом `target_gender`. Пустой результат → `auto_runner.queue_empty`.
-3. Иначе вызывает `autochat.create_session`. Успех → `auto_runner.lead_sent`; любая ошибка → `auto_runner.lead_skipped` (юзернейм уже удалён из очереди, повторно не пробуется).
-4. Sleep: `interval_sec + random(-jitter, +jitter)`, но не меньше `MIN_INTERVAL_SEC=60`. Сон бьётся чанками по 5 сек (`_chunked_sleep`) с проверкой живости воркера в каждой итерации — реакция на падение воркера ≤5 сек, как страховка к bus-подписке.
+1. Читает свежее состояние из БД (`schedule`, `session_ends_at`) **первым делом** и проверяет **естественный cap**: если `NOW() >= session_ends_at` — self-stop c `reason=session_completed`. Эта проверка идёт **до** ожидания воркера (M4, 2026-07-13): раньше для разлогиненного аккаунта, чей wrapper так и не поднимался, петля крутилась вечно и `is_running` залипал — теперь срок сессии жёстко её ограничивает.
+2. Проверяет живость воркера (`get_wrapper`) с grace-периодом (Fix #12/#18): пока wrapper ни разу не был виден живым — молча ждёт (стартовый race с `worker_manager`); после первого появления даёт до `MAX_WRAPPER_MISSES × WRAPPER_MISS_SLEEP_SEC` (≈9 мин), потом self-stop `reason=worker_offline`.
+3. Если расписание пусто (окно ещё не истекло, но лиды кончились) — self-stop c `reason=session_completed`.
+4. Спит до `schedule[0]` чанками по 5 сек (`_chunked_sleep`) с проверкой живости воркера. После сна: если воркер уже упал — на следующую итерацию.
+5. Атомарно снимает `schedule[0]` (`_pop_first_schedule`, `FOR UPDATE`). Достаёт лида: `manual` → `_pop_first_username` из `queue`; `partner_crm` → claim из общего пула с учётом `target_gender`. Пусто → `auto_runner.queue_empty` с `{skipped_slot_at}` и **следующая итерация без ожидания** (график двигается дальше, не сдвигается).
+6. Иначе `autochat.create_session`. Успех → `auto_runner.lead_sent`; ошибка → `auto_runner.lead_skipped` (обработка CRM-случая — см. подраздел ниже).
 
-`stop(account_id, reason="manual")` снимает таск (cancel + ожидание до 5 сек), ставит `is_running=false`, публикует `auto_runner.stopped`. Идемпотентен: если ряда не было или уже было `is_running=false` без живой таски — no-op без фантомных событий.
+`stop(account_id, reason="manual")` снимает таск через общий helper `_cancel_and_wait` (C2, 2026-07-13: глушит `asyncio.CancelledError`, который в Python 3.12+ не наследник `Exception` — раньше `/stop` отдавал 500, а «спуриозный» CancelledError убивал наблюдателя офлайн-воркеров), чистит устаревший вердикт `_self_stop_requested` (C1), очищает `schedule`/`session_started_at`/`session_ends_at`, ставит `is_running=false`, публикует `auto_runner.stopped`. Идемпотентен. `shutdown()` использует тот же helper через `asyncio.gather`.
 
 #### События шины
 
-Типы (`core/events.py`, модуль `worker_auto_runner = "worker_auto_runner"`): `auto_runner.started`, `auto_runner.stopped`, `auto_runner.lead_sent`, `auto_runner.lead_skipped`, `auto_runner.queue_empty`.
+Типы (`core/events.py`, модуль `worker_auto_runner = "worker_auto_runner"`): `auto_runner.started`, `auto_runner.stopped`, `auto_runner.lead_sent`, `auto_runner.lead_skipped`, `auto_runner.queue_empty`. В `auto_runner.stopped` теперь один из `reason ∈ {manual, worker_offline, session_completed, transient_error:*, loop_crashed}` — по нему UI/логика отличает штатное завершение окна от аварии.
 
 #### Интеграция с менеджером и lifespan
 
 `WorkerAutoRunnerService.run()` — фоновый bus-consumer (группа `auto-runner-worker`, consumer `auto-runner-worker-1`): ловит `worker.stopped` / `worker.crashed` (их публикует менеджер) и гасит соответствующего runner'а через `stop(reason="worker_offline")`. Так падение/остановка воркера автоматически останавливает его автомат — связь только через шину, без прямого вызова.
 
-`reset_on_boot()` при старте приложения делает `UPDATE worker_auto_runners SET is_running=false WHERE is_running=true` (`last_status='reset on app restart'`). После рестарта `app` автоматы **не возобновляются** — оператор включает заново вручную (договорённость; убирает риск «после рестарта поплыло само»).
+`reset_on_boot()` при старте приложения **не гасит все автоматы**. Гасит только «мёртвые» сессии — те, у кого `session_ends_at IS NULL` (legacy-ряды без активной сессии) или `session_ends_at <= NOW()` (окно истекло пока app лежал). Остальные — с `is_running=true` и живой сессией — оставляются как есть; сразу после `reset_on_boot()` в lifespan вызывается `resume_running_loops()`, который читает всех активных, **пересобирает расписание на остаток окна** (`_regenerate_schedule_for_remaining_window`) и поднимает per-account `_account_loop`. Пересборка при возобновлении — фикс M5 (2026-07-13): пока app лежал, метки в `schedule[]` ушли в прошлое, и без растягивания оставшихся лидов равномерно по `[NOW, session_ends_at]` цикл выпалил бы все просроченные слоты подряд на первых итерациях → мгновенный PEER_FLOOD после рестарта. Так рестарт app не убивает уже запущенные окна и не провоцирует флуд.
 
-Порядок в lifespan (`api/main.py`): сервис создаётся **после** `AutoChatService` (зовёт его `create_session`), затем `reset_on_boot()` и запуск `run()`. При shutdown авто-раннер гасится **первым**, чтобы перестать звать autochat, пока та ещё в shutdown.
+Порядок в lifespan (`api/main.py`): сервис создаётся **после** `AutoChatService` (зовёт его `create_session`), затем `reset_on_boot()` → `resume_running_loops()` → запуск `run()`. При shutdown авто-раннер гасится **первым** через `shutdown()`, чтобы перестать звать autochat, пока та ещё в shutdown. `is_running` при shutdown НЕ сбрасывается — расписание в БД, при следующем старте app сессия подхватится через `resume_running_loops`.
 
-#### Self-stop при транзиентной ошибке CRM-лида
+#### Self-stop и таксономия ошибок CRM-лида
 
-Для лидов из CRM (`from_crm=True`) `_try_start_dialog` различает категории ошибок autochat: коды `USERNAME_NOT_FOUND`, `USERNAME_UNAVAILABLE`, `CANNOT_WRITE` (`_CRM_INVALID_ERROR_CODES`) → лид финализируется в CRM как `invalid`; любая другая (транзиентная) ошибка → лид возвращается в пул (`reinsert_into_pool`) и воркер останавливается до вмешательства оператора. Само-остановка реализована флагом `_self_stop_requested[account_id]`, который проверяется в `_account_loop` после возврата из `_try_start_dialog` (`_do_self_stop`) — это устраняет race-condition прежней схемы с `asyncio.create_task(self.stop(...))`, которая в проде не срабатывала и воркер продолжал крутиться.
+`_try_start_dialog` классифицирует ошибку autochat (`_classify_send_error`) в один из трёх вердиктов:
+
+- **`invalid_lead`** (`USERNAME_NOT_FOUND`, `USERNAME_UNAVAILABLE`, `CANNOT_WRITE`) — лид физически недоступен; для CRM финализируется как `invalid` у партнёра. Автомат **продолжает** со следующего слота.
+- **`transient`** (`SEND_FAILED_TRANSIENT`=PEER_FLOOD, `FLOOD_WAIT`, `GENERATION_FAILED`) — лид нормальный, но эта попытка не удалась. Для CRM лид возвращается в пул **со штрафом** (`reinsert_into_pool(count_attempt=True)` — инкремент `attempts`, при исчерпании `MAX_LEAD_ATTEMPTS` финализация `invalid`). При TG-флуде дополнительно триггерится SpamBot-recovery + cooldown. Автомат **продолжает**.
+- **`needs_operator`** (`SESSION_EXPIRED`, `WORKER_NOT_RUNNING`, неизвестные коды) — сломались **мы**. Для CRM лид возвращается в пул **без штрафа** (`reinsert_into_pool(count_attempt=False)` — H3, 2026-07-13: раньше наши простои жгли валидный лид как `invalid` и блокировали его навсегда). Автомат **останавливается** до вмешательства оператора.
+
+Отдельный benign-случай: `SESSION_ALREADY_ACTIVE` (на паре уже есть активная сессия — лид уже прописан) — **пропускаем слот и продолжаем**, лид в пул не возвращаем, invalid не пушим, автомат НЕ стопаем (фикс дубля 2026-07-13: раньше это уходило в `needs_operator` self-stop и глушило весь авто-раннер аккаунта).
+
+Само-остановка реализована флагом `_self_stop_requested[account_id]`, который проверяется в `_account_loop` после возврата из `_try_start_dialog` (`_do_self_stop`) — устраняет race-condition прежней схемы с `asyncio.create_task(self.stop(...))`. **Флаг чистится на всех входах/выходах** (`start`, `stop`, `_do_self_stop` вызывают `_self_stop_requested.pop`) — C1 (2026-07-13): раньше ветка `session_completed` писала флаг перед выходом и никто его не стирал, поэтому свежий запуск на первой же итерации видел устаревший вердикт и самостопился после одного лида.
 
 ### 10.6. UI авто-раннера
 
@@ -2167,9 +2280,10 @@ Pydantic-валидация PATCH: `queue: list[str]` (`max_length=1000`), `inte
 - Бейдж «авто» с пульсирующим зелёным кружком, когда автомат запущен.
 - Кнопки ▶ Play / ⏸ Пауза и ⚙ (настройки) рядом с Wipe/Промт/Start/Stop. Тогл Play/Pause обрабатывается внутри карточки (зовёт `api.startAutoRunner` / `stopAutoRunner`); parent передаёт только колбэк `onAutoRunnerSettings`.
 - Play disabled, пока воркер не `running`.
-- Модалка `AutoRunnerSettingsDialog.tsx`: textarea очереди (по юзернейму на строку), `interval_sec`, `jitter_sec`, превью «следующая пауза будет в диапазоне X..Y минут» (считается локально), статус автомата сверху, кнопки Отмена/Сохранить (на Save шлёт PATCH).
+- Строка «→ HH:MM · N осталось» под телефоном, когда автомат запущен и в `schedule` есть моменты (`next_dispatch_at`, `schedule_remaining` из DTO).
+- Модалка `AutoRunnerSettingsDialog.tsx`: textarea очереди (по юзернейму на строку), `window_hours`, `warmup_minutes`, `min_leads`, `max_leads`, локальное превью «разбросаем N–M лидов по окну X, первый — не раньше Y мин, в среднем один каждые Z», статус автомата сверху, при `is_running=true` — жёлтая подсказка что новые значения применятся при следующем Start. Кнопки Отмена/Сохранить (на Save шлёт PATCH).
 
-Минимум `interval_sec = 60` продублирован константой во фронте (number-input не даёт ввести меньше); бэк всё равно перепроверяет (`ge=60`). Хук `useAutoRunner(accountId)` (react-query) живёт внутри каждой карточки с `refetchInterval: 10_000` — поллинг нужен, потому что бэк может сам выключить автомат (`worker.stopped`/`worker.crashed`), и UI ловит это без рефреша (бейдж гаснет в течение ~10 сек). На 5–10 воркерах это приемлемо; при 50+ предусмотрен переход на батч-запрос.
+Верхние границы полей (`MAX_WINDOW_HOURS=48`, `MAX_LEADS=500`, `MAX_WARMUP_MINUTES=240`, `MAX_QUEUE=1000`) продублированы константой во фронте (number-input не даёт ввести больше); бэк всё равно перепроверяет и CHECK-constraint'ы в БД тоже. Хук `useAutoRunner(accountId)` (react-query) живёт внутри каждой карточки с `refetchInterval: 10_000` — поллинг нужен, потому что бэк может сам выключить автомат (`worker.stopped`/`worker.crashed`/`session_completed`), и UI ловит это без рефреша (бейдж гаснет в течение ~10 сек). На 5–10 воркерах это приемлемо; при 50+ предусмотрен переход на батч-запрос.
 
 API-слой UI (`lib/api.ts`): `getAutoRunner / patchAutoRunner / startAutoRunner / stopAutoRunner`; типы `AutoRunnerState` и `AutoRunnerPatchBody` в `types/api.ts`.
 
@@ -2693,13 +2807,14 @@ document                 → describe_document(raw)
 
 ### 12.5. OpenRouter-клиент
 
-Единый клиент `core/openrouter.py` — прослойка между системой и AI-сервисами: при отказе одного сервиса или ключа можно переключиться на другую модель без правок кода. Все запросы идут в один endpoint с одинаковыми заголовками и форматом ответа `choices[0].message.content`. Общие части (`_headers`, `_post`) вынесены в приватные хелперы, чтобы не дублировать обработку ошибок и парсинг трижды.
+Единый клиент `core/openrouter.py` — прослойка между системой и AI-сервисами: при отказе одного сервиса или ключа можно переключиться на другую модель без правок кода. Используются два endpoint'а: `/api/v1/chat/completions` (vision, документы, autochat, evaluator) и `/api/v1/audio/transcriptions` (STT-модели вроде `openai/gpt-4o-mini-transcribe`, `openai/whisper-1` — они не работают через chat.completions). Общие части (`_headers`, `_post`) вынесены в приватные хелперы, чтобы не дублировать обработку ошибок и парсинг трижды.
 
-Три публичные функции:
+Четыре публичные функции:
 
-- `transcribe_audio` — Whisper для звука.
+- `transcribe_audio` — STT через `/api/v1/audio/transcriptions` (модель по умолчанию `openai/gpt-4o-mini-transcribe`).
 - `describe_images` — фото / стикеры / нарезанные кадры через GPT-4o (`openai/gpt-4o` принимает картинки через `image_url` с data-URL).
 - `describe_document` — PDF и другие документы через Gemini.
+- `chat_completion` — универсальный chat.completions для autochat / evaluator.
 
 **Две модели вместо одной.** `openai/gpt-4o` не принимает документы (PDF) напрямую — нужна модель с нативной поддержкой файлов. Выбран Gemini (`google/gemini-2.5-flash`, переменная `OPENROUTER_MODEL_DESCRIPTION_DOCUMENTS` в `core/config.py` и `.env.example`): дешевле, быстрее, по документации OpenRouter PDF проходит нативно без плагина (подтверждено на живом тесте — Gemini поглотил PDF без плагина). В `describe_document` добавлен `plugins: [{id: "file-parser", pdf: {engine: "native"}}]` — для Gemini это no-op, но страховка при будущей смене модели на не умеющую PDF (OpenRouter тогда подключит парсер). Промпты на русском (`IMAGE_DESCRIPTION_PROMPT`, `DOCUMENT_DESCRIPTION_PROMPT`) — выход попадает в `media.description` и отображается в UI на русском.
 
@@ -3589,7 +3704,7 @@ lead_evaluations
 
 Единственная точка общения приложения с CRM. Файлы: `__init__.py`; `errors.py` (`PartnerCrmError` → `NotConfigured`/`CrmHttpError`/`InvalidStatus`); `client.py` (async httpx-обёртка над `/api/l1/*`); `service.py` (`PartnerCrmService`); `routes.py`; `poller.py`; `finalizer.py`. Один httpx-клиент на всё приложение (keep-alive); в lifespan создаётся один `PartnerCrmService`, владеющий клиентом и закрывающий его на shutdown.
 
-`PartnerCrmService` методы: `pool_size`, `list_pool`, `refill_pool`, `claim_lead_for_account`, `push_lead_started`, `push_lead_finalized`, `get_preferences`.
+`PartnerCrmService` методы: `pool_size`, `list_pool`, `reap_stale_claims`, `refill_pool`, `claim_lead_for_account`, `reinsert_into_pool`, `push_lead_started`, `push_lead_finalized`, `get_preferences`. `pool_size` и `list_pool` считают/показывают **только свободных** лидов (`WHERE claimed_at IS NULL`) — согласованно с claim-семантикой Fix #13 (claim помечает `claimed_at`, а не DELETE). Иначе счётчик инфлировался бы лидами «в работе» и refill не срабатывал (H1, 2026-07-13).
 
 #### Эндпоинты `/partner-crm/*`
 
@@ -3606,10 +3721,15 @@ lead_evaluations
 
 ```
 если модуль не сконфигурирован           → пропускаем
+reap_stale_claims()                       → вернуть в пул зависшие claim'ы (>2ч)
 если pool_size >= pool_low_threshold     → пропускаем
 если нет ни одного активного CRM-воркера → пропускаем
 иначе                                    → service.refill_pool(refill_batch_size)
 ```
+
+**Реапер осиротевших claim'ов** (`reap_stale_claims`, H1, 2026-07-13) зовётся первым на каждом тике, **до** подсчёта размера. Claim (Fix #13) помечает `claimed_at=NOW()`; освобождается через `reinsert_into_pool` или DELETE при финализации. Но claim, брошенный крахом воркера / рестартом app **между claim и `create_session`** (лид заклеймлен, но так и не прописан), сам не освобождается — навсегда «съедает» свободный лид, а `pool_size` (только свободные) проседает. Реапер возвращает такие сироты в пул. Симптом до фикса: ~187 повисших claim'ов после ночных рестартов, refill вхолостую, воркеры получали `queue_empty`.
+
+> **Критично (фикс дубля, 2026-07-13):** реапер освобождает только `claimed_at < NOW()-2h` **И** `NOT EXISTS` autochat-сессии по этому username. Успешно прописанный CRM-лид остаётся в пуле как `claimed` до терминальной финализации, а беседа легко длится дольше 2ч. Без условия «нет сессии» реапер освобождал бы уже-прописанного лида → воркер клеймил его заново → `create_session` (гейт блокирует только `starting/active/paused`, но **не** `stopped`) либо повторно писал человеку (дубль), либо на активной беседе бросал `SessionAlreadyActive` → авто-раннер уходил в needs_operator self-stop (аккаунт замолкал). Оставить лида claimed (лик) безопаснее, чем написать повторно; терминальная финализация уберёт его штатно.
 
 «Активный CRM-воркер» — аккаунт с `lead_source='partner_crm'`, `is_active=TRUE` и `worker_auto_runners.is_running=TRUE`. Проверка нужна, чтобы не выбирать чужую квоту `max_concurrent_leads` CRM, пока никто не работает. Тик через `wait_for(stop_event.wait(), timeout=interval)` — мгновенное пробуждение на shutdown. Ошибки тика гасятся (`except Exception` + `log.exception`), таска не падает. INFO — на «refill triggered», DEBUG — на скипы (против лог-спама раз в 60 с).
 
@@ -5224,7 +5344,7 @@ WHERE a.lead_source = 'partner_crm' AND war.is_running = TRUE
 - **4.3 — Чистильщик MinIO.** Класс `Cleaner` — фоновый цикл удаляет файлы старше `cleaner.file_ttl_days` батчами, не трогая ещё обрабатываемые (`pending`), проставляет `storage_key=NULL`/`file_deleted_at` и публикует `file.cleaned`; если весь батч упал — `system.error`. Метаданные и тексты в БД остаются.
 - **4.4 — Endpoints истории.** 7 endpoints: список диалогов, карточка со статистикой, сообщения (курсорная пагинация forward/backward с подгрузкой media и reply-to), SSE `/dialogs/{id}/stream` с фильтром по dialog_id, `POST /dialogs/{id}/read`, `GET /messages/{id}` и синхронная отправка `POST /accounts/{id}/messages`. Вылечены две болячки отправки: `Could not find the input entity` (warm-up через `get_dialogs` после connect) и отсутствие self-echo в `NewMessage` (endpoint сам публикует `message.received` для исходящих).
 - **4.5 — Нагон истории.** `HistorySyncService` при старте воркера догружает пропущенное: `sync.started` → много `sync.dialog.done` → `sync.done`, медиа качается тем же путём, обработка `FloodWaitError`, все события с `parent_id` на `sync.started`. Стартует параллельным asyncio-таском (дубли отсекает unique-индекс), переиспользует snapshot диалогов из warm-up. Тест: `TRUNCATE` диалогов → рестарт → восстановлено 19 сообщений и 9 медиа из Telegram.
-- **5.1 — HTTP-клиент OpenRouter.** Написан `core/openrouter.py` с `transcribe_audio`. Ключевое открытие: у OpenRouter нет Whisper STT-endpoint, аудио только через `/chat/completions` с `input_audio` на мультимодальной модели — выбрана `openai/gpt-4o-audio-preview`, `temperature=0`, единое исключение `OpenRouterError`, увеличенные таймауты на длинные файлы.
+- **5.1 — HTTP-клиент OpenRouter.** Написан `core/openrouter.py` с `transcribe_audio`. Историческое: изначально аудио шло через `/chat/completions` с `input_audio` на мультимодальной `openai/gpt-4o-audio-preview` (у OpenRouter тогда не было выделенного STT-endpoint'а). В 2026-06 OpenRouter выкатил `/api/v1/audio/transcriptions`, `transcribe_audio` переведён на него (см. запись 2026-06-30 в §20), актуальная модель — `openai/gpt-4o-mini-transcribe`. `temperature=0`, единое исключение `OpenRouterError`, увеличенные таймауты на длинные файлы.
 - **5.2 — ffmpeg-конвертер.** `modules/transcription/ffmpeg.py::to_wav` приводит вход к wav PCM 16kHz mono через временный файл (а не stdin — Telegram mp4 хранит moov atom в конце, ffmpeg по pipe не умеет seek). Два класса ошибок: `FfmpegError` (битый файл/таймаут) и `NoAudioError` (wav ≤100 байт — нет аудиодорожки).
 - **5.3 — TranscriptionService.** Consumer group `transcription-worker`: слушает `message.saved` с `has_audio|has_video`, для каждого аудио/видео-media гонит цепочку MinIO → ffmpeg → OpenRouter с публикацией `transcription.started`/`transcription.done`. Логика ретраев из настроек (повтор на ошибку, один повтор на пустой результат → пустой `done`), все ошибки в шину, в БД сервис сам не пишет.
 - **5.4 — Интеграция в lifespan.** `TranscriptionService` подключён фоновой задачей в `api/main.py`, корректный порядок старта/остановки, версия приложения `0.5.0`.
@@ -5358,9 +5478,391 @@ WHERE a.lead_source = 'partner_crm' AND war.is_running = TRUE
 
 ### Исправления по аудиту (2026-06-27 →)
 
-> Точечные фиксы по отчёту `docs/AUDIT_2026-06-26.md`, по одному пункту. Формат: дата, находка аудита, суть, затронутые разделы.
+> Точечные фиксы по аудиту (2026-06-26). Аналитические доки (аудит, analytics, pipeline-fix, review) консолидированы сюда и удалены — спека единственный источник. Формат: дата, находка, суть, затронутые разделы. Новейшие записи — сверху.
+
+- **2026-07-13 (вечер) — КОРНЕВОЙ фикс повторного прописывания (данные + логика) + упрощение пула + слой соединения + живой прогон. Ветка `fix/dedup-root-and-unblock` → merge в main.**
+  *Постановка.* Пересмотреть все фиксы после 23 июня («гонка за хвостом»), найти НАСТОЯЩИЙ корень «лиды прописываются по второму кругу», привести систему в рабочее состояние. Построчный аудит старой (`82efbea`) vs текущей версии (14 состязательных агентов) + живой прогон на 26 воркерах.
+
+  *НАСТОЯЩИЙ корень — два слоя:*
+  1. **Логика:** гейт уникальности в `create_session` был per-account (`WHERE account_id AND telegram_user_id AND status IN starting/active/paused`) — разные аккаунты свободно писали одному человеку; реестр `contacted_leads` (0019) проверялся только в CRM-claim, а не в самом `create_session`.
+  2. **Данные (главное открытие):** `contacted_leads` бэкфилился из `autochat_sessions` (0019), а сессии УДАЛЯЮТСЯ при wipe диалога/сбросе → реестр терял ~69% истории (**1520 в реестре против 4845 фактических контактов** в `events_archive`). Партнёр переназначал уже-написанных, дедуп их не узнавал → дубль. Подтверждено файлом оператора `crm_dup_leads.csv` (256 лидов, писаных 2–88 раз с 2–25 аккаунтов) — все 256 теперь в реестре.
+
+  *Фиксы корня.*
+  - **P0-B (логика):** в `create_session` добавлен ГЛОБАЛЬНЫЙ дедуп по `telegram_user_id` (перед send, для ВСЕХ путей); новое исключение `AlreadyContacted` (`ALREADY_CONTACTED`, 409), в auto_runner — benign skip. `contacted_leads` пишется АТОМАРНО сразу после успешного send (до `bus.publish`) — закрыто окно «отправили, но не записали».
+  - **Данные:** миграция `0021_contacted_leads_from_events_archive.py` — реестр бэкфилится из durable-лога `events_archive` (`autochat.started`: username+telegram_user_id), а НЕ из удаляемых сессий. Живьём перестроен: 1520 → 4849.
+
+  *Упрощение пула (P2, решение владельца «простая модель»).* Откат `claimed_at`-эдифиса: claim снова `DELETE` (было `UPDATE claimed_at` из Fix #13); `reinsert` = `INSERT ON CONFLICT`; `pool_size`/`list_pool` без фильтра `claimed_at`; удалены `reap_stale_claims` (H1), guard, `attempts`-механизм (Fix #8). Колонки `claimed_at/assigned_account_id/attempts` оставлены vestigial (дроп отдельной миграцией позже). Цепочка Fix #8→#13→#23→reaper→guard была self-inflicted — при корне в `create_session` не нужна.
+
+  *Не жечь валидных лидов (P0-A).* transient (PEER_FLOOD/сбой LLM = НАШИ причины) → `reinsert` без штрафа; авто-push `invalid` партнёру по счётчику наших сбоёв УБРАН (отменяет опасную часть Fix #14). invalid наружу — только по реальному «нельзя написать» (ветка invalid_lead → `push_lead_finalized`). Миграция `0020_unblock_self_inflicted_invalids.py` разблокировала лидов с `reason='max_attempts_exhausted'`.
+
+  *Слой соединения (частичный пересмотр Fix #12/#16/#21).* probe целит в Telegram-DC (`core/proxy.TELEGRAM_DC_TARGETS`), а не в `1.1.1.1` (ложные негативы на серверных прокси); гистерезис `DROP_RETRIES=2` перед свитчем на fallback (диагностика: fallback-прокси медленные к TG, свитч на первый блип = churn); честный `SYSTEM_ERROR` при недоступности ОБОИХ прокси (раньше залипал `RUNNING`); удалён мёртвый `force_catch_up` (роль у `catch_up=True`). Диагностика `scripts/proxy_diag.py` (TG-DC vs 1.1.1.1) — все 54 прокси живые.
+
+  *AutoChat.* Дубль авто-ответа при рестарте воркера закрыт: `planner_loop._generate_and_enqueue` под тем же `self._generating`, что и `force_generate_reply`, + re-check `last_our>=last_their`.
+
+  *Auto-runner (R-2).* На старте пропись пишет честный `last_status` («ожидание воркера») и стопается через `STARTUP_MAX_WAIT_SEC=30мин`, если воркер не поднялся (раньше висела `is_running=true` молча до `session_ends_at`).
+
+  *Живой прогон.* 26 воркеров (0 `AUTH_KEY_DUPLICATED`, 0 churn). @it_aqua7 end-to-end (send → ответ → один авто-ответ, без дубля). BANAN + затем все 26 auto-runner'ов по ~3 лида: реальные контакты, **0 дублей** (сверено с `crm_dup_leads.csv` + кросс-аккаунт), transient-сбои возвращают лида в пул. Дедуп верифицирован из 2 источников: 256/256 дублей в реестре, 100 партнёрских `new` — 0 пересечений. *Оговорка (учёт ошибки):* по неполным данным залил в пул in_progress-лиды, часть уже написанных; поставил паузу, дубля по факту НЕ ушло. Урок: durable-источник «писали ли» = `events_archive`, не сессии/`contacted_leads`.
+
+  *Тесты.* Обновлены `test_claim_attempts_and_blacklist` (claim=DELETE, no auto-invalid), `test_wall_clock_and_retry` (reinsert без push), `test_contacted_dedup` (claim mirror без claimed_at); все smoke PASS в контейнере.
+
+  *Отложено (осознанно).* `self_stop`→return-value, `resume`→реактивно по `worker.started`, вычистка vestigial `window_hours` и pool-колонок, фильтр рефилла по полу, восстановление ошибочных invalid на стороне партнёра. Разделы 1–19 (§6/§8/§10/§13/§15) местами ещё описывают прежнее (claimed_at-модель, дедуп из сессий) — актуализация current-state отдельным проходом.
+
+  *Затронуто (1–19):* 6, 8, 10, 13, 14, 15, 19. Файлы: `modules/autochat/{service,session,errors}.py`, `modules/partner_crm/{service,poller}.py`, `modules/worker_auto_runner/service.py`, `modules/worker/{worker,wrapper}.py`, `core/proxy.py`, `scripts/proxy_diag.py`, `alembic/versions/{0020,0021}_*.py`, `tests/smoke/*`.
 
 - **2026-06-27 — Фикс §3.1: авторестарт воркера больше не глушит auto-runner.**
   *Проблема:* при транзиентном падении воркер прозрачно перезапускался (снова `RUNNING`), но в момент падения публиковался `worker.crashed`; авто-раннер трактует его как «офлайн» и **навсегда** останавливал автодиалоги по аккаунту — при этом воркер выглядел здоровым, и оператор не замечал, что лиды перестали обрабатываться.
   *Фикс:* введён отдельный тип события `worker.restarted`. При **успешном** авторестарте публикуется он (а не `worker.crashed`); `worker.crashed` остаётся только для финального краха (рестарт не делался/не удался). Авто-раннер реагирует лишь на `worker.stopped`/`worker.crashed`, поэтому `worker.restarted` игнорирует и продолжает работать. Принцип «шина — основной лог» сохранён (сбой виден как `worker.restarted`).
   *Затронуто:* `core/events.py`, `core/event_messages.py`, `modules/worker_manager/service.py`; разделы 7 и 10.
+
+- **2026-06-29 — Индивидуальный fingerprint аккаунта (api_id + device-info).**
+  *Проблема:* за неделю наблюдений (26-26.06.2026) Telegram дважды batch-killed по 13-15 воркеров одновременно — utworни и в один день. На пуле ~20 рабочих аккаунтов через ~3 недели работы в живых остались 2. Корни два: (1) одни глобальные `TELEGRAM_API_ID/HASH` из `.env` на всю ферму — каждый аккаунт представляется Telegram'у как «то же приложение, что и 18 других»; (2) дефолтный `device_model`/`system_version`/`app_version`/`lang_code` Telethon на всех — идентичный «девайс» на ферме. По связке (api_id, fingerprint) антифрод TG банально группирует аккаунты и применяет batch-action'ы (FloodWait → terminate session). Подтвердил аудит §6 и §7 — это и есть Issue #6 + #7 из бывшего `docs/fixes/open_issues_summary.md`.
+  *Фикс:*
+  1. Миграция `0013_account_fingerprint.py`: добавлено 8 nullable-колонок на `accounts` — `api_id`, `api_hash`, `device_model`, `system_version`, `app_version`, `lang_code`, `system_lang_code`, `lang_pack`.
+  2. `modules/worker/wrapper.py::TelegramWrapper.__init__` принимает все 8 полей; `_make_client` подставляет их в `TelegramClient(...)`. Если device-поля пусты — не передаются (Telethon применит свои дефолты — для service-аккаунта это ОК, для рабочих — закрыто проверкой `worker_manager`).
+  3. `modules/worker/worker.py::Worker.__init__` пробрасывает fingerprint в wrapper (раньше брал глобальные из `core.config.settings`).
+  4. `modules/worker_manager/service.py::start()` SELECT'ит все 14 колонок (старые 6 + 8 fingerprint) и передаёт в `_spawn`/`Worker`; добавлена ошибка `ACCOUNT_FINGERPRINT_MISSING` (HTTP 409) — рабочий аккаунт без заполненных `api_id`/`device_*` не стартует. Restart-path (`_runner` после первого падения) тоже видит fingerprint в замыкании.
+  5. `modules/auth/service.py::AuthService.start()` принимает все 8 fingerprint-полей + опциональный `password` для 2FA (см. ниже); строит `TelegramClient` с полным fingerprint'ом; `_finalize()` INSERT'ит их в `accounts`. `start_reauth()` использует fingerprint из существующей строки accounts — Telegram должен видеть «тот же клиент» при reauth.
+  6. `submit_code` + `SessionPasswordNeededError` — если оператор передал `password` в `/auth/start`, backend сам применяет его через `_apply_password_inline()` без отдельного шага `/auth/2fa`; иначе фаза → `2fa_required` как раньше (обратная совместимость).
+  7. `modules/auth/routes.py::AuthStartIn` расширен на 8 fingerprint-полей + `password: str | None`. Добавлен код ошибки `FINGERPRINT_INVALID` (400).
+  8. UI: `NewAccountDialog.tsx` шаг «form» получил поля fingerprint'а и опциональное поле 2FA-пароля. Сетки 2×/3× для компактности; шаг «2fa» показывается только если Telegram запросит 2FA и пароль не был передан заранее.
+  9. CLI: `scripts/register_account.py` — одношаговая регистрация через те же `/auth/*`; принимает все поля как `--api-id`, `--device-model`, …; интерактивно запрашивает SMS-код после `/auth/start` (+ опц. 2FA-пароль).
+  *Результат:* каждый новый аккаунт несёт собственные `api_id`/`device_*`; ферма перестаёт быть «одним приложением на 20 аккаунтов» — антифрод TG больше не сможет тривиально сгруппировать всех по fingerprint'у. Глобальные `TELEGRAM_API_ID/HASH` из `.env` остаются для service-аккаунта доставки (`report_delivery`), который не подвержен этой проблеме (одиночный, без cold-outreach).
+  *Не закрыто:* `proxy-creds-plaintext-db` (аудит §3.11) — `session_data` и прокси-креды всё ещё в БД в открытом виде; это отдельный фикс шифрования at-rest. Также `wrapper.py` Issue из бывшего `transient_self_stop_and_privacy_misclassification.md` про `ALLOW_PAYMENT_REQUIRED → SESSION_EXPIRED` — это другой класс проблем (классификация ошибок), не fingerprint.
+  *Затронуто:* `alembic/versions/0013_account_fingerprint.py` (новая); `modules/worker/wrapper.py`, `modules/worker/worker.py`, `modules/worker_manager/service.py`, `modules/auth/service.py`, `modules/auth/routes.py`; UI: `modules/ui_web/src/components/dialogs/NewAccountDialog.tsx`, `modules/ui_web/src/lib/api.ts`; CLI: `scripts/register_account.py`. Разделы SPEC: 6 (accounts), 8 (wrapper, §8.6.1), 9 (вся §9.1/9.2/9.3 + endpoints + reauth + UI/CLI).
+
+- **2026-06-30 — Auto-runner переведён с «interval+jitter» на окно + N лидов.**
+  *Проблема:* прежняя модель тикала «каждые ~20 мин ±5 мин» — равномерно-периодическое расписание, детектится антифродом как автомат; при пустой очереди воркер всё равно продолжал тикать в том же ритме. К тому же при `start()` первый лид уходил почти сразу после нажатия Play — палит момент включения. Оператор хочет «сессия автопрописи = окно 12ч, в него разбросаны 15-25 моментов, случайно; первый — не сразу».
+  *Фикс:*
+  1. Миграция `0014_auto_runner_windowed_schedule.py`: DROP `interval_sec`/`jitter_sec` + CHECK'и; ADD `window_hours` (default 12, 1-48), `min_leads` (default 15), `max_leads` (default 25), `warmup_minutes` (default 10, 0-240), `session_started_at TIMESTAMPTZ`, `session_ends_at TIMESTAMPTZ`, `schedule TIMESTAMPTZ[] NOT NULL DEFAULT '{}'`. Три CHECK-constraint'а на границы.
+  2. `modules/worker_auto_runner/service.py::_generate_schedule(now, ...)`: `n = randint(min_leads, max_leads)`; первый лид в `[warmup_end, warmup_end + FIRST_LEAD_SPREAD_SEC=900]`, ограниченный `session_ends_at`; остальные N-1 — uniform в `[first, session_ends_at]`, sorted. Возвращает `(schedule, session_ends_at)`.
+  3. `start(account_id)` теперь: генерирует расписание, пишет `session_started_at/session_ends_at/schedule` одной транзакцией, создаёт `_account_loop`. Идемпотентно — если task уже жив, не пересобирает.
+  4. `_account_loop` спит до `schedule[0]` через `_chunked_sleep`, атомарно pop'ает момент (`_pop_first_schedule`, `FOR UPDATE`), обрабатывает как раньше. Если `schedule=[]` или `NOW() >= session_ends_at` → self-stop c `reason=session_completed`. При пустом источнике лидов момент считается использованным (график не «отматывается»).
+  5. `reset_on_boot()` больше **не гасит все автоматы**. Гасит только сессии с `session_ends_at IS NULL` (legacy) или `session_ends_at <= NOW()` (истёкшие). Новый метод `resume_running_loops()` (вызывается в lifespan сразу после `reset_on_boot`) читает всех `is_running=true AND session_ends_at > NOW()` и поднимает `_account_loop` — сессии переживают рестарт app.
+  6. `stop()` дополнительно очищает `schedule/session_started_at/session_ends_at`, чтобы следующий `start` не спутал остаток предыдущей сессии с новой.
+  7. `update_config` принимает `window_hours/min_leads/max_leads/warmup_minutes` вместо `interval_sec/jitter_sec`. Проверяет `min_leads <= max_leads` учитывая текущие значения в БД (для инкрементальных PATCH'ей).
+  8. `routes.py::AutoRunnerPatch`: новые поля с Pydantic-границами (`ge=1, le=48` и т.д.). DTO ответа добавляет `session_started_at`, `session_ends_at`, `schedule`, `schedule_remaining`, `next_dispatch_at`.
+  9. UI: `AutoRunnerSettingsDialog.tsx` — новые поля `window_hours`, `warmup_minutes`, `min_leads`, `max_leads` + локальное превью «разбросаем N-M лидов по окну X, первый — не раньше Y мин, в среднем один каждые Z». При `is_running=true` — предупреждение, что новые значения применятся при следующем Start. `AccountCard.tsx` показывает «→ HH:MM · N осталось» под телефоном когда автомат работает.
+  10. Константа `InvalidInterval` → `InvalidConfig` (`INVALID_CONFIG` HTTP 400) — покрывает все проверки диапазонов.
+  *Результат:* автопропись выглядит естественнее: случайная плотность внутри окна (иногда 3 лида подряд, иногда пустой час), гарантированный отступ от момента включения (по умолчанию 10-25 минут), сессия имеет чёткий конец (по `window_hours`), после рестарта app воркеры дожимают свой график. Проверено smoke-тестом: 23 лида на окне 12ч, первый через 11.8 мин, распределение uniform.
+  *Затронуто:* `alembic/versions/0014_auto_runner_windowed_schedule.py` (новая); `modules/worker_auto_runner/service.py` (переписан), `modules/worker_auto_runner/routes.py`; `api/main.py` (добавлен `resume_running_loops` в lifespan); UI: `modules/ui_web/src/types/api.ts`, `modules/ui_web/src/components/dialogs/AutoRunnerSettingsDialog.tsx`, `modules/ui_web/src/components/dialogs/AccountCard.tsx`. Разделы SPEC: 5 (карта модулей), 6.4 (карта сервисов), 10.5 (Worker Auto Runner — переписан), 10.6 (UI), 15.х (bus-consumer группа).
+
+- **2026-06-30 — Транскрипция: `openai/gpt-4o-mini-transcribe` через `/api/v1/audio/transcriptions` + рендер расшифровки в HTML-отчёте.**
+  *Проблема:* транскрипция шла через `openai/gpt-4o-audio-preview` на chat.completions (`input_audio` внутри message content). Модель нестабильна, часть аудио получала `openrouter error: null` / пустые ответы. Плюс отчёт `report.py::_render_messages` показывал голосовые как `[голосовое]` — оператор не видел, о чём говорилось в voice-сообщениях, даже если расшифровка успешно легла в `media.transcription`. Задача покрывает пункт «transcription-empty-retry-not-counted / phase-3 model» из `docs/AUDIT_2026-06-26.md` §L332.
+  *Фикс:*
+  1. `core/openrouter.py::transcribe_audio` переведён на выделенный STT-эндпоинт `POST /api/v1/audio/transcriptions` (JSON body `{"model","input_audio":{"data","format"}}`, ответ `{"text","usage"}`) — тот же тип клиента `httpx.AsyncClient(timeout=HTTP_TIMEOUT)`, тот же `_headers()`. Убран мёртвый `TRANSCRIPTION_PROMPT` (STT-эндпоинт не принимает system-prompt). Добавлена константа `OPENROUTER_TRANSCRIPTIONS_URL`.
+  2. Дефолт модели в `core/config.py::OPENROUTER_MODEL_TRANSCRIPTION` — `openai/gpt-4o-mini-transcribe`. `.env` синхронизирован. Требует пересоздания контейнера (`docker compose up -d --force-recreate app`), а не просто `restart` — env компоуз кэширует.
+  3. `modules/autochat/report.py::_load_messages` — добавлены под-запросы `string_agg(NULLIF(transcription,''), ' ')` и то же для `description` (JOIN'ы по `message_id`). `_render_messages` вместо `_media_placeholder` для media-без-текста теперь зовёт новый `_media_body(msg)` — возвращает `[голосовое] <транскрипция>` для voice/audio/video_note, `[фото] <описание>` для photo/video/animation/sticker/document. Если расшифровка/описание пустые (`pending` / `failed` / `none`) — только ярлычок как раньше. Класс `.media-only` (курсив, opacity) применяется только когда контента нет.
+  4. Новый CSS-класс `.media-tag` (pill-ярлычок перед текстом) — отдельно для isolated bubble (входящее) и out bubble (исходящее). Инлайн-стиль, зашит в head-CSS отчёта.
+  5. Проверено: `_wait_for_transcriptions` (`modules/autochat/session.py:458`) уже реализует нужное поведение — `_planner_loop` перед `_generate_and_enqueue` вызывает его; пока `media.transcription_status='pending' OR description_status='pending'` в диалоге — poll 30с × 10 попыток (5 мин). Только после этого идёт генерация. Таймаут — safety valve, чтобы навсегда не залипло на битой транскрипции. Ничего в `session.py` менять не потребовалось.
+  *Результат:* smoke-test через `transcribe_audio(silent_wav)` возвращает `""` за один вызов (endpoint принят, модель работает). Оператор в HTML-отчёте теперь видит `[голосовое] Привет, как дела?` вместо просто `[голосовое]`.
+  *Затронуто:* `core/openrouter.py`, `core/config.py`, `.env`; `modules/autochat/report.py`; разделы SPEC 6.5 (переменные окружения), 8.5 (`core/openrouter.py`), 20 (эта запись). Wait-логика уже была верной — только verified.
+
+- **2026-07-11 — Стабильность воркеров: supervisor-паттерн + таксономия ошибок + refresh last_status.**
+  *Проблема:* 11.07 утром массовый инцидент: 10-14 воркеров одновременно перешли в `last_status='stopped (transient_error:SESSION_EXPIRED)'`, UI начал отдавать `/accounts` за 40-60 сек (нормально — 100мс). Разбор показал три независимых архитектурных пробела:
+    1. **`Worker.run` не слушал `client.disconnected`.** Когда Telethon в фоне отваливался (сетевой RST, TG-side close, исчерпание `connection_retries=2`), TelegramClient тихо становился `is_connected()=False`, но никаких exception'ов в наш код не приходило. Broken clients копились в памяти app'а, каждый крутил recv_loop с ошибками `readexactly() called while another coroutine is already waiting` / `Server replied with a wrong session ID` — блокировали asyncio event-loop, все HTTP тормозили (сценарий №2 из аудита рассинхрона состояний).
+    2. **Race при спавне.** `WorkerManager._spawn` писал `Redis:worker:{id}:status=RUNNING` СРАЗУ после `asyncio.create_task(_runner)`, ДО того как `wrapper.connect()` реально отработал. В окне 20-40 сек UI/`get_wrapper()` видели воркер как "живой", хотя connect ещё шёл (сценарий №1).
+    3. **Таксономия ошибок в `auto_runner._try_start_dialog` слишком грубая.** Всё что не в `_CRM_INVALID_ERROR_CODES` считалось "нужна реакция оператора" → self-stop автомата. По данным событий за месяц 88% таких self-stop'ов были на `SEND_FAILED_TRANSIENT` = PEER_FLOOD (Telethon PeerFloodError: "Too many requests (caused by SendMessageRequest)" без секунд). PEER_FLOOD — это тихий anti-spam TG, снимается сам через 30-60 мин; @SpamBot его вообще не показывает. Оператор тратил половину дня "будя" воркеры, реальной ручной работы не было.
+    4. **`last_status` в БД никогда не обновлялся на успехах.** Только `start()` / `stop()` / self-stop / крах его писали. Успешная отправка лида — нет. Из-за этого метки вроде `SESSION_EXPIRED` от вчерашнего self-stop'а висели навсегда, даже когда сегодня воркер вовсю рассылает лидов. Именно они создали ложную картину утреннего инцидента: 10 из 12 "SESSION_EXPIRED" на самом деле были живыми, просто метка запечёная.
+  *Фикс (без заплаток — каждый пункт закрывает архитектурный пробел, не симптом):*
+  1. **`TelegramWrapper.wait_until_disconnected()` (`modules/worker/wrapper.py`).** Прокси-обёртка над Telethon'овским `TelegramClient.disconnected` awaitable. Возвращается когда клиент реально отвалился (или мгновенно если ещё не подключён). Новое исключение `TelethonDisconnected(WrapperError)` — маркер этого события в наверх.
+  2. **`Worker.run` = supervisor-паттерн (`modules/worker/worker.py`).** Вместо `await self._stop_event.wait()` теперь `asyncio.wait({stop_task, disc_task}, FIRST_COMPLETED)`. Если победил disc_task — ставится флаг `_telethon_disconnected`, после cleanup'а бросается `TelethonDisconnected`. Штатный stop() возвращается тихо как раньше. `SessionExpired` из handler'ов идёт через `_pending_exception` (третий канал) — тоже как раньше.
+  3. **Race при спавне: `_on_ready` callback (`modules/worker/worker.py` + `modules/worker_manager/service.py`).** `Worker.__init__` принимает optional `on_ready: Callable[[], Awaitable[None]]`. `Worker.run` вызывает его один раз ПОСЛЕ успешного `wrapper.connect()`. `WorkerManager._spawn` подставляет свой колбэк, который делает `_set_status(RUNNING)`. Из `_spawn` убран синхронный write RUNNING — теперь статус STARTING остаётся до реального подключения. `get_wrapper()` больше не возвращает "живой" wrapper пока connect не отработал → UI/auto_runner видят честную картину.
+  4. **`WorkerManager._runner` ловит `TelethonDisconnected`** — публикует `worker.stopped` c `reason=telethon_disconnect`, ставит status STOPPED, error='telethon_disconnect'. Auto-runner тот же обработчик что и на `worker.stopped/crashed` → корректно гасит автомат. Auto-restart НЕ пытается: обычно disconnect идёт от TG-side (revoke), reconnect с той же session_data упрётся в ту же ошибку. Оператор поднимает через `/workers/{id}/start` после разбора.
+  5. **Таксономия ошибок (`modules/worker_auto_runner/service.py`).** Три вердикта (`_classify_send_error`):
+     - `invalid_lead`: `CANNOT_WRITE`, `USERNAME_NOT_FOUND`, `USERNAME_UNAVAILABLE` — лид объективно мёртвый. Push `terminal_status=invalid` в CRM, автомат ПРОДОЛЖАЕТ работу.
+     - `transient`: `SEND_FAILED_TRANSIENT` (PEER_FLOOD), `FLOOD_WAIT` / `FloodWaitError`, `GENERATION_FAILED` — временный сбой. Лид возвращается в пул, автомат ПРОДОЛЖАЕТ работу. Следующий слот попробует нового лида, PEER_FLOOD часто снимается сам к следующему тику.
+     - `needs_operator`: `SESSION_EXPIRED`, `WORKER_NOT_RUNNING`, любые неизвестные коды (безопасный дефолт). Лид возвращается в пул, автомат ОСТАНАВЛИВАЕТСЯ через `_self_stop_requested`. Reason: `needs_operator:<CODE>` вместо старого `transient_error:<CODE>`.
+     Раньше `SEND_FAILED_TRANSIENT` попадал во второй бакет старого кода (было только два: INVALID vs всё остальное) → self-stop. Теперь остаётся `transient` → автомат живёт.
+  6. **`_touch_last_status(account_id, status)` + вызов при успехе (`modules/worker_auto_runner/service.py`).** Хелпер обновляет `last_status` без переключения `is_running`. Зовётся из `_try_start_dialog` после успешного `bus.publish(AUTO_RUNNER_LEAD_SENT)` — ставит `'running'`. Стирает устаревшие ошибочные метки от прошлых self-stop'ов, когда автомат сегодня успешно отправляет лид. UI видит актуальное состояние.
+  7. **Smoke-тесты (`tests/smoke/`):**
+     - `test_auto_runner_taxonomy.py` — 14 юнит-кейсов на `_classify_send_error` + guard'ы (нет коллизий бакетов, PEER_FLOOD не self-stop).
+     - `test_worker_supervisor.py` — 3 async-кейса с FakeWrapper: (a) штатный stop → run() тихо возвращается, on_ready вызван в правильный момент; (b) fake-disconnect → бросается `TelethonDisconnected`; (c) stop и disconnect почти одновременно, stop победил → тихий возврат без исключения.
+     - `test_last_status_refresh.py` — интеграционный: ставим устаревшую метку `SESSION_EXPIRED` → зовём `_touch_last_status('running')` → проверяем что запись обновилась.
+     Все три сьюта: **17/17 PASS** на живом коде после rebuild'а.
+  *Результат:*
+  - UI не залипает от broken sessions (главный источник лагов утреннего инцидента).
+  - PEER_FLOOD больше не глушит автомат — оператор перестаёт "будить" воркеры каждые 30 мин.
+  - `last_status` в БД отражает актуальное состояние, а не последнюю ошибку недельной давности.
+  - `WORKER_NOT_RUNNING` от `get_wrapper()` больше не появляется в окне 20-40 сек после `/workers/{id}/start` (race устранён).
+  *Затронуто:* `modules/worker/wrapper.py` (+wait_until_disconnected, +TelethonDisconnected); `modules/worker/worker.py` (supervisor, on_ready); `modules/worker_manager/service.py` (_on_ready callback, TelethonDisconnected handler, remove sync RUNNING); `modules/worker_auto_runner/service.py` (taxonomy, _touch_last_status, refactor _try_start_dialog); новая директория `tests/smoke/`. Разделы SPEC: 8.4 (Worker жизненный цикл), 8.6 (WorkerManager), 10.5 (Worker Auto Runner), 20 (эта запись).
+
+  **Fix #4 (обнаружено при live-verify):** после rollout'а фиксов 1-3 стагерный запуск auto-runner дал 21/23 воркеров с `stopped (needs_operator:SESSION_EXPIRED)`. Расследование показало ЛОЖНУЮ классификацию: события `auto_runner.lead_skipped` содержали `error: "RPCError 406: ALLOW_PAYMENT_REQUIRED (caused by SendMessageRequest)"` — TG-side ошибка "лид требует Stars за DM" (закрыл лички). Autochat/service.py правильно матчит `ALLOW_PAYMENT_REQUIRED` в `_RPC_CANNOT_WRITE_MARKERS` и должен возвращать `CannotWrite`, но ошибка не доходила до этой ветки. Копнули глубже: в Telethon 1.36 `AuthKeyError.code = 406` — это **generic класс для ВСЕХ ошибок с HTTP-кодом 406** (исторически 406 = auth-related). `ALLOW_PAYMENT_REQUIRED` не имеет specific класса в `rpcerrorlist`, поэтому Telethon бросает его как `AuthKeyError(request, message)`. Наш `wrapper._guard` ловил `AuthKeyError` в `_SESSION_EXPIRED_ERRORS` → мапил в `SessionExpired` → autochat раисит `AutoSessionExpired` → auto_runner классифицирует как `needs_operator` → self-stop. Все 21 воркер массово легли не из-за реального session expired, а из-за privacy-настроек **отдельных лидов**. **Фикс:** в `wrapper.py` добавлен `_NOT_SESSION_ERROR_MARKERS` (синхронизирован с `autochat/service.py::_RPC_CANNOT_WRITE_MARKERS`): `ALLOW_PAYMENT_REQUIRED`, `PRIVACY_PREMIUM_REQUIRED`, `USER_BANNED_IN_CHANNEL`, `CHAT_RESTRICTED`. Во ВСЕХ 5 местах где `_guard`-подобная логика ловит `_SESSION_EXPIRED_ERRORS`, ПЕРЕД мапингом в `SessionExpired` проверяется `if any(m in str(e) for m in _NOT_SESSION_ERROR_MARKERS): raise` — ошибка пропускается наверх без модификации, autochat её матчит по маркеру и делает `CannotWrite` → CRM `invalid`. Тест `tests/smoke/test_privacy_marker_bypass.py` (3 кейса) — все PASS. Затронут дополнительно: `modules/worker/wrapper.py` (+`_NOT_SESSION_ERROR_MARKERS`, +5 патчей `_SESSION_EXPIRED_ERRORS`-обработчиков), `tests/smoke/test_privacy_marker_bypass.py` (новый).
+
+  **Fix #5 (PEER_FLOOD auto-recovery через @SpamBot + 2h cooldown):** после Fix #2 автомат больше не глушится на PEER_FLOOD, но **следующие слоты** всё равно упирались в тот же флуд — воркер бесполезно тратил schedule[]. Оператор знает что у Premium-аккаунтов флуд снимается `/start` к `@SpamBot` дважды, после чего 2ч отдыха гарантированно очищают antifraud-состояние. **Реализация:**
+  1. Миграция `0015_auto_runner_flood_cooldown.py`: `ADD COLUMN cooldown_until TIMESTAMPTZ, cooldown_reason TEXT`.
+  2. Хелпер `_set_cooldown(account_id, until, reason)` + расширение `_select_one` на новые поля.
+  3. Классификатор `_is_flood_error(err_code, err_msg)`:
+     - `FLOOD_WAIT` / `FloodWaitError` → True
+     - `SEND_FAILED_TRANSIENT` c `"Too many requests"` в тексте → True (PEER_FLOOD)
+     - `SEND_FAILED_TRANSIENT` c `"user was deleted"` → **False** (не флуд, лид мёртвый; лечить это отдельно, не через SpamBot).
+  4. `_trigger_flood_recovery(account_id, err_code, err_msg)` вызывается из `_try_start_dialog` когда `verdict=transient` и `_is_flood_error(...)=True`. Делает:
+     - `wrapper.send_message('SpamBot', '/start')` дважды с паузой 3 сек. Ошибки съедаются (если и SpamBot заблокирован, cooldown всё равно применим — отдых лечит сам).
+     - `_set_cooldown(account_id, NOW()+2h, f"flood:{err_code}")`.
+     - Публикует `AUTO_RUNNER_LEAD_SKIPPED` c `data.flood_recovery=True` (переиспользуем существующий тип события — оператор видит в фиде).
+     - `_touch_last_status = 'cooldown (flood, until ...)'`.
+  5. В `_account_loop` (ПЕРЕД pop_first_schedule): если `cooldown_until > NOW()` — сон до его истечения через `_chunked_sleep` (реагирует на cancel/worker_offline). После сна: `_set_cooldown(None, None)` + `_touch_last_status('running')` + событие `flood_recovery_ended` (тип `AUTO_RUNNER_LEAD_SENT` для видимости в фиде). Слоты попавшие в окно cooldown пропадают — расписание НЕ пересобирается, это ожидаемо (потерянные лиды партнёрская CRM выдаст заново на следующем refill).
+  6. DTO в `routes.py` расширен на `cooldown_until` + `cooldown_reason` для UI-подсказки.
+  7. Тест `tests/smoke/test_flood_recovery.py`: 10 матрица-кейсов на `_is_flood_error` (PEER_FLOOD-marker матчится; "user deleted" не матчится; CANNOT_WRITE не матчится; неизвестный код не матчится) + sanity констант + интеграционный тест persistence (`_set_cooldown` пишет в БД → `_select_one` возвращает).
+  **Итоговый счёт тестов:** 32/32 PASS (14 taxonomy + 3 supervisor + 1 last_status + 3 privacy marker + 11 flood recovery). Затронуто дополнительно: `alembic/versions/0015_auto_runner_flood_cooldown.py` (новая), `modules/worker_auto_runner/service.py` (+_is_flood_error, +_trigger_flood_recovery, cooldown-check в loop, _set_cooldown), `modules/worker_auto_runner/routes.py` (cooldown в DTO), `tests/smoke/test_flood_recovery.py` (новый).
+
+  **Fix #6 (рендер медиа в отчёте, msg.type vs media.type):** после Fix из 2026-06-30 (`_media_body` для показа расшифровки в HTML-отчёте) операторы всё равно видели `[медиа]` вместо транскрипции. Копнули: `msg.get("type")` — это `messages.type` = `'regular'` / `'service'` (тип сообщения из TG). А `'voice'`/`'audio'`/`'photo'`/`'video'` — это тип **МЕДИА** (`media.type`), отдельная таблица. `_media_body` сравнивал `msg["type"]='regular'` со списками `_AUDIO_TYPES={'voice',...}` — совпадения не бывало НИКОГДА, всё шло в fallback `_media_placeholder(msg_type)` → `.get('regular', '[медиа]')` = `'[медиа]'`. Транскрипция в БД лежала корректно, `_load_messages` её тянул через `string_agg`, но `_media_body` игнорировал.
+  **Фикс:**
+  1. В `_load_messages` добавлен под-запрос `(SELECT string_agg(DISTINCT type, ',' ORDER BY type) FROM media WHERE message_id = m.id) AS media_types` (плюс аналогичный `reply_media_types`). Возвращает CSV типов media, привязанных к сообщению (может быть несколько — media group).
+  2. Новый чистый хелпер `_pick_media_type(msg)` выбирает **основной** тип с приоритетом `audio → bimodal → visual`, чтобы для смешанной media group отчёт показывал наиболее важный канал (голос > видео > картинка).
+  3. `_AUDIO_TYPES = {"voice","audio"}`, `_BIMODAL_TYPES = {"video","video_note"}` (имеют и озвучку и картинку), `_VISUAL_TYPES = {"photo","animation","sticker","document"}`.
+  4. `_media_body` переписан: берёт picked type, для audio показывает `[label] <транскрипция>`, для bimodal показывает `[label] <транскрипция> · <описание>` (оба канала когда оба есть), для visual — `[label] <описание>`. Fallback `[медиа]` только когда действительно нечего расшифровать / неизвестный тип.
+  5. `_reply_snippet` принимает `media_types_csv` вместо `msg_type`, использует тот же `_pick_media_type` — цитаты голосовых показывают `[голосовое]`, не `[медиа]`.
+  6. Тест `tests/smoke/test_report_media_render.py` — 17 кейсов: 10 на `_pick_media_type` (все типы + приоритеты + пусто + unknown), 5 на `_media_body` (voice+транскрипция, voice-only-label, photo+description, video-bimodal, mixed-audio+photo), 2 на `_reply_snippet`.
+  **Live-verify:** на реальном dialog_id=80149 с одним voice-сообщением до фикса рендерилось `[медиа]`, после — `[голосовое] Привет, понятия не имею, первый раз тебя вижу.`.
+  **Итоговый счёт тестов после Fix #6:** 49/49 PASS (14 taxonomy + 3 supervisor + 1 last_status + 3 privacy marker + 11 flood recovery + 17 report media). Затронуто дополнительно: `modules/autochat/report.py` (+`_pick_media_type`, изменён `_media_body`, `_reply_snippet`, `_load_messages`), `tests/smoke/test_report_media_render.py` (новый).
+
+  **Fix #7 ("user was deleted" → invalid):** ошибка `RPCError: "The specified user was deleted (caused by SendMessageRequest)"` приходит когда лид удалил свой TG-аккаунт. Раньше классифицировалась как `SendFailedTransient` (verdict=transient) и лид возвращался в пул — другой воркер тоже упал бы на нём, и так по кругу. По смыслу это терминальное состояние. **Фикс:** маркер `"user was deleted"` добавлен в `modules/autochat/service.py::_RPC_CANNOT_WRITE_MARKERS`. Теперь `autochat` раисит `CannotWrite` → `auto_runner` классифицирует как `invalid_lead` → push `terminal_status=invalid` в CRM. Одна строка + 2 теста.
+
+  **Fix #8 (retry-counter в CRM-пуле):** до этого фикса лид мог бесконечно ходить по кругу — если все 26 воркеров попадали на PEER_FLOOD/FloodWait по этому лиду, он reinsert'ился обратно вечно. **Фикс:**
+  1. Миграция `0016_crm_lead_attempts.py`: `ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`.
+  2. `partner_crm/service.py::reinsert_into_pool` принимает `account_id` (новый обязательный параметр), делает `INSERT ... ON CONFLICT DO UPDATE SET attempts = attempts + 1 RETURNING attempts`.
+  3. Если `attempts >= MAX_LEAD_ATTEMPTS = 3` — лид удаляется из пула и вызывается `push_lead_finalized(terminal_status="invalid")` от имени последнего упавшего воркера. Возвращает `False` (лид финализирован, не в пуле).
+  4. Обновлён единственный call-site в `worker_auto_runner/service.py::_try_start_dialog` — передаёт `account_id`.
+  Тесты: `test_wall_clock_and_retry.py`: `attempts=1 → True` (лид в пуле, push не звался), `attempts=3 → False + push_lead_finalized(status='invalid')` через мок пула и push-client.
+
+  **Fix #9 (wall-clock окно 08-23 МСК + новые дефолты):** до этого окно было "N часов от момента `start()`" — пропись шла в любое время суток. Оператор попросил жёсткое расписание "с 08:00 до 23:00 МСК", плюс скромнее по объёму (15-18 лидов вместо 15-25).
+  1. Миграция `0017_auto_runner_wall_clock_window.py`: `ADD COLUMN active_start_hour_msk INT NOT NULL DEFAULT 8, active_end_hour_msk INT NOT NULL DEFAULT 23`. `ALTER max_leads DEFAULT 18`. `UPDATE` всех существующих записей на новые значения. CHECK-constraint: 0≤start≤23, 1≤end≤24, end>start.
+  2. Новая функция `_msk_wall_clock_window(now_utc, active_start_hour_msk, active_end_hour_msk)` → `(start_utc, end_utc)`. Часовой пояс UTC+3 без DST (MSK стабилен с 2011 года). Если `now_msk >= end_msk` — окно на завтра.
+  3. `_generate_schedule` переписан: строит расписание в границах активного окна МСК; первый лид не раньше `max(now + warmup, window_start)`; если warmup выкатил нас за окно — переносится на завтра.
+  4. `session_ends_at = window_end` — по-прежнему.
+  5. `update_config` принимает `active_start_hour_msk` + `active_end_hour_msk` с валидацией. Routes/DTO/типы UI дополнены.
+  6. UI `AutoRunnerSettingsDialog.tsx`: вместо поля "Окно (часов)" — два поля "Начало окна (МСК)" и "Конец окна (МСК)". Превью подсчитывает `windowHrs = end - start`, показывает "случайно по окну 08:00–23:00 МСК (15 ч)".
+  7. Все 26 существующих воркеров через `UPDATE` в миграции переведены на дефолты 8/23/15/18.
+  Тесты: `test_wall_clock_and_retry.py`: (a) сегодняшнее окно, (b) 23:30 МСК → окно на завтра, (c) `_generate_schedule` реально ставит все точки в окне и после warmup.
+
+  **Итоговый счёт тестов после Fix #7-9:** 56/56 PASS (14 taxonomy + 3 supervisor + 1 last_status + 3 privacy marker + 11 flood recovery + 17 report media + 7 wall-clock/retry). Затронуто дополнительно: `alembic/versions/0016_crm_lead_attempts.py` (новая), `alembic/versions/0017_auto_runner_wall_clock_window.py` (новая), `modules/autochat/service.py` (+"user was deleted" маркер), `modules/partner_crm/service.py` (reinsert_into_pool теперь принимает account_id, инкрементит attempts, финализирует при исчерпании), `modules/worker_auto_runner/service.py` (+`_msk_wall_clock_window`, +`MSK_OFFSET`, переписан `_generate_schedule`, `_select_one`/`update_config`/`start` расширены на новые поля), `modules/worker_auto_runner/routes.py` (DTO + Pydantic patch на новые поля), `modules/ui_web/src/types/api.ts` (типы), `modules/ui_web/src/components/dialogs/AutoRunnerSettingsDialog.tsx` (два новых числовых input вместо одного), `tests/smoke/test_wall_clock_and_retry.py` (новый).
+
+  **Fix #10 (умный cooldown на flood: TG-seconds + rand(10-20 мин) + regenerate schedule):** до этого фикса ЛЮБОЙ flood (короткий `FloodWaitError N=30 sec` или `PEER_FLOOD` без секунд) уводил воркер в фиксированный **2ч cooldown**. 30-секундный FloodWait тратил 2 часа слот воркера впустую. Плюс после cooldown loop продолжал по СТАРОМУ расписанию — все просроченные timestamps выпаливались подряд, PEER_FLOOD возвращался.
+  **Фикс:**
+  1. В `_try_start_dialog::except Exception as e` дополнительно извлекаем `err_seconds = getattr(e, "seconds", None)` — Telethon и наш `autochat.errors.FloodWait` сохраняют секунды из TG-ответа.
+  2. `_trigger_flood_recovery` теперь принимает `seconds: int | None`. Cooldown вычисляется как: `base = seconds if seconds else FLOOD_COOLDOWN_HOURS*3600` (2ч дефолт для PEER_FLOOD), `extra = random.uniform(FLOOD_EXTRA_REST_MIN_SEC=10min, FLOOD_EXTRA_REST_MAX_SEC=20min)`, `cooldown_until = NOW() + base + extra`. Случайный отдых распределяет пик восстановлений во времени и даёт запас на неточность серверного счётчика.
+  3. `cooldown_reason` теперь пишет секунды когда есть (`flood:FLOOD_WAIT:180s`), для PEER_FLOOD остаётся просто `flood:SEND_FAILED_TRANSIENT`.
+  4. Событие `AUTO_RUNNER_LEAD_SKIPPED` c `flood_recovery=True` расширено: `seconds_from_tg`, `extra_rest_sec`, `cooldown_until` — оператор в фиде видит точную причину и длительность.
+  5. **Новый хелпер `_regenerate_schedule_for_remaining_window(account_id)`**: читает текущий `schedule[]` (в нём после cooldown лежат уже просроченные timestamps), считает N=`len(schedule)`, `session_ends_at` — теперь то же самое N лидов равномерно раскидываем в `[NOW, session_ends_at]`. Пишем в БД. Возвращает новую длину.
+  6. В `_account_loop` cooldown-ветке после `_set_cooldown(None, None)` вызывается `_regenerate_schedule_for_remaining_window` **до** publish "cooldown ended". Событие `flood_recovery_ended` теперь несёт `schedule_regenerated_leads` для мониторинга.
+  7. Тесты `tests/smoke/test_smart_flood_cooldown.py` (2 кейса): (a) `_set_cooldown` с расчётом `seconds + rand(10-20 min)` — `cooldown_until` попадает в ожидаемое окно, `cooldown_reason` содержит секунды; (b) `_regenerate_schedule_for_remaining_window` — сохраняет N, все timestamps в `[NOW, session_end]`, отсортированы.
+  **Итоговый счёт тестов после Fix #10:** 58/58 PASS (14 taxonomy + 3 supervisor + 1 last_status + 3 privacy marker + 11 flood recovery + 17 report media + 7 wall-clock/retry + 2 smart cooldown). Затронуто дополнительно: `modules/worker_auto_runner/service.py` (+`FLOOD_EXTRA_REST_*` константы, +`_regenerate_schedule_for_remaining_window`, обновлён `_trigger_flood_recovery` и `_try_start_dialog`, cooldown-ветка `_account_loop`), `tests/smoke/test_smart_flood_cooldown.py` (новый).
+
+- **2026-07-13 — POST-MORTEM: `docker compose restart app` = регрессия Telethon updates на 21/26 воркерах.**
+  *Что произошло.* За день сделал два `docker compose restart app` (для деплоя Fix #17 и Fix #18) — потому что это быстрее (~15 сек) чем `--force-recreate` (~30 сек). После второго restart'а обнаружено: 21 из 26 воркеров тихо перестали получать входящие сообщения (проверено через `dialog.typing_observed` за 30 мин — 4/26 воркеров имеют events, 22/26 нулевые; и через `message.received is_outgoing=false` — до restart 24 воркера с inbound, после только 5). Точечный `stop + start` воркера через API **не помогает** — новый Worker поднимается, sync.done не публикуется, updates от TG не приходят.
+  *Причина.* `docker compose restart app` перезапускает процесс внутри существующего контейнера. Uvicorn получает SIGTERM, lifespan shutdown отменяет asyncio-задачи, `Worker.stop()` → `wrapper.disconnect()` шлёт Telegram-серверу «я ушёл». Но SIGTERM→SIGKILL grace period в docker по умолчанию **10 сек**, а `wrapper.disconnect()` не даёт гарантий что MTProto-пакет доставлен до kill'а. Telegram-сервер считает старую сессию активной, шлёт updates на **старое** (мёртвое) TCP-соединение внутри убитого процесса. Новый процесс с той же `StringSession` подключается, handler'ы привязываются корректно (Fix #16 в порядке), но updates от TG не приходят — они уходят в никуда. Fix #16 юнит-тест PASS потому что FakeWrapper не симулирует TG-серверный session state.
+  *Как правильно.* `docker compose up -d --force-recreate --no-deps app` пересоздаёт весь контейнер: старый умирает начисто, network interface исчезает, TCP RST на всех соединениях с TG на транспортном уровне — Telegram переключается на новую сессию мгновенно.
+  *Диагностический сигнал.* `SELECT COUNT(DISTINCT account_id) FROM events_archive WHERE type='dialog.typing_observed' AND time >= NOW() - INTERVAL '30 min'` должно быть близко к числу активно работающих воркеров (у нас 20+ на нормальной нагрузке). Если <10 — почти наверняка session-lock регрессия, нужен force-recreate.
+  *Урок.* Использовать **только** `docker compose up -d --force-recreate --no-deps app` для деплоев кода app. `restart` больше не используется.
+
+- **2026-07-13 — Кросс-аккаунт дедуп (реестр `contacted_leads`) + полный сброс системы.**
+  *Проблема.* Анализ по дням показал: кросс-аккаунт дубли («2 воркера — один человек») — не разовый баг, а системное поведение, спайкующее при массовых рестартах (07-11 = 100% дублей БЕЗ каких-либо правок кода — это был день массового реавтора; 07-13 = 96% в день моих деплоев; обычный 07-12 = 7%). Механизм: при рестарте in-flight сессии падают → `reinsert_into_pool` сбрасывает лидов в свободный пул → на восстановлении их разбирают ДРУГИЕ аккаунты. Плюс дедуп в `create_session` был per-account (не глобальный), а партнёр пересох (последний досыл 07-12 12:55) — пул целиком из уже-прописанных.
+  *Корневое лечение (простая логика).* Миграция `0019_contacted_leads.py` — глобальный реестр `contacted_leads (username PK, telegram_user_id, account_id, contacted_at)`. На успешной отправке первого сообщения [autochat/service.py](modules/autochat/service.py) `create_session` → `INSERT contacted_leads`. Дедуп в двух местах [partner_crm/service.py](modules/partner_crm/service.py): `claim_lead_for_account` добавляет `AND NOT EXISTS contacted_leads`, `_take_into_pool` (рефилл) возвращает `skipped_contacted`. Итог: **прописали раз → больше НИКОГДА, любым аккаунтом, при любом рестарте/реинсерте/переназначении партнёром.** Реестр в БД переживает рестарт — «аккуратно при рестарте» закрыто. Реестр НЕ бэкфилится (идёт вместе со сбросом — старт с чистого листа).
+  *Полный сброс системы (по запросу оператора, необратимо).* (1) Пауза всех 26 автопрописей; (2) пуш `no_response` в партнёрскую CRM по 160 незакрытым лидам (статуса `archive` в интеграции нет — использовали `no_response`); (3) wipe всех 1748 переписок (14669 сообщений) `revoke=True` — удаление и у нас, и у собеседников; (4) очистка `crm_lead_pool` + `autochat_sessions`; (5) деплой реестра + дедупа; (6) чистый лист.
+  *Тест* [tests/smoke/test_contacted_dedup.py](tests/smoke/test_contacted_dedup.py): `_take_into_pool` → `skipped_contacted`; claim-исключение прячет контактированного. Затронуты **§15**, **§6** (новая таблица).
+
+- **2026-07-13 — Хотфикс дубля прописи: реапер (H1) не должен воскрешать уже-прописанных лидов.**
+  *Симптом (после деплоя Части A).* Оператор заметил, что «какие-то лиды прописываются по второму кругу», и что `dialog #92140` (`mad_black_fox`, acc 43) прописан дважды: сессия 5402 (вчера, stopped) + 5607 (сегодня, active). Плюс авто-раннер acc 25 замолчал с `needs_operator:SESSION_ALREADY_ACTIVE`.
+  *Корневая причина — мой реапер H1.* Успешно прописанный CRM-лид остаётся в `crm_lead_pool` как `claimed` до терминальной финализации (беседа длится часами). Реапер `reap_stale_claims` освобождал ЛЮБОЙ claim старше 2ч, включая уже-прописанных. Дальше воркер клеймил лида заново, а `create_session` (гейт дедупа блокирует только `starting/active/paused`, но **не** `stopped`) выдавал два исхода: (а) при stopped-сессии — **повторная отправка** тому же человеку (дубль); (б) при active-сессии — `SessionAlreadyActive` → таксономия относила это к `needs_operator` → **авто-раннер self-stop** (аккаунт замолкал целиком, как acc 25).
+  *Масштаб.* 1 дубль-отправка сегодня после деплоя (`mad_black_fox`) + acc 25 в дауне; 66 дублей исторически — отдельный, более старый низкорейтовый путь (уже-прописанный лид возвращался в пул через error-reinsert), не мой реапер.
+  *Фиксы.*
+    1. [modules/partner_crm/service.py](modules/partner_crm/service.py) `reap_stale_claims`: добавлено условие `AND NOT EXISTS (SELECT 1 FROM autochat_sessions s WHERE lower(s.target_username)=lower(crm_lead_pool.username))` — реапер трогает только настоящих сирот (claimed, но без единой сессии = app умер между claim и create_session). Уже-прописанного лида не воскрешает.
+    2. [modules/worker_auto_runner/service.py](modules/worker_auto_runner/service.py) `_try_start_dialog`: `SESSION_ALREADY_ACTIVE` теперь benign-skip (пропустить слот, продолжить), а не needs_operator self-stop — авто-раннер не умирает на benign-условии, лид в пул не возвращается и invalid не пушится.
+  *Деплой.* `force-recreate` (второй за день) + стаггер-рестарт 26 воркеров + ручной подъём авто-раннера acc 25 (он был is_running=false, resume_running_loops его не поднимал). Затронуты **§15** (реапер), **§10.5** (таксономия).
+  *Известный отдельный долг.* Пре-существующий путь (66 дублей): уже-прописанный CRM-лид не удаляется из пула сразу после успешной отправки, поэтому error-reinsert может вернуть его как свободного. Правка — удалять лид из пула на успехе `create_session` (from_crm) — намеренно отложена как аккуратная правка ядра CRM-потока, не наспех на живом проде.
+
+- **2026-07-13 — Правильный пайплайн: переписан слой соединения (Часть A) + пакет прикладных фиксов (C1–C4, H1, H3, M1–M8, L1–L5).**
+  *Контекст.* По плану [docs/PIPELINE_FIX_2026-07-13.md](docs/PIPELINE_FIX_2026-07-13.md) — не очередные заплатки поверх заплаток, а замена корневого фундамента слоя соединения плюс корректные фиксы прикладных багов авто-раннера, autochat, CRM и инфраструктуры. Ниже по частям.
+
+  **Часть A — правильный слой соединения (C3, H2, M7; сняты костыли Fix #16 warm-up/re-subscribe и Fix #21 force_catch_up).** Корневая ошибка: на каждый реконнект/свитч прокси создавался НОВЫЙ `TelegramClient` из исходной строки сессии (сброс entity-кэша, updates-state, salt), а фоновый probe поднимал ВТОРУЮ реальную сессию через другой прокси → Telegram видел один auth-key с двух IP → `AUTH_KEY_DUPLICATED` → массовый разлогин (C3). Переписано на **один персистентный клиент на аккаунт**:
+    - [modules/worker/wrapper.py](modules/worker/wrapper.py): персистентный `self._session = StringSession(...)` (создаётся раз, переезжает во все клиенты); `_make_client` строит клиент с `auto_reconnect=True`, `connection_retries` (~10), `retry_delay`, `catch_up=True`, `flood_sleep_threshold=60`, `receive_updates=True`; `probe_proxy` теперь **транспортный** (`core.proxy.check_socks5` → TCP до `1.1.1.1:443` через SOCKS, без сессии); хендлеры хранятся в враппере и авто-перевешиваются в `connect_via` при свитче (`_reattach_handlers`); добавлен `get_me()`; `get_session_data` читает из `self._session`.
+    - [modules/worker/worker.py](modules/worker/worker.py): `Worker.run` переписан в тонкий супервайзер — один connect, хендлеры/`get_me`/`get_dialogs` один раз, нагон один раз, дальше супервизия `wait_until_disconnected` + **последовательный** свитч прокси (полный disconnect → connect на fallback с тем же `self._session`) + фоновый транспортный probe основного → возврат (H2, без stale-Event) + бэкофф (M7). Удалены `_connect_loop_with_switch`, `_probe_primary_loop`, warm-up/re-subscribe/force_catch_up. `SessionExpired` по-прежнему пробрасывается наружу как reauth.
+    - Затронуты разделы **§8.7** (полностью переписан) и **§10.3**.
+
+  **Часть B — авто-раннер ([modules/worker_auto_runner/service.py](modules/worker_auto_runner/service.py)).**
+    - **C1** — пропись глохла после первого лида на повторном старте: ветка `session_completed` писала флаг `_self_stop_requested`, который никто не чистил → свежий цикл видел устаревший вердикт. Убрана запись флага; `_self_stop_requested.pop` теперь во всех входах/выходах (`start`, `stop`, `_do_self_stop`).
+    - **C2 + M6** — `stop()`/`shutdown()` падали с `asyncio.CancelledError` (в Py 3.12+ не наследник `Exception`) при отмене loop-task: `/stop` → 500, а «спуриозный» CancelledError убивал наблюдателя офлайн-воркеров. Единый helper `_cancel_and_wait` (ловит Cancelled/Timeout/Exception); консьюмер `run()` различает реальную отмену (`_stop_event`) от спуриозной.
+    - **M4** — возобновлённая пропись мёртвого воркера крутилась вечно: проверка `session_ends_at` вынесена **до** ожидания wrapper'а (естественный cap).
+    - **M5** — после даунтайма прописи выпаливали просроченные слоты залпом: `resume_running_loops` пересобирает расписание на остаток окна (`_regenerate_schedule_for_remaining_window`) при возобновлении.
+    - **L2** — `DEFAULT_MAX_LEADS` 25 → 18 (синхрон с миграцией 0017).
+    - Затронут раздел **§10.5**.
+
+  **Часть C — AutoChat.**
+    - **C4** ([modules/autochat/service.py](modules/autochat/service.py)) — регенерация missed-inbound на `worker.started` шла инлайн в единственном консьюмере (`_wait_for_transcriptions` до 5 мин + LLM) → замирал приём у всех аккаунтов. Вынесена в фоновую задачу `_regen_missed_inbound` с семафором (лимит параллелизма).
+    - **M2** ([modules/autochat/session.py](modules/autochat/session.py)) — дубли ответов при двойном реконнекте: «замок» `self._generating` + метка `last_our_activity_at` **в момент постановки в очередь** (селектор `last_their > last_our` перестаёт выбирать сессию до отправки).
+    - **M3** — штатное завершение диалога (`<finishdialog/>` без сегментов) больше не помечается ERROR: `status=SUCCESS if (segments or finish_requested)`.
+
+  **Часть D — CRM ([modules/partner_crm/service.py](modules/partner_crm/service.py)).**
+    - **H1** — пул «истощался»: `list_pool` теперь фильтрует `claimed_at IS NULL` (согласован с уже-исправленным `pool_size`, Fix #23); добавлен **реапер** `reap_stale_claims` (возвращает в пул claim'ы старше 2ч), зовётся первым на каждом тике поллера ([modules/partner_crm/poller.py](modules/partner_crm/poller.py)).
+    - **H3** — наши сбои жгли валидные лиды как `invalid`: `reinsert_into_pool` получил `count_attempt`; авто-раннер зовёт его с `True` для `transient` (штрафуем) и `False` для `needs_operator` (наша вина — не штрафуем).
+    - Затронут раздел **§15** (методы, поллер, таксономия self-stop в §10.5).
+
+  **Часть E — инфраструктура и UI.**
+    - **M1** ([modules/report_delivery/service.py](modules/report_delivery/service.py) + wrapper) — сервис-аккаунт `report_delivery` спамил `system.error` (~2880/сутки при мёртвом прокси): `wrapper.connect(publish_error=False)` подавляет публикацию, вызывающий логирует сам; экспоненциальный бэкофф реконнекта (30с → 900с).
+    - **M8** ([NewAccountDialog.tsx](modules/ui_web/src/components/dialogs/NewAccountDialog.tsx) + [api.ts](modules/ui_web/src/lib/api.ts)) — неверный inline-2FA-пароль загонял мастер в тупик: `describeApiError` отдаёт `code`, мастер на `PASSWORD_INVALID`/`BAD_PHASE` ведёт на шаг 2FA (бэкенд уже в фазе `2fa_required`).
+    - **L1/L3** ([modules/worker_manager/service.py](modules/worker_manager/service.py)) — авторестарт мутировал `_slots` без лока: свитч слота под `self._lock` с перепроверкой `slot.worker is worker` (L1); статус `starting` на время восстановления вместо `crashed` (L3).
+    - **L4** ([modules/auth/service.py](modules/auth/service.py)) — `api_hash` больше не пишется в Redis `auth_session`, живёт только в памяти `_Live` (как пароль).
+    - **L5** ([useAccounts.ts](modules/ui_web/src/hooks/useAccounts.ts) + [useLiveInvalidator.ts](modules/ui_web/src/hooks/useLiveInvalidator.ts)) — быстрый safety-поллинг (12с вместо 60с) на `['accounts']`/`['auto-runner']`, когда `EventSource` не в состоянии OPEN (общий стор `useSseConnected`).
+
+  **Что НЕ трогали** (проверкой снято, не поломки): R1 «user was deleted → разлогин» (это `UserDeletedError`/403, корректно уходит в invalid), R2 транскрипция (эндпоинт отдаёт 200, 6/6 в проде), R3 fingerprint-гейт (из 27 аккаунтов только сервисный без fingerprint, он и исключён).
+
+  *Тесты.* Обновлён [tests/smoke/test_resilient_worker.py](tests/smoke/test_resilient_worker.py) под новую архитектуру Части A (хендлеры один раз, последовательный свитч, транспортный probe); удалён устаревший `test_reconnect_rebinds_handlers.py` (тестировал снятый костыль Fix #16); добавлен [tests/smoke/test_auto_runner_c1_c2.py](tests/smoke/test_auto_runner_c1_c2.py) (4 кейса: `_cancel_and_wait` глушит CancelledError, `stop()` без 500 + чистит флаг, `_do_self_stop`/`start` чистят флаг). **Все 12 смоук-сьютов PASS** в контейнере; полный граф модулей импортируется чисто; фронт-изменения type-clean (`tsc`). Затронуты также **§8.7, §10.3, §10.5, §15**.
+
+- **2026-07-13 — Fix #23: `pool_size()` считает только СВОБОДНЫХ лидов (`claimed_at IS NULL`).**
+  *Симптом.* Утром 2026-07-13 после запуска auto-runner (26 воркеров × 18-20 лидов) 6 воркеров сразу получили `auto_runner.queue_empty`, пропись не начиналась. Пул при этом показывал 187 записей.
+  *Причина.* `PartnerCrmService.pool_size()` делал `SELECT COUNT(*) FROM crm_lead_pool` — считал ВСЕ записи, включая уже claimed. До Fix #13 семантика была «в пуле = свободна», после Fix #13 записи с `claimed_at IS NOT NULL` — это лиды «в работе» (ещё не финализированы). После вчерашних рестартов ~187 claim'ов зависли (не сделан ни `reinsert_into_pool`, ни `push_lead_finalized` — процесс app умер посреди flow). Poller `partner_crm.poller._tick()` смотрел `pool_size >= threshold(10)` → «пул полон, refill не нужен» → **ни одного `partner_crm.pool_refilled` за 2 часа**. При этом claim_lead_for_account фильтрует `claimed_at IS NULL` → 0 доступных → queue_empty.
+  *Быстрое лечение (сделано вручную).* `UPDATE crm_lead_pool SET claimed_at=NULL, assigned_account_id=NULL WHERE claimed_at IS NOT NULL AND claimed_at < NOW() - INTERVAL '30 min';` — освободил 187 зависших. Пропись пошла в течение 3 мин: 1 lead_taken → 1 autochat.started → 1 initial_sent.
+  *Фикс кода.* В [modules/partner_crm/service.py](modules/partner_crm/service.py) `pool_size()` теперь `SELECT COUNT(*) FROM crm_lead_pool WHERE claimed_at IS NULL`. Docstring объясняет причину и симптом воспроизведения.
+  *Не задеплоено.* Fix #23 в файлах, но force-recreate app сейчас снёс бы 26 воркеров в разгар рабочего дня. Deploy отложен до следующего планового рестарта (вечером или завтра). Пока действует workaround: если пул опять забьётся claim'ами (например при повторном рестарте не по Fix #19/#22), нужно вручную прогнать unstuck-UPDATE (см. выше). Плюс запланировать очистку через cron: каждые 30 мин освобождать claim'ы старше 30 мин — но это уже overkill, если Fix #19 + #22 v2 в проде.
+  *Связь с другими фиксами.* Fix #23 — прямое следствие Fix #13. При проектировании Fix #13 не заметили, что `pool_size()` в poller'е использует старый counting.
+
+- **2026-07-13 — Fix #22 (v2, safe): триггер regenerate на событие `worker.started`, не в `_restore_active_sessions`.**
+  *Проблема.* Autochat-сессии не переживают рестарт app как asyncio-task. `AutoChatService._restore_active_sessions()` уже существовал (вызывался в `run()` при старте) и восстанавливал session-объекты в памяти с in_chat=False, ожидая следующего inbound-события. НО тонкость: `message.received` события, пришедшие ДО рестарта, уже были обработаны предыдущим autochat consumer и ack'нуты в Redis consumer group — при рестарте они НЕ переиграются. Если лид ответил пока autochat-task была мертва, session восстанавливается зомби, лид уходит в `no_response` через 24ч.
+  *Симптомы.* После сегодняшних 4 рестартов app накопилось 9 зомби-диалогов (регенерированы вручную): 93199, 93216, 93178, 93075, 93143, 92917, 93213, 92590, 92128.
+  **Первая версия Fix #22 сломала 1 сессию.** Я попытался триггерить `force_generate_reply` прямо в `_restore_active_sessions` — но на момент вызова воркеры могут быть ещё stopped (стандартная последовательность: app стартует → autochat restore → оператор запускает stagger_recovery.py минутой позже). Session 5396 (venus82026) успешно сгенерила текст, попыталась отправить, `wrapper=None` → `_fail("send_failed")` → **терминальный `status='failed'`**. Session восстановлен вручную (UPDATE status='active').
+  *Правильная реализация (v2).*
+    1. `_restore_active_sessions()` **не делает regenerate**. Только восстанавливает state machine в памяти (как было до v1).
+    2. Новый обработчик `_on_worker_started(account_id, data)` — вызывается в `_dispatch` на события `EventType.WORKER_STARTED`. Гарантирует что wrapper поднят (событие публикуется в `Worker.run()` СРАЗУ после connect + subscribe + catch_up).
+    3. `_on_worker_started` делает SQL:
+       ```sql
+       SELECT id, dialog_id FROM autochat_sessions
+        WHERE account_id = $1 AND status='active'
+          AND last_their_message_at > COALESCE(last_our_activity_at, '1970-01-01'::timestamptz)
+          AND last_their_message_at >= NOW() - make_interval(secs => $2)
+       ```
+       И для каждой строки — `await session.force_generate_reply()`.
+    4. **Time TTL** `_MISSED_INBOUND_TTL_SEC = 6*3600`: не воскрешаем сессии где лид написал больше 6 часов назад — тактически он уже сдал, воскрешение = странный спам.
+    5. Идемпотентность: `worker.started` приходит и на first_run, и на reconnect'ы. Оба сценария защищены SQL-фильтром `their > ours` — если regenerate уже сделан и мы ответили, condition FALSE → no-op.
+    6. Try/except на каждую отдельную regen — падение одной не блокирует остальные.
+    7. `WORKER_STARTED` добавлен в `_INTERESTING_TYPES` набор autochat consumer.
+  *Тесты* `tests/smoke/test_autochat_resume.py` — 4 кейса, все PASS:
+    1. `worker.started` для acc с missed inbound → `force_generate_reply()` вызван.
+    2. Пустой fetch (наш outbound был последним) → regen НЕ вызывается.
+    3. TTL константа = 6ч (защита от воскрешения древних).
+    4. Unknown session id из SQL не крашит handler (защита от рассинхрона БД ↔ in-memory).
+  **Итог по тестам:** 12 сьютов PASS (11 предыдущих + новый autochat-resume с 4 кейсами).
+  *Связь с Fix #18/#21.* Fix #18 закрыл resume для auto-runner. Fix #21 закрыл push updates на level TG-сервера. Fix #22 закрывает последнюю дыру — восстановление autochat-очереди после рестарта. **Теперь любой рестарт app полностью прозрачен по всем осям**: воркер вернулся → catch_up от TG-сервера → autochat увидел WORKER_STARTED → если у него зомби для этого acc → regenerate → ответ идёт с гарантированно живым wrapper'ом.
+
+- **2026-07-13 — Fix #21: `force_catch_up()` после subscribe — регрессия из POST-MORTEM #2 закрыта, верифицировано живым round-trip.**
+  *Корневая причина (пересмотр после Fix #21).* Первоначальная гипотеза в POST-MORTEM #2 про «устаревший session_data → TG держит phantom subscription» указывала в правильном направлении, но неточно: `StringSession` не хранит `pts/qts/date` (это делают только `SQLiteSession`), поэтому дело не в устаревании session_data. **Реальный механизм:** после рестарта app новый Telethon-клиент подключается по MTProto к TG, но НЕ шлёт `updates.getState` / `updates.getDifference` активно. Telethon в 1.36 при старте с чистой StringSession просто «слушает» push-updates от TG. **TG-сервер помнит какой connection получал updates для этого auth_key** — если старый connection только что был активен, TG может ещё какое-то время маршрутизировать push на него (мёртвый), а не на новый. Наши pull-запросы (`iter_dialogs`, `send_message`) работают всегда — они направлены нашим клиентом. Push subscriptions «прилипают» к предыдущему receiver'у.
+  *Fix.* Метод Telethon `client.catch_up()` кладёт в очередь искусственный `UpdatesTooLong` → Telethon отвечает вызовом `updates.getDifference` к серверу → TG:
+    1. присылает список updates которые накопились с последнего known state (сразу попадают в наши handler'ы, потому что мы их зарегистрировали до вызова);
+    2. **регистрирует ЭТОГО клиента** как текущего получателя последующих push-updates, стирая phantom-подписку.
+  *Реализация.*
+    - [modules/worker/wrapper.py](modules/worker/wrapper.py): новый метод `force_catch_up()` — обёртка над `client.catch_up()` с `try/except` (best-effort, не роняет воркер) + log.warning на неудачу.
+    - [modules/worker/worker.py](modules/worker/worker.py) `Worker.run()`: новый шаг «4.5» между subscribe (шаг 4) и bus/sync (шаг 5). Строго ПОСЛЕ `on_new_message` + `enable_typing_observer` — иначе updates, которые Telethon подтянет, некому будет обработать. Вызывается на КАЖДЫЙ круг supervisor-loop'а (first_run + reconnect'ы), потому что новый TelegramClient каждый раз возвращает нас к той же проблеме.
+    - Docstring `Worker.run` обновлён под новый шаг.
+  *Верификация.* Live round-trip test (2026-07-13, 21:44 MSK): подняли acc=45 (SAD_05_RU) который был «тихим» после регрессии → `autochat.start` на `@it_aqua7` (личный TG оператора) → оператор ответил дважды с typing. Все три критичных сигнала пришли:
+    - `dialog.typing_observed` × 3 (21:44:11 / 21:44:19 / 21:44:27) — UserUpdate handler работает
+    - `message.received is_outgoing=false` × 2 (21:44:24 «Привет, лт? Интересно», 21:44:32 «возможно знакомы») — NewMessage handler работает
+    - `autochat.entered_chat` (21:44:39) — autochat pipeline реагирует на inbound
+  До Fix #21 acc=45 показывал 0 typing и 0 inbound за 30 мин при активных диалогах. После Fix #21 — работает мгновенно.
+  *Побочный эффект.* Fix #21 устраняет проблему полностью — Fix #20 (периодическое `session.save()` в БД) остаётся запланированным как defense-in-depth, но перестал быть критичным: даже если session_data устареет, `catch_up()` при следующем подъёме воркера установит наш клиент как активного receiver push.
+
+- **2026-07-13 — POST-MORTEM #2: force-recreate НЕ решил регрессию, корневая причина глубже — устаревший `session_data` в БД.**
+  *Продолжение первого post-mortem.* После `docker compose up -d --force-recreate --no-deps app` + stagger_recovery состояние: 26/26 воркеров `running`, но по факту **20 из 26 не получают live push updates от Telegram**. Проверено на широком окне (1 час после recreate):
+    - `44`: было 12 inbound → стало 0
+    - `34`: было 7 → 0
+    - `32`: было 6 → 0
+    - `30`: было 5 → 0
+    - `48, 35, 47, 33, 27, ...`: все ушли в 0
+    - Остались активны: `24, 29, 31, 36, 38, 40` (6 воркеров)
+  Причём `sync.done` прошёл для ВСЕХ 26 (нагон истории), значит:
+    - MTProto соединение установлено ✓
+    - Аутентификация валидна ✓
+    - Pull-API (`iter_dialogs`, `send_message`) работает ✓
+    - **Push-updates (`NewMessage`, `UserUpdate` handlers) — не работает** ✗
+  *Корневая причина.* Telethon хранит внутри `StringSession` позицию updates (`pts`, `qts`, `seq`). Внутри `accounts.session_data` в БД **лежит session с момента `/auth/start` мастера** — иногда неделями старая. На каждом старте Worker'а Telethon читает эту старую session, TG-сервер видит клиента со «старым» `pts` и **держит push-subscription за более свежим клиентом** (тот, что жил в предыдущем процессе — на его момент session_data была свежее). Свежая session_data никогда в БД не пишется — только auth-мастер это делает.
+  *Почему 6 воркеров работают.* Их session_data случайно оказалась достаточно свежей (например их авторизовывали недавно, или сегодня их session_data обновилась через reauth-flow). У остальных 20 — старая.
+  *Почему force-recreate не помог.* Сеть контейнера полностью пересоздана, старые TCP-соединения умерли — но **проблема не в контейнере**, а в состоянии на **Telegram-серверной** стороне. TG сам должен сбросить subscription по TTL.
+  *Что делаем сейчас.* Ждём 2-4 часа — по опыту Telegram сбрасывает push-subscription старого «фантомного» клиента через внутренний TTL. Как только сброс произошёл — push updates придут на живой клиент. Outbound (лидам) в это время работает — мы просто не видим их ответы.
+  *Как проверить что регрессия прошла.* `SELECT COUNT(DISTINCT account_id) FROM events_archive WHERE type='dialog.typing_observed' AND time >= NOW() - INTERVAL '30 min' AND account_id BETWEEN 23 AND 48` — должно быть ≥15 (норма). Или таблица ниже: `in_last_1h` у большинства не-0. Если через 4-6 часов всё ещё <10 живых → форс-мажор, надо reauth.
+
+- **2026-07-13 — Fix #20 (запланирован, НЕ реализован): периодическое сохранение session_data в БД + при graceful shutdown.**
+  *Задача.* Устранить корневую причину регрессии из post-mortem #2 — не допускать чтобы `accounts.session_data` в БД когда-либо была старше живой session Telethon-клиента. Тогда следующий рестарт app восстановит клиенты с актуальным `pts`, TG не будет держать subscription на «более свежий» несуществующий процесс.
+  *План реализации.*
+  1. В [modules/worker/worker.py](modules/worker/worker.py) добавить фоновую task в `Worker.run()`: `_save_session_loop()` — каждые **5 минут** делает `self.wrapper.get_session_data()` (там `client.session.save()`) и пишет в `accounts.session_data` через отдельный `pool.acquire()`. TTL в TG для «свежести» клиента порядка 30 мин — сохранение раз в 5 мин даёт запас.
+  2. В `Worker.run()` finally-блоке (при штатной остановке): **сохранить session_data перед disconnect**. Комбинация с планируемым Fix #19 (graceful shutdown) даст двойную гарантию.
+  3. Добавить в `Worker.stop()` вызов save_session синхронно — чтобы `/workers/{id}/stop` через API тоже писал актуальную session.
+  4. Мини-миграция не нужна — колонка `accounts.session_data` уже есть, только UPDATE'ы.
+  5. Тест: смоук `tests/smoke/test_session_persistence.py` — Worker.run() запускается с FakeWrapper, вертит 3 круга save_session_loop, проверяем UPDATE'ы в БД (через мок asyncpg).
+  *Приоритет.* Высокий — эта проблема будет воспроизводиться каждый раз при рестарте, если не пофиксить. Fix #19 без Fix #20 всё равно оставит окно рассинхрона.
+  *Не блокирует ничего.* Можно делать отдельно. С Fix #19 не связан жёстко, но оба нужны для полной устойчивости к рестартам.
+
+- **2026-07-13 — Fix #19 (запланирован, НЕ реализован): graceful shutdown Telethon в lifespan shutdown.**
+  *Задача.* Устранить корневую причину регрессии из post-mortem выше — сделать `docker compose restart app` таким же чистым как `--force-recreate`. Сейчас единственная защита — не использовать `restart`, но human error возможен.
+  *План реализации.*
+  1. В [api/main.py](api/main.py) lifespan shutdown: **до** cancel'а `worker_task`'ов явно вызвать `await worker_manager.stop_all()` и **дождаться** (`asyncio.wait_for(..., timeout=8.0)`) фактического завершения `wrapper.disconnect()` каждого воркера. Сейчас cancel рвёт корутину на любом await'е внутри disconnect, MTProto goodbye-пакет может не улететь.
+  2. В [modules/worker/wrapper.py](modules/worker/wrapper.py) `disconnect()`: после `await self._client.disconnect()` добавить `await asyncio.sleep(0.5)` — гарантия что Telethon дописал send-buffer в сокет до закрытия. Плюс `await asyncio.wait_for(..., timeout=2.0)` вокруг самого disconnect'а — если Telegram не отвечает, не висим бесконечно.
+  3. В [docker-compose.yml](docker-compose.yml) сервис `app`: `stop_grace_period: 20s` (по умолчанию 10) — даёт нам bounded окно чтобы Uvicorn успел прогнать все finally-блоки во всех воркерах × 8s на воркера.
+  4. Тест: смоук `tests/smoke/test_graceful_shutdown.py` — запустить app, дождаться 26 воркеров онлайн, SIGTERM, замерить сколько времени shutdown, проверить `wrapper.disconnect()` вызван для всех воркеров (через мок или лог-скан).
+  *Приоритет.* Средний. Пока действует правило «только `--force-recreate`», регрессия не воспроизводится. Реализовать когда либо (а) появится ещё один аналогичный симптом, (б) захотим упростить оператору жизнь возможностью использовать `restart`.
+  *Не блокирует ничего.* Никакие другие фиксы или фичи от Fix #19 не зависят.
+
+- **2026-07-13 — Fix #18: grace-таймер `_account_loop` не тикает пока wrapper ни разу не был жив (закрыт lifespan startup race).**
+  *Контекст.* После рестарта app (например для деплоя нового кода) `resume_running_loops` в lifespan startup сразу создавал loop-task'и для всех воркеров с живой сессией `session_ends_at > NOW()`. Но `worker_manager.start()` не поднимает wrapper'ы автоматически — оператор запускает их через stagger-скрипт `scripts/stagger_recovery.py`, который выдерживает ~30 сек между стартами (антифрод). 26 воркеров = ~13 мин до полного подъёма. Fix #12 grace = `MAX_WRAPPER_MISSES × WRAPPER_MISS_SLEEP_SEC = 3 × 180 = 9 мин`. Воркеры на хвосте очереди не успевали за grace → `_account_loop` считал их «offline», сам себя выключал с `last_status="worker offline (extended)"`. При тесте после restart app сегодня 9/26 auto-runner так и не подхватились.
+  *Фикс:* в `_account_loop` добавлен флаг `ever_saw_wrapper: bool = False`. Пока wrapper ни разу не появлялся — итерация с `get_wrapper()==None` НЕ увеличивает `wrapper_miss_count`, а просто спит `WRAPPER_MISS_SLEEP_SEC` и повторяет проверку. Как только wrapper впервые появился → флаг флипается в True → далее grace-таймер работает как раньше (`MAX_WRAPPER_MISSES` подряд с sleep между — self-stop). Естественный cap на бесконечное ожидание — `session_ends_at`: если оператор так и не поднял воркер до конца окна, ветка «session_completed» отработает как обычно.
+  *Тест* `tests/smoke/test_resilient_worker.py::test_startup_wait_never_counts_before_first_wrapper` (новый): 10 итераций с `wrapper=None` до появления → 0 self-stop; после появления wrapper'а — `MAX_WRAPPER_MISSES` промахов → ровно 1 self-stop. PASS.
+  **Итог по тестам:** 12 сьютов PASS (11 предыдущих + 1 обновлённая resilience-сьюта c 6 тестами вместо 5). Затронуто: [modules/worker_auto_runner/service.py](modules/worker_auto_runner/service.py) (`_account_loop`: +`ever_saw_wrapper` guard в начале цикла; docstring актуализирован), [tests/smoke/test_resilient_worker.py](tests/smoke/test_resilient_worker.py) (+кейс).
+
+- **2026-07-13 — Fix #17: account_name в /events и SSE (кэш имён 60с) — UI показывает "AFERIST_02_RU" вместо "account_24".**
+  *Проблема.* Оператор в логе событий видел «account_45» вместо человекочитаемого имени — понять о каком воркере речь можно было только через отдельный SELECT в БД. UI (`EventRow.tsx`) уже умел рендерить `account_name` с fallback'ом на `account_${id}`, но бэк это поле никогда не заполнял.
+  *Фикс:* в `api/routes/events.py` добавлен модульный кэш `_ACC_NAME_CACHE: dict[int, str]` с TTL 60с. Функция `_refresh_account_names_if_stale()` при истечении TTL делает `SELECT id, name FROM accounts` (27 строк — пыль на фоне тысяч событий/час) и обновляет кэш. `_enrich(event)` теперь дописывает `account_name` из кэша если есть. Освежение вызывается в 5 точках: `list_events` (обычный + root_id ветки), `json_generator` в экспорте, SSE `stream_events`, `get_event_chain`, `get_event`. При отсутствии в кэше (например аккаунт создан только что) — фронт откатится на `account_${id}`.
+  Проверено live: `GET /events?limit=2` вернул `acc_id=24 → name='AFERIST_02_RU'`. UI без изменений — сразу подхватил новое поле через существующий fallback.
+
+- **2026-07-13 — Fix #16: handlers и entity-cache перевешиваются на каждый reconnect воркера (закрыт тихий баг Fix #12).**
+  *Контекст.* Аудит uncommitted изменений (параллельный workflow) поднял два риск-флага в новом supervisor-loop'е Fix #12 [worker.py:124](modules/worker/worker.py#L124):
+  1. `wrapper.on_new_message(...)` и `wrapper.enable_typing_observer()` вызывались только внутри `if first_run:`. Handler'ы Telethon привязаны к конкретному `TelegramClient`, а `wrapper.connect_via()` при каждом reconnect'е создаёт **новый** клиент через `_make_client()` и переприсваивает `self._client`. Итог: после первого runtime-disconnect (supervisor уходит в `continue`) новый TelegramClient идёт без подписок → **воркер молча перестаёт получать входящие сообщения**, autochat замолкает, лиды тухнут по `no_response`.
+  2. `wrapper.get_dialogs(limit=None)` (прогрев entity-кэша) тоже был только на first_run. `_make_client` инициализирует `StringSession(self._initial_session)` — из строки на момент старта воркера, без накопленных access_hash. После reconnect'а первый `send_message(user_id=...)` рискует получить `Could not find input entity`, лид зациклится через reinsert.
+  *Фикс:* в [worker.py](modules/worker/worker.py) вынес блоки warm-up (get_dialogs) и subscribe (on_new_message + enable_typing_observer) **из-под** `if first_run:`. Теперь они выполняются на каждом успешном connect'е (первый + все reconnect'ы). `sync_task` (нагон истории) и первый `WORKER_STARTED`-event остаются только на first_run — они одноразовые по природе. Reconnect-event публикуется отдельной веткой (`data.reconnected=True`), не дублирует «первый» старт.
+  *Тест* `tests/smoke/test_reconnect_rebinds_handlers.py` (новый): FakeWrapper со счётчиками. `wait_until_disconnected` возвращается через 50 мс первый раз (симуляция runtime разрыва) и висит бесконечно на втором. `Worker.run()` прогоняется целиком (с моком `bus.publish` и `HistorySyncService`). Проверки: `connect_via` вызван 2 раза, `on_new_message` = 2, `enable_typing_observer` = 2, `get_dialogs` = 2, опубликовано ровно 1 событие с `reconnected=True`. PASS.
+  *Побочное.* Поправил хрупкий `tests/smoke/test_claim_attempts_and_blacklist.py`: INSERT-тестового юзера теперь с `fetched_at='1970-01-01'::timestamptz`, чтобы `claim_lead_for_account` (ORDER BY fetched_at ASC LIMIT 1) гарантированно забрал именно его, а не свежих продовых лидов. Тест был написан для пустого пула, ломался когда refill накачивал реальными лидами.
+  **Итог по тестам:** 11 сьютов PASS (14 taxonomy + 3 worker_supervisor + 1 last_status + 3 privacy marker + 11 flood recovery + 17 report media + 7 wall-clock/retry + 2 smart cooldown + 5 resilience + 2 claim/blacklist + 1 reconnect rebind). Затронуто: [modules/worker/worker.py](modules/worker/worker.py) (subscribe/warm-up вынесены за пределы `if first_run:`, docstring актуализирован, шаги пере-нумерованы), новый тест, +patch хрупкого blacklist-теста.
+
+- **2026-07-12 — Fix #13 + #14: attempts-счётчик реально работает + перманентный blacklist от партнёра.**
+  *Аудит-контекст.* Пользователь попросил проверить сколько лидов мы потеряли. Query по всем `partner_crm.lead_taken` vs `autochat.started` за месяц (2026-06-01 → 2026-07-12): взято 3877 лидов, диалог реально запущен на 3851 (99.3%). Из 26 потерь: 12 = OpenRouter кончились деньги 17.06 (HTTP 402, одна волна), 5 = USERNAME_NOT_FOUND (правильно), 1 = WORKER_NOT_RUNNING 01.06, 8 = имеют `partner_crm.lead_taken` без всяких последующих событий — вероятно app рестартовали между claim и autochat.create_session, задача умерла. **Реальная потеря: ~7-8 лидов из ~3900 = ~0.2%. Общий success rate: 99.66%.**
+  *Открытие про Fix #8.* За сутки видели по 15+ повторных `partner_crm.lead_taken` для одних и тех же двух юзеров (`zephyxhxa`, `calixozz`, оба «user was deleted» на TG). Fix #8 (max 3 attempts → invalid) должен был это остановить, но не работал. **Причина:** `claim_lead_for_account` делал `DELETE FROM crm_lead_pool WHERE id=$1` (удалял запись). Потом `reinsert_into_pool` делал `INSERT ... ON CONFLICT DO UPDATE SET attempts = attempts + 1` — но ROW отсутствовал → INSERT-ветка → `attempts=1` каждый раз. Счётчик никогда не превышал 1, лимит из Fix #8 никогда не срабатывал.
+  *Открытие про партнёра.* Даже когда мы всё же пушили invalid (Fix #7 после 12.07), партнёрская CRM продолжала выдавать нам этих же юзеров. Партнёр не помечает их invalid в своей БД (или помечает, но потом сбрасывает). Нужен наш собственный persistent-blacklist.
+  *Фикс:*
+  1. Миграция `0018_crm_pool_claim_flag_and_invalid_leads.py`:
+     - `crm_lead_pool.claimed_at TIMESTAMPTZ` + `assigned_account_id INT` — Fix #13.
+     - `CREATE INDEX crm_lead_pool_free_idx ON crm_lead_pool (gender, fetched_at) WHERE claimed_at IS NULL` — быстрый поиск свободных.
+     - Новая таблица `invalid_leads (username PK, reason, invalidated_at, attempts_seen)` — Fix #14.
+     - Seed: `INSERT INTO invalid_leads` из `events_archive` за 30 дней где `partner_crm.status_pushed` c `status=invalid`. Результат: **16 юзеров** засеяны, включая `zephyxhxa`+`calixozz`.
+  2. **Fix #13** — `claim_lead_for_account`: `SELECT ... WHERE claimed_at IS NULL FOR UPDATE SKIP LOCKED` + `UPDATE SET claimed_at=NOW(), assigned_account_id=$` (вместо DELETE). Row остаётся в пуле с сохранённым `attempts`. `reinsert_into_pool`: `UPDATE SET claimed_at=NULL, attempts=attempts+1 WHERE username=$`. Если row не нашлось (edge case, оператор почистил вручную) — INSERT-fallback c `attempts=1`. При `attempts >= MAX_LEAD_ATTEMPTS`: `DELETE` + `INSERT INTO invalid_leads (reason='max_attempts_exhausted', attempts_seen=N)` + `push_lead_finalized(invalid)`.
+  3. **Fix #14** — `_take_into_pool` в начале проверяет `SELECT 1 FROM invalid_leads WHERE username=$`. Если есть — возвращает `"skipped_invalid"` вместо `"inserted"`, партнёру `set_lead_status` НЕ вызывается (не тратим API-квоту на мёртвых). Событие `partner_crm.pool_refilled` получило поле `skipped_invalid` для наблюдения.
+  4. **`push_lead_finalized`** дополнен: после успешного push'а к партнёру `DELETE FROM crm_lead_pool` (было раскидано в `reinsert`, теперь ещё и здесь), и при `terminal_status="invalid"` — `INSERT INTO invalid_leads`. Финализация success не добавляет в blacklist (успешные лиды могут пригодиться повторно на другой сервис в будущем).
+  5. Тест `tests/smoke/test_claim_attempts_and_blacklist.py`: два интеграционных кейса на реальном pool (с моком `bus.publish`, чтобы не требовался Redis).
+     - **Fix #13 core**: `claim → reinsert → claim → reinsert → claim → reinsert` (3 цикла): `attempts` инкрементится 1→2→3, на третьем reinsert row удаляется, `invalid_leads.attempts_seen=3`, `push_lead_finalized(invalid)` вызывается ровно 1 раз.
+     - **Fix #14**: pre-seed'ленный юзер в `invalid_leads`. `_take_into_pool` возвращает `"skipped_invalid"`, `set_lead_status` НЕ дёргается (fake CRM-client бросает AssertionError если позвали).
+  **Итоговый счёт тестов после Fix #13+14:** 65/65 PASS (14 taxonomy + 3 supervisor + 1 last_status + 3 privacy marker + 11 flood recovery + 17 report media + 7 wall-clock/retry + 2 smart cooldown + 5 resilience + 2 claim/blacklist). Затронуто: `alembic/versions/0018_crm_pool_claim_flag_and_invalid_leads.py` (новая), `modules/partner_crm/service.py` (переписаны `claim_lead_for_account`, `reinsert_into_pool`, `push_lead_finalized`; добавлена проверка blacklist в `_take_into_pool`; `pool_refilled` payload extend'нут `skipped_invalid`), `tests/smoke/test_claim_attempts_and_blacklist.py` (новый).
+
+- **2026-07-12 — Fix #12: Resilient Worker (переменная схема прокси, никогда не крашится по сети).**
+  *Проблема:* воркер падал в `crashed` при коротких пропаданиях связи (прокси-провайдер лёг на 5 мин → воркер мёртв до ручного Start). Оператор: «Telegram Desktop так не делает — он крутится в Connecting и восстанавливается сам». Действительно так должно быть.
+  *Фикс:*
+  1. `TelegramWrapper.connect_via(proxy_url)` — новый метод: одна попытка connect'а через **конкретный** прокси, без fallback-логики внутри. `SessionExpired` пробрасывается, всё остальное — тоже как есть, Worker сам решит что делать.
+  2. `TelegramWrapper.probe_proxy(proxy_url)` — быстрая проверка что прокси отдаёт connect до TG. Создаёт временный `TelegramClient`, коннектится, сразу отключается. Не трогает `self._client`. Используется фоновым probe-task'ом.
+  3. `TelegramWrapper.connect()` **оставлен для обратной совместимости** (auth-flow всё ещё использует), теперь просто зовёт `connect_via(main)` → `connect_via(fallback)` подряд.
+  4. `Worker.run` **полностью переписан** в resilient outer-loop:
+     - Первые `PRIMARY_MAX_ATTEMPTS=5` попыток connect идут на main-прокси с паузой `RECONNECT_INTERVAL_SEC=60`. Всего ~5 мин на main.
+     - Если main всё это время лежит — свитч на fallback + запуск фонового `_probe_primary_loop` который каждую `PROBE_INTERVAL_SEC=60` проверяет main.
+     - При успешном connect'е → warm-up (`get_dialogs`) и `on_ready` callback вызываются **только на первом круге** (не переигрываются на каждом reconnect).
+     - Supervisor ждёт **три** сигнала одновременно: `stop_event`, `wait_until_disconnected`, `primary_restored_event`. Первый победивший определяет действие:
+       * `stop_event` → выход из loop, штатный `worker.stopped`
+       * `primary_restored` (мы на fallback и main ожил) → отключаемся, следующий круг подключит через main, публикуем `worker.restarted` c reason `primary_proxy_restored`
+       * `disconnect` → публикуем `worker.restarted` c reason `runtime_disconnect`, следующий круг переподключит
+     - `SessionExpired` (реальный auth-fail) — единственное что бросается наружу для менеджера.
+  5. `WorkerManager._runner` больше не мапит `TelethonDisconnected` / `ProxyUnavailable` в CRASHED — Worker.run сам это обрабатывает через retry. Обработчики удалены (Fix #1 сценарий больше не может случиться).
+  6. **Auto-runner grace period (`MAX_WRAPPER_MISSES=3, WRAPPER_MISS_SLEEP_SEC=180`):** пока Worker.run ретраит connect, `get_wrapper()` возвращает None. Раньше auto_runner сразу self-stop'ился с `worker_offline`. Теперь ждёт до 3 подряд промахов × 3 мин = **9 мин grace period**. За это время Worker обычно восстанавливается, автомат никак не заметил перебоя.
+  7. Тесты `tests/smoke/test_resilient_worker.py` — 5 кейсов: (a) main работает — 1 попытка, primary_active=True; (b) 5 fail на main → свитч на fallback; (c) stop_event во время попыток → выход без connect; (d) probe сигналит когда main ожил; (e) sanity grace-period логика.
+  **Ожидаемое поведение вживую:**
+  - Прокси лёг на 2-3 мин → воркер молча ретраит, автомат теряет 1-2 слота, продолжает
+  - Main упал надолго → 5 мин на main, потом fallback, автомат работает, main-probe в фоне ждёт
+  - Оба лежат → Worker в reconnecting forever, auto-runner через 9 мин self-stop c `worker_offline`, оператор увидит и разберётся
+  - TG стороннее session revoke → status=SESSION_EXPIRED, нужен reauth
+  **Итоговый счёт тестов после Fix #12:** 63/63 PASS (14 taxonomy + 3 supervisor + 1 last_status + 3 privacy marker + 11 flood recovery + 17 report media + 7 wall-clock/retry + 2 smart cooldown + 5 resilience). Затронуто: `modules/worker/wrapper.py` (+`connect_via`, +`probe_proxy`, `connect` теперь через них), `modules/worker/worker.py` (полностью переписан `run` + новые методы `_connect_loop_with_switch`, `_probe_primary_loop`, `_active_is_primary`), `modules/worker_manager/service.py` (убраны `TelethonDisconnected`/`ProxyUnavailable` handlers в `_runner`), `modules/worker_auto_runner/service.py` (grace period в `_account_loop`), `tests/smoke/test_resilient_worker.py` (новый).
+
+- **2026-07-12 — Fix #11: PEER_FLOOD cooldown 2ч → 15 мин + rand(10-20 мин).**
+  *Проблема:* оператор указал что 2ч cooldown для PEER_FLOOD (Fix #5/#10 default) слишком консервативен. Данные подтверждают: за неделю (5-11 июля) из 106 flood-стопов **все 100% были PEER_FLOOD без секунд от TG** (0 настоящих FloodWait с явными секундами). @SpamBot `/start` на Premium (все наши воркеры) реально снимает PEER_FLOOD — оператор подтвердил личной практикой. Значит cooldown нужен не «дать флагу самоочиститься», а «дать боту прожевать снятие» — это минуты, не часы.
+  *Фикс:* константа `FLOOD_COOLDOWN_HOURS = 2` заменена на `FLOOD_COOLDOWN_BASE_SEC = 15 * 60`. `_trigger_flood_recovery` теперь для PEER_FLOOD (без seconds) считает `cooldown = 15 мин + rand(10-20 мин) = 25-35 мин`. Для FloodWait с явными секундами N: `cooldown = N + rand(10-20 мин)` как и было.
+  *Тесты:* `test_flood_recovery.py::test_constants_sanity` обновлён под новую константу. Все 8 сьютов (58/58) продолжают PASS. Затронуто: `modules/worker_auto_runner/service.py` (константа + один docstring + один call site в `_trigger_flood_recovery`), `tests/smoke/test_flood_recovery.py`.

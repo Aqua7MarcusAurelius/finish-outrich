@@ -2,9 +2,15 @@
 Модуль авторизации. Проводит пользователя через многошаговую
 авторизацию Telegram: start → code → (опц.) 2fa → success.
 
+С миграции 0013 каждый аккаунт несёт собственные api_id/api_hash и
+device-info; оператор задаёт их при вызове /auth/start (вместе с
+телефоном, прокси и опциональным 2FA-паролем — последний backend
+сам применит после кода, если Telegram запросит 2FA). Это закрепляет
+уникальный fingerprint аккаунта — см. §9 PROJECT_SPEC.md.
+
 Состояние сессии — в Redis (auth_session:{id}, TTL 15 мин).
-TelegramClient и phone_code_hash — в памяти процесса.
-При рестарте процесса активные авторизации теряются (docs/auth.md).
+TelegramClient, phone_code_hash и (опц.) 2FA-пароль — в памяти процесса.
+При рестарте процесса активные авторизации теряются.
 """
 from __future__ import annotations
 
@@ -32,7 +38,6 @@ from telethon.sessions import StringSession
 
 from core import bus, db
 from core import redis as redis_mod
-from core.config import settings
 from core.events import EventType, Module, Status
 from core.proxy import check_socks5, parse_socks5
 
@@ -121,7 +126,12 @@ class BadPhase(AuthError):
 
 class ApiCredentialsInvalid(AuthError):
     code = "API_CREDENTIALS_INVALID"
-    message = "TELEGRAM_API_ID / TELEGRAM_API_HASH неверны"
+    message = "api_id / api_hash аккаунта неверны"
+
+
+class FingerprintInvalid(AuthError):
+    code = "FINGERPRINT_INVALID"
+    message = "device_model / system_version / app_version обязательны"
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -132,6 +142,15 @@ class _Live:
     client: TelegramClient
     phone_code_hash: str | None = None
     reauth_account_id: int | None = None
+    # 2FA-пароль, переданный оператором заранее в /auth/start. Если на коде
+    # Telegram запросит 2FA — backend сам подставит пароль, без отдельного
+    # шага /auth/2fa. Сериализовать нельзя — живёт только в памяти процесса.
+    password: str | None = None
+    # L4 (2026-07-13): api_hash — секрет приложения TG, держим ТОЛЬКО в памяти
+    # (как password), не пишем в Redis auth_session. Сессия и так memory-bound
+    # (client в _Live), при рестарте процесса теряется целиком — так что
+    # хранить секрет в Redis не давало плюсов, только риск утечки.
+    api_hash: str | None = None
 
 
 class AuthService:
@@ -147,10 +166,23 @@ class AuthService:
         name: str,
         proxy_primary: str,
         proxy_fallback: str,
+        api_id: int,
+        api_hash: str,
+        device_model: str,
+        system_version: str,
+        app_version: str,
+        lang_code: str = "en",
+        system_lang_code: str = "en",
+        lang_pack: str = "",
+        password: str | None = None,
         reauth_account_id: int | None = None,
     ) -> dict[str, Any]:
         self._validate_phone(phone)
-        self._validate_api_creds()
+        self._validate_api_creds(api_id, api_hash)
+        self._validate_fingerprint(device_model, system_version, app_version)
+        lang_code = (lang_code or "en").strip() or "en"
+        system_lang_code = (system_lang_code or "en").strip() or "en"
+        lang_pack = (lang_pack or "").strip()
 
         # Проверяем оба прокси
         primary_res = await check_socks5(proxy_primary)
@@ -166,14 +198,23 @@ class AuthService:
 
         session_id = uuid.uuid4().hex
 
-        # Поднимаем Telethon через primary
+        # Поднимаем Telethon через primary. Поля fingerprint'а подставляются
+        # явно — TelegramClient запомнит их и при последующих реконнектах
+        # будет представляться Telegram'у так же. `lang_pack` сохраняется
+        # в БД для документации, но в `TelegramClient.__init__` его нет
+        # (внутреннее MTProto-поле, не публичный аргумент конструктора).
         client = TelegramClient(
             StringSession(),
-            settings.TELEGRAM_API_ID,
-            settings.TELEGRAM_API_HASH,
+            api_id,
+            api_hash,
             proxy=parse_socks5(proxy_primary),
             connection_retries=2,
             timeout=20,
+            device_model=device_model,
+            system_version=system_version,
+            app_version=app_version,
+            lang_code=lang_code,
+            system_lang_code=system_lang_code,
         )
         try:
             await asyncio.wait_for(client.connect(), timeout=20)
@@ -206,6 +247,8 @@ class AuthService:
             client=client,
             phone_code_hash=getattr(sent_code, "phone_code_hash", None),
             reauth_account_id=reauth_account_id,
+            password=password or None,
+            api_hash=api_hash,   # L4: только в памяти, не в Redis
         )
 
         await self._write_state(
@@ -216,6 +259,18 @@ class AuthService:
                 "name": name,
                 "proxy_primary": proxy_primary,
                 "proxy_fallback": proxy_fallback,
+                "api_id": api_id,
+                # L4: api_hash в Redis НЕ пишем — только в памяти (_Live.api_hash).
+                "device_model": device_model,
+                "system_version": system_version,
+                "app_version": app_version,
+                "lang_code": lang_code,
+                "system_lang_code": system_lang_code,
+                "lang_pack": lang_pack,
+                # Пароль в Redis не пишем — он живёт только в памяти процесса
+                # (см. _Live.password). Это компромисс: при рестарте процесса
+                # сессия теряется (как было и до фичи), пароль не утекает в
+                # хранилище.
                 "reauth_account_id": reauth_account_id,
                 "created_at": bus.now_utc().isoformat(),
                 "error": None,
@@ -249,6 +304,12 @@ class AuthService:
             await self._mark_failed(session_id, "код истёк")
             raise CodeExpired()
         except SessionPasswordNeededError:
+            # Если оператор задал пароль заранее в /auth/start — применяем
+            # его сразу, без отдельного шага /auth/2fa (это поведение
+            # «one-shot» из §9 SPEC). Иначе — переводим в фазу 2fa_required
+            # и ждём явный /auth/2fa.
+            if live.password:
+                return await self._apply_password_inline(session_id, state, live)
             await self._write_state(session_id, {**state, "phase": PHASE_2FA_REQUIRED})
             return {"status": PHASE_2FA_REQUIRED}
         except Exception as e:
@@ -298,20 +359,38 @@ class AuthService:
         await client.delete(f"{REDIS_KEY_PREFIX}{session_id}")
 
     async def start_reauth(self, *, account_id: int) -> dict[str, Any]:
+        """Переавторизация: используем сохранённые на аккаунте fingerprint-поля
+        как есть — Telegram должен видеть «тот же клиент». Меняется только
+        session_data (новый StringSession после успешного code/2fa)."""
         pool = db.get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT name, phone, proxy_primary, proxy_fallback "
+                "SELECT name, phone, proxy_primary, proxy_fallback, "
+                "api_id, api_hash, device_model, system_version, app_version, "
+                "lang_code, system_lang_code, lang_pack "
                 "FROM accounts WHERE id = $1",
                 account_id,
             )
         if row is None:
             raise AccountNotFound()
+        if not row["api_id"] or not row["api_hash"]:
+            raise ApiCredentialsInvalid(
+                "У аккаунта не задан api_id/api_hash — это аккаунт до миграции 0013, "
+                "пересоздай его через мастер добавления (а не переавторизуй)"
+            )
         return await self.start(
             phone=row["phone"],
             name=row["name"],
             proxy_primary=row["proxy_primary"],
             proxy_fallback=row["proxy_fallback"],
+            api_id=int(row["api_id"]),
+            api_hash=row["api_hash"],
+            device_model=row["device_model"] or "",
+            system_version=row["system_version"] or "",
+            app_version=row["app_version"] or "",
+            lang_code=row["lang_code"] or "en",
+            system_lang_code=row["system_lang_code"] or "en",
+            lang_pack=row["lang_pack"] or "",
             reauth_account_id=account_id,
         )
 
@@ -327,12 +406,34 @@ class AuthService:
         if not _PHONE_RX.match(phone):
             raise PhoneInvalid()
 
-    def _validate_api_creds(self) -> None:
-        if not settings.TELEGRAM_API_ID or not settings.TELEGRAM_API_HASH:
-            raise AuthError(
-                "TELEGRAM_API_ID / TELEGRAM_API_HASH не заданы в .env "
-                "— получите на https://my.telegram.org"
+    def _validate_api_creds(self, api_id: int, api_hash: str) -> None:
+        if not api_id or not api_hash:
+            raise ApiCredentialsInvalid()
+
+    def _validate_fingerprint(
+        self, device_model: str, system_version: str, app_version: str,
+    ) -> None:
+        if not device_model or not system_version or not app_version:
+            raise FingerprintInvalid()
+
+    async def _apply_password_inline(
+        self, session_id: str, state: dict, live: _Live,
+    ) -> dict[str, Any]:
+        """SessionPasswordNeededError + у нас уже есть пароль из /auth/start —
+        дотюкиваем 2FA молча, оператору отдаём готовый аккаунт (без
+        промежуточной фазы 2fa_required)."""
+        try:
+            await live.client.sign_in(password=live.password or "")
+        except PasswordHashInvalidError:
+            await self._write_state(session_id, {**state, "phase": PHASE_2FA_REQUIRED})
+            raise PasswordInvalid(
+                "Пароль 2FA из /auth/start не подошёл — отправь правильный через /auth/2fa"
             )
+        except Exception as e:
+            log.exception("auth: inline password sign_in failed")
+            await self._mark_failed(session_id, str(e))
+            raise AuthError(f"Ошибка 2FA: {e}")
+        return await self._finalize(session_id, state)
 
     async def _write_state(self, session_id: str, state: dict) -> None:
         client = redis_mod.get_client()
@@ -380,6 +481,9 @@ class AuthService:
         async with pool.acquire() as conn:
             async with conn.transaction():
                 if reauth_account_id is not None:
+                    # Переавторизация: fingerprint-поля уже на аккаунте,
+                    # перезаписывать их не нужно (Telegram должен видеть
+                    # один и тот же клиент). Только session_data + is_active.
                     row = await conn.fetchrow(
                         """
                         UPDATE accounts
@@ -400,12 +504,23 @@ class AuthService:
                         """
                         INSERT INTO accounts
                             (name, phone, session_data, proxy_primary,
-                             proxy_fallback, is_active, created_at, updated_at)
-                        VALUES ($1, $2, $3, $4, $5, TRUE, NOW(), NOW())
+                             proxy_fallback, is_active,
+                             api_id, api_hash, device_model, system_version,
+                             app_version, lang_code, system_lang_code, lang_pack,
+                             created_at, updated_at)
+                        VALUES ($1, $2, $3, $4, $5, TRUE,
+                                $6, $7, $8, $9, $10, $11, $12, $13,
+                                NOW(), NOW())
                         RETURNING id
                         """,
                         state["name"], state["phone"], session_bytes,
                         state["proxy_primary"], state["proxy_fallback"],
+                        # L4: api_hash из памяти (_Live), а не из Redis state.
+                        int(state["api_id"]), live.api_hash,
+                        state["device_model"], state["system_version"],
+                        state["app_version"], state.get("lang_code") or "en",
+                        state.get("system_lang_code") or "en",
+                        state.get("lang_pack") or "",
                     )
                     event_type = EventType.ACCOUNT_CREATED
 

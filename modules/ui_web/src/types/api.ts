@@ -217,14 +217,30 @@ export interface EventStats {
   events_per_sec: number;
 }
 
-// Per-account автомат старта диалогов. Очередь — список юзернеймов
-// (без `@`, бэк нормализует). interval_sec — минимум 60 (защита от флуда).
+// Per-account автомат старта диалогов. При `start` строится расписание
+// на `window_hours` часов: N ∈ [min_leads, max_leads] случайных моментов,
+// первый — не раньше чем через `warmup_minutes` после включения.
+// `schedule` — оставшиеся timestamps (ISO), `next_dispatch_at` — первый
+// из них для UI-хинта.
 export interface AutoRunnerState {
   account_id: number;
   is_running: boolean;
   queue: string[];
-  interval_sec: number;
-  jitter_sec: number;
+  window_hours: number;
+  min_leads: number;
+  max_leads: number;
+  warmup_minutes: number;
+  // Wall-clock окно активной прописи по МСК (Fix #9). Пропись случайно
+  // раскидывается по [active_start_hour_msk, active_end_hour_msk] МСК.
+  active_start_hour_msk: number;
+  active_end_hour_msk: number;
+  session_started_at: string | null;
+  session_ends_at: string | null;
+  schedule: string[];
+  schedule_remaining: number;
+  next_dispatch_at: string | null;
+  cooldown_until: string | null;
+  cooldown_reason: string | null;
   last_action_at: string | null;
   last_status: string | null;
   updated_at: string | null;
@@ -232,8 +248,12 @@ export interface AutoRunnerState {
 
 export interface AutoRunnerPatchBody {
   queue?: string[];
-  interval_sec?: number;
-  jitter_sec?: number;
+  window_hours?: number;
+  min_leads?: number;
+  max_leads?: number;
+  warmup_minutes?: number;
+  active_start_hour_msk?: number;
+  active_end_hour_msk?: number;
 }
 
 export interface EventFilters {

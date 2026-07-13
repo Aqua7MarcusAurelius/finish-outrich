@@ -53,16 +53,30 @@ class PartnerCrmService:
     # ─── Пул лидов ───────────────────────────────────────────────────
 
     async def pool_size(self) -> int:
+        """Число свободных лидов в пуле.
+
+        Простая модель (2026-07-13, решение владельца): claim СРАЗУ удаляет
+        забранного лида из пула, поэтому ВСЕ строки в `crm_lead_pool` —
+        свободные, и COUNT(*) точен без фильтра по claimed_at. Колонки
+        claimed_at/assigned_account_id/attempts больше не используются
+        (остались в схеме как vestigial, дропнутся отдельной миграцией после
+        подтверждения простой модели живым прогоном).
+        """
         pool = db.get_pool()
         async with pool.acquire() as conn:
-            return int(await conn.fetchval("SELECT COUNT(*) FROM crm_lead_pool"))
+            return int(await conn.fetchval(
+                "SELECT COUNT(*) FROM crm_lead_pool"
+            ))
 
     async def list_pool(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        # Простая модель (2026-07-13): все строки пула свободны (claim удаляет
+        # забранного лида) — фильтр по claimed_at не нужен.
         pool = db.get_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT id, username, gender, fetched_at "
-                "FROM crm_lead_pool ORDER BY fetched_at ASC LIMIT $1",
+                "FROM crm_lead_pool "
+                "ORDER BY fetched_at ASC LIMIT $1",
                 int(limit),
             )
         return [
@@ -134,6 +148,8 @@ class PartnerCrmService:
         inserted = 0
         skipped = 0
         start_failed = 0
+        skipped_invalid = 0
+        skipped_contacted = 0
         for lead in assigned_new:
             r = await self._take_into_pool(lead, origin="assigned")
             if r == "inserted":
@@ -142,6 +158,10 @@ class PartnerCrmService:
                 skipped += 1
             elif r == "start_failed":
                 start_failed += 1
+            elif r == "skipped_invalid":
+                skipped_invalid += 1
+            elif r == "skipped_contacted":
+                skipped_contacted += 1
 
         result = {
             "requested": int(count),
@@ -150,6 +170,8 @@ class PartnerCrmService:
             "from_request_new": 0,
             "inserted": inserted,
             "skipped_duplicates": skipped,
+            "skipped_invalid": skipped_invalid,
+            "skipped_contacted": skipped_contacted,
             "start_failed": start_failed,
         }
         await bus.publish(
@@ -185,6 +207,32 @@ class PartnerCrmService:
         gender = lead.get("gender")
         if gender not in (None, "female", "male"):
             gender = None
+
+        # Fix #14 (2026-07-12): не берём в пул юзеров которых уже
+        # финализировали как invalid. Партнёр может продолжать выдавать
+        # нам «мёртвых» юзеров пачками — тратить на них цикл нет смысла.
+        # + 2026-07-13: не берём тех, кому УЖЕ писали (contacted_leads) —
+        # это корневой дедуп против «2 воркера — один лид». Партнёр
+        # переназначает уже-прописанных как new; мы их пропускаем.
+        pool_db = db.get_pool()
+        async with pool_db.acquire() as conn:
+            is_invalid = await conn.fetchval(
+                "SELECT 1 FROM invalid_leads WHERE lower(username) = lower($1)", username,
+            )
+            is_contacted = await conn.fetchval(
+                "SELECT 1 FROM contacted_leads WHERE lower(username) = lower($1)", username,
+            )
+        if is_contacted:
+            log.info(
+                "partner_crm refill: skip %r — already contacted (dedup)", username,
+            )
+            return "skipped_contacted"
+        if is_invalid:
+            log.info(
+                "partner_crm refill: skip %r — in invalid_leads (blacklist)",
+                username,
+            )
+            return "skipped_invalid"
 
         # 1) Переводим в in_progress первым — чтобы локально не держать
         # лида, которого CRM не подтвердила «в работе».
@@ -232,32 +280,31 @@ class PartnerCrmService:
         return "inserted" if inserted_id is not None else "skipped"
 
     async def reinsert_into_pool(
-        self, *, username: str, gender: str | None,
+        self, *, account_id: int, username: str, gender: str | None,
     ) -> bool:
-        """
-        Положить лида обратно в пул после неудачной попытки автостарта
-        (FloodWait, воркер упал, OpenRouter недоступен и т.п.).
+        """Вернуть лида в пул после неудачной попытки автостарта.
 
-        CRM-статус НЕ трогаем — он уже `in_progress` (был выставлен при
-        первоначальном заборе в пул). Просто возвращаем лида в очередь
-        чтобы любой свободный воркер с подходящим target_gender его
-        подхватил.
-
-        Возвращает True если вставили, False если уже в пуле (race —
-        кто-то другой уже положил обратно).
+        Простая модель (2026-07-13, решение владельца): claim удаляет
+        забранного лида из пула, поэтому reinsert просто вставляет его обратно
+        (ON CONFLICT — освежаем fetched_at, чтобы он ушёл в конец очереди).
+        Никаких attempts/claimed_at и никакого авто-invalid: лида НЕ штрафуем
+        за неудачную попытку (PEER_FLOOD/сбой LLM — НАШИ причины). invalid
+        наружу — только по реальному «нельзя написать» (ветка invalid_lead в
+        auto_runner → push_lead_finalized). Всегда возвращает True.
         """
         pool = db.get_pool()
         async with pool.acquire() as conn:
-            row_id = await conn.fetchval(
+            await conn.execute(
                 """
                 INSERT INTO crm_lead_pool (username, gender)
                 VALUES ($1, $2)
-                ON CONFLICT (username) DO NOTHING
-                RETURNING id
+                ON CONFLICT (username) DO UPDATE
+                    SET fetched_at = NOW(),
+                        gender     = COALESCE(EXCLUDED.gender, crm_lead_pool.gender)
                 """,
                 username, gender,
             )
-        return row_id is not None
+        return True
 
     async def claim_lead_for_account(
         self,
@@ -269,33 +316,42 @@ class PartnerCrmService:
         Забрать **одного** лида из пула под конкретного воркера с учётом
         фильтра по полу. Используется worker_auto_runner при тике.
 
-        target_gender: 'any' | 'female' | 'male'.
+        Простая модель (2026-07-13, решение владельца): claim СРАЗУ удаляет
+        лида из пула (FOR UPDATE SKIP LOCKED + DELETE в одной транзакции). Не
+        удалось написать → `reinsert_into_pool` вернёт обратно. Корневой дедуп
+        «никогда повторно» держит `create_session` по telegram_user_id; здесь
+        дополнительно дешёвый пре-фильтр `contacted_leads` по username, чтобы не
+        тратить цикл на заведомо контактированного.
 
+        target_gender: 'any' | 'female' | 'male'.
         Возвращает {id, username, gender} или None если подходящего нет.
         """
         pool = db.get_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
-                if target_gender == "any":
-                    where = "TRUE"
-                    args: list[Any] = []
-                elif target_gender in ("female", "male"):
-                    # gender IS NULL — берём тоже (если CRM не сказала пол,
-                    # считаем подходящим, лучше отправить чем держать в пуле).
+                if target_gender in ("female", "male"):
                     where = "(gender IS NULL OR gender = $1)"
-                    args = [target_gender]
+                    args: list[Any] = [target_gender]
                 else:
-                    log.warning(
-                        "partner_crm: unknown target_gender=%r for account=%s, "
-                        "treating as 'any'", target_gender, account_id,
-                    )
+                    if target_gender != "any":
+                        log.warning(
+                            "partner_crm: unknown target_gender=%r for account=%s, "
+                            "treating as 'any'", target_gender, account_id,
+                        )
                     where = "TRUE"
                     args = []
 
+                # Дешёвый пре-фильтр: не клеймим тех, кому уже писали
+                # (contacted_leads по username). Железобетонный дедуп по
+                # личности — в create_session по telegram_user_id.
                 row = await conn.fetchrow(
                     f"""
                     SELECT id, username, gender FROM crm_lead_pool
                     WHERE {where}
+                      AND NOT EXISTS (
+                            SELECT 1 FROM contacted_leads c
+                            WHERE lower(c.username) = lower(crm_lead_pool.username)
+                      )
                     ORDER BY fetched_at ASC
                     LIMIT 1
                     FOR UPDATE SKIP LOCKED
@@ -305,6 +361,7 @@ class PartnerCrmService:
                 if row is None:
                     return None
 
+                # Простая модель: забрали → сразу удаляем из пула.
                 await conn.execute(
                     "DELETE FROM crm_lead_pool WHERE id = $1", row["id"],
                 )
@@ -396,6 +453,26 @@ class PartnerCrmService:
             account_id=account_id,
             data={"username": username, "status": terminal_status},
         )
+
+        # Fix #13 + #14: после успешного финального push'а лид уходит из
+        # активного пула. При status=invalid дополнительно кладём в
+        # `invalid_leads` чтобы партнёр не смог подсунуть его повторно.
+        pool_db = db.get_pool()
+        async with pool_db.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM crm_lead_pool WHERE username = $1", username,
+            )
+            if terminal_status == "invalid":
+                await conn.execute(
+                    """
+                    INSERT INTO invalid_leads (username, reason)
+                    VALUES ($1, $2)
+                    ON CONFLICT (username) DO UPDATE
+                        SET invalidated_at = NOW(),
+                            reason         = EXCLUDED.reason
+                    """,
+                    username, f"pushed_invalid_via_finalize",
+                )
 
     # ─── Внутреннее ──────────────────────────────────────────────────
 

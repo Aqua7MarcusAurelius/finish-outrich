@@ -140,9 +140,18 @@ async def _load_report_context_by_dialog(dialog_id: int) -> dict[str, Any] | Non
 
 async def _load_messages(dialog_id: int) -> list[dict[str, Any]]:
     """
-    Все сообщения диалога по дате. Для каждого тянем поля reply_* из
-    цитируемого сообщения (LEFT JOIN messages на самого себя) — чтобы
-    в HTML отрисовать цитату-полоску внутри пузыря.
+    Все сообщения диалога по дате. Для каждого тянем:
+      - reply_* — поля цитируемого сообщения (LEFT JOIN messages на себя),
+        чтобы отрисовать полоску-цитату в пузыре.
+      - media_transcription / media_description — склеенный текст из media
+        для голосовых/аудио и фото/видео/gif/документов.
+      - media_types — CSV списка `media.type` привязанных к этому сообщению
+        (voice/audio/video/video_note/photo/animation/sticker/document).
+        Нужен потому что `messages.type` = 'regular'/'service' и НЕ равен
+        типу медиа. Без него весь fallback падал в '[медиа]' для голосовых.
+        (Fix #6, 2026-07-11 — см. §20.)
+      - reply_media_types — то же для цитаты, чтобы `_reply_snippet`
+        показывал правильный ярлычок цитируемого медиа.
     """
     pool = db.get_pool()
     async with pool.acquire() as conn:
@@ -155,10 +164,18 @@ async def _load_messages(dialog_id: int) -> list[dict[str, Any]]:
                 m.date,
                 m.text,
                 EXISTS (SELECT 1 FROM media WHERE message_id = m.id) AS has_media,
+                (SELECT string_agg(NULLIF(transcription, ''), ' ' ORDER BY id)
+                   FROM media WHERE message_id = m.id) AS media_transcription,
+                (SELECT string_agg(NULLIF(description, ''), ' ' ORDER BY id)
+                   FROM media WHERE message_id = m.id) AS media_description,
+                (SELECT string_agg(DISTINCT type, ',' ORDER BY type)
+                   FROM media WHERE message_id = m.id) AS media_types,
                 p.id          AS reply_id,
                 p.text        AS reply_text,
                 p.is_outgoing AS reply_is_outgoing,
                 p.type        AS reply_type,
+                (SELECT string_agg(DISTINCT type, ',' ORDER BY type)
+                   FROM media WHERE message_id = p.id) AS reply_media_types,
                 EXISTS (SELECT 1 FROM media WHERE message_id = p.id) AS reply_has_media
             FROM messages m
             LEFT JOIN messages p ON p.id = m.reply_to_message_id
@@ -209,7 +226,7 @@ def _format_date_sep(dt: datetime) -> str:
 
 
 def _media_placeholder(msg_type: str) -> str:
-    """Короткий ярлычок для сообщений без текста."""
+    """Короткий ярлычок для сообщений без текста и без транскрипции/описания."""
     return {
         "photo": "[фото]",
         "video": "[видео]",
@@ -220,6 +237,74 @@ def _media_placeholder(msg_type: str) -> str:
         "video_note": "[кружок]",
         "document": "[документ]",
     }.get(msg_type, "[медиа]")
+
+
+# Соответствие типа МЕДИА (media.type, НЕ messages.type='regular') и
+# модальности расшифровки: audio-типы отдают transcription, изобразительные —
+# description. video / video_note имеют и то, и другое (видео с озвучкой).
+_AUDIO_TYPES = frozenset({"voice", "audio"})
+_VISUAL_TYPES = frozenset({"photo", "animation", "sticker", "document"})
+_BIMODAL_TYPES = frozenset({"video", "video_note"})   # оба канала
+
+
+def _pick_media_type(msg: dict[str, Any]) -> str:
+    """Выбирает основной тип медиа из `media_types` (CSV из _load_messages).
+
+    Приоритет: audio → bimodal → visual → пустой ('' = ярлычок [медиа]).
+    Нужен потому что у сообщения может быть несколько media разных типов
+    (media group). Возвращает один тип для label + определения канала
+    транскрипция/описание.
+    """
+    raw = (msg.get("media_types") or "").strip()
+    if not raw:
+        return ""
+    types = {t.strip() for t in raw.split(",") if t.strip()}
+    for group in (_AUDIO_TYPES, _BIMODAL_TYPES, _VISUAL_TYPES):
+        picked = sorted(types & group)
+        if picked:
+            return picked[0]
+    return ""
+
+
+def _media_body(msg: dict[str, Any]) -> str:
+    """
+    Возвращает содержимое пузыря для media-сообщения без текста:
+      - для голосовых/аудио — `[голосовое] <транскрипция>`;
+      - для видео / кружков — `[видео] <транскрипция>` (если есть) плюс
+        `· <описание>` (если есть);
+      - для фото/GIF/стикеров/документов — `[тип] <описание>`;
+      - если ничего не расшифровалось — только ярлычок.
+    Возвращается HTML-эскейпнутым.
+
+    Fix #6 (2026-07-11): раньше использовался `msg.type`, который для
+    контентных сообщений всегда = 'regular'/'service' — не совпадал
+    с `media.type` (voice/photo/...), из-за чего ВСЕ медиа падали в
+    fallback `[медиа]`. Теперь берём тип из подтянутого `media_types`.
+    """
+    picked = _pick_media_type(msg)
+    if not picked:
+        # Есть has_media, но media_types не пришло — используем fallback.
+        return escape(_media_placeholder(msg.get("type") or ""))
+    label = _media_placeholder(picked)
+    transcription = (msg.get("media_transcription") or "").strip()
+    description = (msg.get("media_description") or "").strip()
+
+    # Собираем текст в зависимости от того, какие каналы есть.
+    parts: list[str] = []
+    if picked in _AUDIO_TYPES and transcription:
+        parts.append(escape(transcription))
+    elif picked in _BIMODAL_TYPES:
+        if transcription:
+            parts.append(escape(transcription))
+        if description:
+            sep = " · " if parts else ""
+            parts.append(sep + escape(description))
+    elif picked in _VISUAL_TYPES and description:
+        parts.append(escape(description))
+
+    if parts:
+        return f'<span class="media-tag">{escape(label)}</span> {"".join(parts)}'
+    return escape(label)
 
 
 def _partner_display(ctx: dict[str, Any]) -> str:
@@ -512,6 +597,23 @@ body {
     opacity: 0.85;
 }
 
+/* Ярлычок [голосовое] / [фото] перед транскрипцией/описанием. */
+.media-tag {
+    display: inline-block;
+    margin-right: 4px;
+    padding: 1px 6px;
+    border-radius: 8px;
+    background: rgba(0,0,0,0.08);
+    font-size: 11px;
+    font-style: italic;
+    opacity: 0.75;
+    vertical-align: baseline;
+}
+.row.out .bubble .media-tag {
+    background: rgba(255,255,255,0.18);
+    color: rgba(255,255,255,0.95);
+}
+
 /* ─── Цитата (reply) внутри пузыря ──────────────────────────────── */
 .reply {
     border-left: 3px solid currentColor;
@@ -560,15 +662,24 @@ body {
 _REPLY_TEXT_MAX = 90
 
 
-def _reply_snippet(text: str | None, has_media: bool, msg_type: str | None) -> str:
-    """Текст в цитате-плашке: либо обрезанный text, либо ярлык медиа."""
+def _reply_snippet(
+    text: str | None, has_media: bool, media_types_csv: str | None,
+) -> str:
+    """Текст в цитате-плашке: либо обрезанный text, либо ярлык медиа.
+
+    Fix #6: раньше принимали `msg_type` = messages.type = 'regular' и мапили
+    на media-ярлычки — никогда не срабатывало, цитаты голосовых показывались
+    как fallback `[медиа]`. Теперь принимаем CSV `media.type` из
+    reply_media_types и выбираем правильный ярлычок.
+    """
     if text:
         snippet = text.strip().replace("\n", " ")
         if len(snippet) > _REPLY_TEXT_MAX:
             snippet = snippet[: _REPLY_TEXT_MAX - 1] + "…"
         return snippet
     if has_media:
-        return _media_placeholder(msg_type or "")
+        picked = _pick_media_type({"media_types": media_types_csv or ""})
+        return _media_placeholder(picked or "")
     return "сообщение"
 
 
@@ -583,7 +694,7 @@ def _render_reply(m: dict[str, Any], ctx: dict[str, Any]) -> str:
     snippet = _reply_snippet(
         m.get("reply_text"),
         bool(m.get("reply_has_media")),
-        m.get("reply_type"),
+        m.get("reply_media_types"),
     )
     return (
         f'<div class="reply">'
@@ -622,8 +733,14 @@ def _render_messages(messages: list[dict[str, Any]], ctx: dict[str, Any]) -> str
             body = escape(text)
             media_cls = ""
         elif has_media:
-            body = escape(_media_placeholder(m.get("type") or ""))
-            media_cls = " media-only"
+            body = _media_body(m)
+            # media-only оставляем только когда транскрипции/описания нет —
+            # иначе пузырь фактически несёт текст и должен рендериться как
+            # обычное текстовое сообщение.
+            media_cls = "" if (
+                (m.get("media_transcription") or "").strip()
+                or (m.get("media_description") or "").strip()
+            ) else " media-only"
         else:
             # Сервисное / пустое сообщение — пропускаем.
             continue

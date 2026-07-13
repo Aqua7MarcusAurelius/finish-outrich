@@ -1,5 +1,11 @@
 """
-Endpoint'ы модуля авторизации. См. docs/api.md → раздел "Авторизация".
+Endpoint'ы модуля авторизации. См. PROJECT_SPEC.md §9 (Авторизация и аккаунты).
+
+Контракт `/auth/start`: оператор передаёт ВСЕ поля fingerprint'а аккаунта
+(api_id, api_hash, device_model, system_version, app_version, lang_code,
+system_lang_code, lang_pack) плюс опциональный 2FA-пароль. Если Telegram
+запросит 2FA — backend сам подставит пароль (без отдельного /auth/2fa),
+и оператор получит готовый аккаунт после /auth/code.
 """
 from __future__ import annotations
 
@@ -21,6 +27,17 @@ class AuthStartIn(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     proxy_primary: str
     proxy_fallback: str
+    api_id: int = Field(gt=0)
+    api_hash: str = Field(min_length=1)
+    device_model: str = Field(min_length=1, max_length=200)
+    system_version: str = Field(min_length=1, max_length=200)
+    app_version: str = Field(min_length=1, max_length=200)
+    lang_code: str = Field(default="en", min_length=1, max_length=20)
+    system_lang_code: str = Field(default="en", min_length=1, max_length=20)
+    lang_pack: str = Field(default="", max_length=50)
+    # 2FA-пароль вперёд. Backend применит его после /auth/code, если Telegram
+    # запросит 2FA. Если 2FA не требуется — поле игнорируется.
+    password: str | None = None
 
 
 class CodeIn(BaseModel):
@@ -52,6 +69,15 @@ async def auth_start(payload: AuthStartIn, service: AuthService = Depends(get_se
             name=payload.name,
             proxy_primary=payload.proxy_primary,
             proxy_fallback=payload.proxy_fallback,
+            api_id=payload.api_id,
+            api_hash=payload.api_hash,
+            device_model=payload.device_model,
+            system_version=payload.system_version,
+            app_version=payload.app_version,
+            lang_code=payload.lang_code,
+            system_lang_code=payload.system_lang_code,
+            lang_pack=payload.lang_pack,
+            password=payload.password,
         )
     except AuthError as e:
         return _err(e)

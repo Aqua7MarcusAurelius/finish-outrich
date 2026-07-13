@@ -82,6 +82,13 @@ export function AccountCard({
           )}
         </div>
         <div className="mono text-xs text-muted-foreground">{account.phone}</div>
+        {arRunning && arQ.data?.next_dispatch_at && (
+          <div className="mono text-[10px] text-muted-foreground" title="Следующий лид · осталось / всего">
+            → {new Date(arQ.data.next_dispatch_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+            {" · "}
+            {arQ.data.schedule_remaining} осталось
+          </div>
+        )}
         <div className="mt-1 flex items-center justify-between">
           <span className="text-xs text-muted-foreground">{account.dialogs_count} диалогов</span>
           <div className="flex flex-col items-end gap-1">
@@ -119,7 +126,7 @@ export function AccountCard({
                 size="sm"
                 variant="outline"
                 onClick={(e) => { e.stopPropagation(); onAutoRunnerSettings?.(); }}
-                title="Настройки авторежима (очередь, интервал)"
+                title="Настройки авторежима (очередь, окно, лидов)"
               >
                 <Settings className="h-3 w-3" />
               </Button>

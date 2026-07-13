@@ -67,9 +67,14 @@ _RPC_CANNOT_WRITE_MARKERS: tuple[str, ...] = (
     "ALLOW_PAYMENT_REQUIRED",          # лид требует Stars за DM
     "USER_BANNED_IN_CHANNEL",          # лид забанен/удалён на TG-стороне
     "CHAT_RESTRICTED",
+    # "The specified user was deleted" — юзер удалил свой аккаунт в TG.
+    # Приходит как RPCError без специфичного класса. Смысл терминальный:
+    # никакой другой воркер не сможет ему написать. Fix #7 (2026-07-11).
+    "user was deleted",
 )
 
 from .errors import (
+    AlreadyContacted,
     CannotWrite,
     DialogNotFound,
     FloodWait,
@@ -102,7 +107,15 @@ _INTERESTING_TYPES = {
     EventType.MESSAGE_SAVED,
     EventType.MESSAGE_UPDATED,
     EventType.DIALOG_TYPING_OBSERVED,
+    EventType.WORKER_STARTED,  # Fix #22: триггер для догона missed inbound
 }
+
+# Fix #22: окно «свежести» пропущенного inbound. Сессия воскрешается через
+# regenerate только если last_their_message_at не старше этого TTL. Логика:
+# если лид написал больше 6 часов назад и мы не ответили — тактически он
+# уже сдал, воскрешать разговор из «мёртвого» состояния = странно и рискнём
+# спамом. При типичном рестарт-window'е (секунды-минуты) 6ч с огромным запасом.
+_MISSED_INBOUND_TTL_SEC = 6 * 3600
 
 
 class AutoChatService:
@@ -120,6 +133,15 @@ class AutoChatService:
 
         self._lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
+
+        # C4 (2026-07-13): догон missed-inbound на worker.started тяжёлый
+        # (_wait_for_transcriptions до 5 мин + LLM) — его НЕЛЬЗЯ выполнять
+        # инлайн в консьюмере: единственный autochat-worker-1 замрёт и приём
+        # встанет у ВСЕХ аккаунтов. Выносим в фоновые задачи с ограничением
+        # параллелизма, чтобы массовый реконнект-шторм не запустил сотню
+        # LLM-вызовов разом. Задачи держим в set'е (иначе GC их соберёт).
+        self._regen_sem = asyncio.Semaphore(4)
+        self._bg_tasks: set[asyncio.Task] = set()
 
     # ─────────────────────────────────────────────────────────────────
     # Жизненный цикл
@@ -173,12 +195,15 @@ class AutoChatService:
         Поднять из БД все сессии со status='active' после рестарта приложения.
 
         Всегда форсим in_chat=False — состояние enter/idle таймеров не
-        переживает рестарт, следующий inbound нормально запустит enter-timer
-        (см. docs/autochat.md → «Восстановление при рестарте»).
+        переживает рестарт, следующий inbound нормально запустит enter-timer.
 
-        Воркер аккаунта может быть ещё не запущен — это ок, сессия будет
-        ждать события. Когда пользователь сделает POST /workers/{id}/start
-        и придёт первое message.saved — state machine оживёт.
+        Fix #22 (2026-07-13): восстанавливаем только state machine в памяти.
+        Автоматический regenerate для сессий с пропущенным inbound ЗДЕСЬ НЕ
+        ДЕЛАЕМ — на момент вызова воркеры могут быть ещё stopped, wrapper
+        отсутствует, send упадёт, session уйдёт в терминальный `failed`
+        (был убит session 5396 первой версией фикса — восстановлен).
+        Правильный триггер regenerate — событие `worker.started`, которое
+        гарантирует что wrapper поднят. См. `_on_worker_started`.
         """
         pool = db.get_pool()
         async with pool.acquire() as conn:
@@ -212,9 +237,91 @@ class AutoChatService:
         if restored:
             log.info("autochat: restored %d active session(s)", restored)
 
+    async def _on_worker_started(
+        self, account_id: int | None, data: dict[str, Any],
+    ) -> None:
+        """
+        Fix #22 (2026-07-13): когда воркер поднялся — проверить все active
+        сессии этого аккаунта на пропущенный inbound и триггернуть regenerate.
+
+        Пропущенный inbound: лид ответил, но `message.received` был
+        обработан прошлой autochat-task ДО рестарта и ack'нут в Redis
+        consumer group — при рестарте не переиграется. Без этого триггера
+        сессия висит зомби, лид уходит в `no_response` через 24ч.
+
+        Защита от воскрешения древних диалогов: `last_their_message_at`
+        не старше `_MISSED_INBOUND_TTL_SEC` (6ч). Если лид написал вчера
+        и мы молчим — это не «пропустили из-за рестарта», это тактически
+        уже закрытый диалог, воскрешать не надо.
+
+        Идемпотентно: если сессии этого аккаунта не нуждаются в regen —
+        просто no-op. Событие `worker.started` приходит и на first_run,
+        и на reconnect'ы — оба сценария защищены проверкой last_their > last_our.
+        """
+        if account_id is None:
+            return
+
+        pool = db.get_pool()
+        try:
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, dialog_id, last_their_message_at, last_our_activity_at
+                    FROM autochat_sessions
+                    WHERE account_id = $1
+                      AND status = 'active'
+                      AND last_their_message_at IS NOT NULL
+                      AND last_their_message_at > COALESCE(
+                            last_our_activity_at, '1970-01-01'::timestamptz
+                          )
+                      AND last_their_message_at >= NOW() - make_interval(secs => $2)
+                    """,
+                    int(account_id), int(_MISSED_INBOUND_TTL_SEC),
+                )
+        except Exception:
+            log.exception(
+                "autochat: worker.started missed-inbound scan failed for acc=%s",
+                account_id,
+            )
+            return
+
+        if not rows:
+            return
+
+        regen_ok = 0
+        for row in rows:
+            sid = int(row["id"])
+            async with self._lock:
+                session = self._sessions_by_id.get(sid)
+            if session is None:
+                continue
+            try:
+                await session.force_generate_reply()
+                regen_ok += 1
+                log.info(
+                    "autochat: worker.started acc=%s → regenerated session %s "
+                    "(their=%s > ours=%s)",
+                    account_id, sid,
+                    row["last_their_message_at"], row["last_our_activity_at"],
+                )
+            except Exception:
+                log.exception(
+                    "autochat: regenerate on worker.started failed for session %s",
+                    sid,
+                )
+        if regen_ok:
+            log.info(
+                "autochat: worker.started acc=%s recovered %d zombie session(s)",
+                account_id, regen_ok,
+            )
+
     async def stop(self) -> None:
         """Остановить consumer и все активные сессии."""
         self._stop_event.set()
+        # C4: гасим фоновые regen-задачи (могут висеть в _wait_for_transcriptions).
+        for task in list(self._bg_tasks):
+            if not task.done():
+                task.cancel()
         async with self._lock:
             sessions = list(self._sessions_by_id.values())
         for s in sessions:
@@ -241,6 +348,31 @@ class AutoChatService:
             await self._on_message_updated(account_id, data)
         elif etype == EventType.DIALOG_TYPING_OBSERVED:
             await self._on_typing(account_id, data)
+        elif etype == EventType.WORKER_STARTED:
+            # C4: НЕ блокируем диспетчер — догон missed-inbound уходит в фон.
+            task = asyncio.create_task(
+                self._regen_missed_inbound(account_id, data),
+                name=f"autochat_regen_{account_id}",
+            )
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+
+    async def _regen_missed_inbound(
+        self, account_id: int | None, data: dict[str, Any],
+    ) -> None:
+        """Фоновая обёртка над `_on_worker_started` с лимитом параллелизма.
+
+        Вынесено из консьюмера (C4): пока идёт `_wait_for_transcriptions`
+        (до 5 мин) и вызов LLM, диспетчер шины должен продолжать читать
+        события, иначе приём замирает у всех аккаунтов.
+        """
+        async with self._regen_sem:
+            try:
+                await self._on_worker_started(account_id, data)
+            except Exception:
+                log.exception(
+                    "autochat: regen missed inbound failed acc=%s", account_id,
+                )
 
     async def _on_message_saved(
         self, account_id: int | None, data: dict[str, Any],
@@ -393,6 +525,21 @@ class AutoChatService:
             )
             if exists:
                 raise SessionAlreadyActive()
+            # КОРНЕВОЙ ДЕДУП (2026-07-13): глобально по ЛИЧНОСТИ
+            # (telegram_user_id), а не per-account и не по изменчивому
+            # username. Если этому человеку уже писал ЛЮБОЙ аккаунт —
+            # второй раз не пишем НИКОГДА (приоритет владельца: «не написать
+            # тем, кому уже писали, — превыше всего»). Закрывает исходный баг
+            # неуникальности сессий на ЕДИНОМ слое для ВСЕХ путей (CRM-claim,
+            # ручная очередь, resume) — раньше защита держалась только на
+            # claim по username и текла при смене username / неатомарной
+            # записи реестра.
+            contacted = await conn.fetchval(
+                "SELECT 1 FROM contacted_leads WHERE telegram_user_id = $1",
+                telegram_user_id,
+            )
+            if contacted:
+                raise AlreadyContacted()
             acc_name_row = await conn.fetchrow(
                 "SELECT name FROM accounts WHERE id = $1", account_id,
             )
@@ -492,6 +639,22 @@ class AutoChatService:
 
         tg_msg_id = sent.get("telegram_message_id")
 
+        # АТОМАРНАЯ фиксация контакта (2026-07-13): сообщение РЕАЛЬНО ушло →
+        # СРАЗУ пишем в глобальный реестр contacted_leads, ДО любых bus.publish.
+        # Раньше запись шла в самом конце (после нескольких await bus.publish);
+        # если Redis моргал между отправкой и записью — человек оказывался
+        # «написан, но не зарегистрирован», лид реинзертился и его писал второй
+        # аккаунт. Ключ — telegram_user_id (личность); username — для читаемости.
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO contacted_leads (username, telegram_user_id, account_id)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (username) DO NOTHING
+                """,
+                cleaned_username.lower(), telegram_user_id, account_id,
+            )
+
         # Публикуем message.received (история запишет; history создаст dialog)
         if tg_msg_id is not None:
             message_data: dict[str, Any] = {
@@ -536,7 +699,8 @@ class AutoChatService:
             },
         )
 
-        # Промоушен до active + регистрация сессии
+        # Промоушен до active. (Регистрацию в contacted_leads уже сделали
+        # атомарно сразу после успешной отправки — см. выше, до bus.publish.)
         async with pool.acquire() as conn:
             final_row = await conn.fetchrow(
                 """

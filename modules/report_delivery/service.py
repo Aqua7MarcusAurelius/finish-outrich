@@ -49,7 +49,11 @@ CONSUMER = "report-delivery-1"
 _DEDUP_TTL_SEC = 90 * 24 * 3600
 
 # Пауза между попытками переподключения сервис-аккаунта.
+# M1 (2026-07-13): экспоненциальный бэкофф от базовой до максимальной паузы —
+# при мёртвом прокси сервис-аккаунта раньше долбили connect каждые 30с и
+# спамили шину ~2880 system.error/сутки. Теперь пауза растёт до _RECONNECT_MAX_SEC.
 _RECONNECT_DELAY_SEC = 30
+_RECONNECT_MAX_SEC = 900
 
 # Telegram режет подпись на 1024 символах — держимся под лимитом.
 _CAPTION_MAX = 1024
@@ -108,12 +112,18 @@ class ReportDeliveryService:
             len(self._group_map), self._service_account_id,
         )
 
+        reconnect_delay = _RECONNECT_DELAY_SEC
         while not self._stop_event.is_set():
             try:
                 if self._wrapper is None or not self._wrapper.is_connected():
                     if not await self._connect():
-                        await self._sleep(_RECONNECT_DELAY_SEC)
+                        # M1: экспоненциальный бэкофф вместо фиксированных 30с.
+                        await self._sleep(reconnect_delay)
+                        reconnect_delay = min(
+                            reconnect_delay * 2, _RECONNECT_MAX_SEC,
+                        )
                         continue
+                    reconnect_delay = _RECONNECT_DELAY_SEC  # успех — сброс
 
                 batch = await bus.read_group(
                     GROUP, CONSUMER, count=20, block_ms=5000,
@@ -186,7 +196,9 @@ class ReportDeliveryService:
                 proxy_primary=account["proxy_primary"],
                 proxy_fallback=account["proxy_fallback"],
             )
-            await wrapper.connect(require_authorized=True)
+            # M1: publish_error=False — не спамим шину system.error на каждой
+            # попытке; логируем сами (run() ретраит с экспо-бэкоффом).
+            await wrapper.connect(require_authorized=True, publish_error=False)
         except (SessionExpired, ProxyUnavailable) as e:
             log.error("report_delivery: connect failed: %s", e)
             return False

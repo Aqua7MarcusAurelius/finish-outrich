@@ -106,6 +106,9 @@ class PartnerCrmPoller:
         if not self._service.is_configured():
             return  # .env пустой — молча ждём
 
+        # Простая модель (2026-07-13): claim удаляет лида из пула, зависших
+        # claim'ов не бывает — реапер не нужен. pool_size = число свободных.
+
         threshold = await _get_int_setting(
             "partner_crm.pool_low_threshold", DEFAULT_POOL_LOW_THRESHOLD,
         )

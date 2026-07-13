@@ -9,10 +9,16 @@ import { api, describeApiError } from "@/lib/api";
 import { useToast } from "@/lib/toast";
 import { useAutoRunner } from "@/hooks/useAccounts";
 
-// Настройки авторежима одного воркера: очередь юзернеймов (по одному
-// на строку), интервал между стартами, jitter. Save кладёт PATCH'ем
-// на бэк. is_running и last_status — read-only, рендерим как
-// информацию в шапке.
+// Настройки авторежима одного воркера.
+//
+// Модель: сессия автопрописи = окно `window_hours` часов; при старте
+// генерируется N ∈ [min_leads, max_leads] случайных моментов внутри
+// окна. Первый лид — не раньше чем через `warmup_minutes` после
+// включения. По истечении окна или пустого расписания — авто-стоп.
+//
+// Save = PATCH конфига. Save НЕ пересобирает уже идущую сессию — новые
+// значения применятся только при следующем `start`. Чтобы применить
+// сразу — нажать stop → start в UI.
 
 type Props = {
   open: boolean;
@@ -21,8 +27,11 @@ type Props = {
   onClose: () => void;
 };
 
-const MIN_INTERVAL = 60;     // дублируем MIN_INTERVAL_SEC из бэка
-const MAX_QUEUE = 1000;      // дублируем MAX_QUEUE_LEN из бэка
+// Верхние границы дублируем из бэка (см. modules/worker_auto_runner/service.py).
+const MAX_WINDOW_HOURS = 48;
+const MAX_LEADS = 500;
+const MAX_WARMUP_MINUTES = 240;
+const MAX_QUEUE = 1000;
 
 function parseQueueText(text: string): string[] {
   return text
@@ -31,22 +40,25 @@ function parseQueueText(text: string): string[] {
     .filter(Boolean);
 }
 
-function formatSeconds(sec: number): string {
-  if (sec < 60) return `${sec} сек`;
-  const m = Math.floor(sec / 60);
-  const s = sec % 60;
-  return s === 0 ? `${m} мин` : `${m} мин ${s} сек`;
+function formatHM(minutes: number): string {
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  if (h === 0) return `${m} мин`;
+  if (m === 0) return `${h} ч`;
+  return `${h} ч ${m} мин`;
 }
 
 export function AutoRunnerSettingsDialog({ open, accountId, accountLabel, onClose }: Props) {
   const toast = useToast();
   const q = useAutoRunner(open ? accountId : null);
 
-  // Локальные draft'ы — наполняются при загрузке, синхронизируются при
-  // смене аккаунта. Save сравнивает с актуальным состоянием.
   const [queueText, setQueueText] = useState("");
-  const [intervalSec, setIntervalSec] = useState<number>(1200);
-  const [jitterSec, setJitterSec] = useState<number>(300);
+  const [windowHours, setWindowHours] = useState<number>(12);
+  const [minLeads, setMinLeads] = useState<number>(15);
+  const [maxLeads, setMaxLeads] = useState<number>(18);
+  const [warmupMinutes, setWarmupMinutes] = useState<number>(10);
+  const [activeStartHourMsk, setActiveStartHourMsk] = useState<number>(8);
+  const [activeEndHourMsk, setActiveEndHourMsk] = useState<number>(23);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -54,18 +66,30 @@ export function AutoRunnerSettingsDialog({ open, accountId, accountLabel, onClos
     const d = q.data;
     if (!d) return;
     setQueueText(d.queue.join("\n"));
-    setIntervalSec(d.interval_sec);
-    setJitterSec(d.jitter_sec);
+    setWindowHours(d.window_hours);
+    setMinLeads(d.min_leads);
+    setMaxLeads(d.max_leads);
+    setWarmupMinutes(d.warmup_minutes);
+    setActiveStartHourMsk(d.active_start_hour_msk);
+    setActiveEndHourMsk(d.active_end_hour_msk);
   }, [open, q.data]);
 
   const parsedQueue = useMemo(() => parseQueueText(queueText), [queueText]);
-  const intervalValid = intervalSec >= MIN_INTERVAL;
-  const jitterValid = jitterSec >= 0;
-  const queueValid = parsedQueue.length <= MAX_QUEUE;
-  const formValid = intervalValid && jitterValid && queueValid;
 
-  const minDelay = Math.max(MIN_INTERVAL, intervalSec - jitterSec);
-  const maxDelay = Math.max(MIN_INTERVAL, intervalSec + jitterSec);
+  const activeHoursValid =
+    activeStartHourMsk >= 0 && activeStartHourMsk <= 23 &&
+    activeEndHourMsk >= 1 && activeEndHourMsk <= 24 &&
+    activeEndHourMsk > activeStartHourMsk;
+  const leadsValid =
+    minLeads >= 1 && maxLeads >= minLeads && maxLeads <= MAX_LEADS;
+  const warmupValid = warmupMinutes >= 0 && warmupMinutes <= MAX_WARMUP_MINUTES;
+  const queueValid = parsedQueue.length <= MAX_QUEUE;
+  const formValid = activeHoursValid && leadsValid && warmupValid && queueValid;
+
+  const windowHrs = activeEndHourMsk - activeStartHourMsk;
+  const avgLeads = (minLeads + maxLeads) / 2;
+  const avgIntervalMin =
+    avgLeads > 0 ? Math.round((windowHrs * 60) / avgLeads) : 0;
 
   async function save() {
     if (accountId == null || !formValid) return;
@@ -73,8 +97,11 @@ export function AutoRunnerSettingsDialog({ open, accountId, accountLabel, onClos
     try {
       await api.patchAutoRunner(accountId, {
         queue: parsedQueue,
-        interval_sec: intervalSec,
-        jitter_sec: jitterSec,
+        min_leads: minLeads,
+        max_leads: maxLeads,
+        warmup_minutes: warmupMinutes,
+        active_start_hour_msk: activeStartHourMsk,
+        active_end_hour_msk: activeEndHourMsk,
       });
       q.refetch();
       toast.success("Настройки авторежима сохранены");
@@ -120,11 +147,11 @@ export function AutoRunnerSettingsDialog({ open, accountId, accountLabel, onClos
                   id="ar-queue"
                   value={queueText}
                   onChange={(e) => setQueueText(e.target.value)}
-                  className="mono min-h-[180px] text-xs"
+                  className="mono min-h-[140px] text-xs"
                   placeholder={"ivan_petrov\nolga_sidorova\n@kirill_2025"}
                 />
                 <div className="flex justify-between text-[11px] text-muted-foreground">
-                  <span>после прочтения юзернейма он удаляется из очереди</span>
+                  <span>после старта диалога юзернейм удаляется из очереди</span>
                   <span className={queueValid ? "" : "text-destructive"}>
                     {parsedQueue.length} / {MAX_QUEUE}
                   </span>
@@ -133,43 +160,102 @@ export function AutoRunnerSettingsDialog({ open, accountId, accountLabel, onClos
 
               <div className="flex gap-3">
                 <div className="flex flex-1 flex-col gap-1">
-                  <Label htmlFor="ar-interval">Интервал (сек)</Label>
+                  <Label htmlFor="ar-start">Начало окна (МСК)</Label>
                   <Input
-                    id="ar-interval"
+                    id="ar-start"
                     type="number"
-                    min={MIN_INTERVAL}
-                    value={intervalSec}
-                    onChange={(e) => setIntervalSec(Number(e.target.value || 0))}
+                    min={0}
+                    max={23}
+                    value={activeStartHourMsk}
+                    onChange={(e) => setActiveStartHourMsk(Number(e.target.value || 0))}
                     className="mono"
                   />
                   <span className="text-[11px] text-muted-foreground">
-                    ≈ {formatSeconds(intervalSec)} (минимум {MIN_INTERVAL})
+                    час (0–23), например 8 = 08:00
                   </span>
                 </div>
                 <div className="flex flex-1 flex-col gap-1">
-                  <Label htmlFor="ar-jitter">Разброс ± (сек)</Label>
+                  <Label htmlFor="ar-end">Конец окна (МСК)</Label>
                   <Input
-                    id="ar-jitter"
+                    id="ar-end"
                     type="number"
-                    min={0}
-                    value={jitterSec}
-                    onChange={(e) => setJitterSec(Number(e.target.value || 0))}
+                    min={1}
+                    max={24}
+                    value={activeEndHourMsk}
+                    onChange={(e) => setActiveEndHourMsk(Number(e.target.value || 0))}
                     className="mono"
                   />
                   <span className="text-[11px] text-muted-foreground">
-                    случайная добавка к интервалу
+                    час (1–24), например 23 = 23:00
                   </span>
+                </div>
+                <div className="flex flex-1 flex-col gap-1">
+                  <Label htmlFor="ar-warmup">Прогрев (мин)</Label>
+                  <Input
+                    id="ar-warmup"
+                    type="number"
+                    min={0}
+                    max={MAX_WARMUP_MINUTES}
+                    value={warmupMinutes}
+                    onChange={(e) => setWarmupMinutes(Number(e.target.value || 0))}
+                    className="mono"
+                  />
+                  <span className="text-[11px] text-muted-foreground">
+                    первый лид не раньше
+                  </span>
+                </div>
+              </div>
+
+              <div className="flex gap-3">
+                <div className="flex flex-1 flex-col gap-1">
+                  <Label htmlFor="ar-min">Мин. лидов</Label>
+                  <Input
+                    id="ar-min"
+                    type="number"
+                    min={1}
+                    max={MAX_LEADS}
+                    value={minLeads}
+                    onChange={(e) => setMinLeads(Number(e.target.value || 0))}
+                    className="mono"
+                  />
+                </div>
+                <div className="flex flex-1 flex-col gap-1">
+                  <Label htmlFor="ar-max">Макс. лидов</Label>
+                  <Input
+                    id="ar-max"
+                    type="number"
+                    min={1}
+                    max={MAX_LEADS}
+                    value={maxLeads}
+                    onChange={(e) => setMaxLeads(Number(e.target.value || 0))}
+                    className="mono"
+                  />
                 </div>
               </div>
 
               <div className="rounded-md border border-border bg-secondary/40 p-2 text-[11px]">
                 <div className="text-muted-foreground">
-                  Каждая пауза будет случайной в диапазоне:
+                  При старте: разбросаем <b>{minLeads}–{maxLeads}</b> лидов
+                  случайно по окну <b>{activeStartHourMsk}:00–{activeEndHourMsk}:00 МСК</b> ({formatHM(windowHrs * 60)}). Первый
+                  лид — не раньше <b>{formatHM(warmupMinutes)}</b>. В среднем
+                  один лид примерно каждые <b>{formatHM(avgIntervalMin)}</b>.
                 </div>
-                <div className="mono">
-                  от <b>{formatSeconds(minDelay)}</b> до <b>{formatSeconds(maxDelay)}</b>
-                </div>
+                {q.data.is_running && (
+                  <div className="mt-1 text-status-warning">
+                    Сессия уже идёт — новые значения применятся при
+                    следующем <b>Start</b>. Чтобы применить сразу — сначала <b>Stop</b>.
+                  </div>
+                )}
               </div>
+
+              {q.data.next_dispatch_at && q.data.is_running && (
+                <div className="text-[11px] text-muted-foreground">
+                  Следующий лид: <span className="mono">
+                    {new Date(q.data.next_dispatch_at).toLocaleTimeString()}
+                  </span>{" · осталось "}
+                  <span className="mono">{q.data.schedule_remaining}</span>
+                </div>
+              )}
 
               {q.data.last_status && (
                 <div className="text-[11px] text-muted-foreground">

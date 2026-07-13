@@ -15,6 +15,7 @@ import base64
 import csv
 import io
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -26,6 +27,36 @@ from core import bus, db
 from core.event_messages import format_message
 
 router = APIRouter(tags=["events"])
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Кэш имён аккаунтов (id → name) для обогащения событий.
+# 27 аккаунтов × TTL 60 сек ≪ поток событий. UI показывает "SAD_03_RU"
+# вместо "account_45". При отсутствии в кэше — фронт откатывается на
+# `account_${id}` (см. modules/ui_web/src/components/events/EventRow.tsx).
+# ─────────────────────────────────────────────────────────────────────
+
+_ACC_NAME_CACHE: dict[int, str] = {}
+_ACC_NAME_CACHE_TS: float = 0.0
+_ACC_NAME_CACHE_TTL_SEC = 60.0
+
+
+async def _refresh_account_names_if_stale() -> None:
+    global _ACC_NAME_CACHE_TS
+    now = time.monotonic()
+    if _ACC_NAME_CACHE and (now - _ACC_NAME_CACHE_TS) < _ACC_NAME_CACHE_TTL_SEC:
+        return
+    pool = db.get_pool()
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT id, name FROM accounts")
+    except Exception:
+        # Cache miss не должен ронять endpoint — fallback на account_id
+        return
+    _ACC_NAME_CACHE.clear()
+    for r in rows:
+        _ACC_NAME_CACHE[int(r["id"])] = r["name"]
+    _ACC_NAME_CACHE_TS = now
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -50,9 +81,14 @@ def _row_to_event(row: Any) -> dict[str, Any]:
 
 
 def _enrich(event: dict[str, Any]) -> dict[str, Any]:
-    """Добавить вычисляемое поле `message`."""
+    """Добавить вычисляемые поля `message` и `account_name` (из кэша)."""
     out = dict(event)
     out["message"] = format_message(event)
+    acc_id = out.get("account_id")
+    if acc_id is not None:
+        name = _ACC_NAME_CACHE.get(int(acc_id))
+        if name:
+            out["account_name"] = name
     return out
 
 
@@ -193,6 +229,7 @@ async def list_events(
         """
         async with pool.acquire() as conn:
             rows = await conn.fetch(sql, root_id, limit)
+        await _refresh_account_names_if_stale()
         return {
             "events": [_enrich(_row_to_event(r)) for r in rows],
             "next_cursor": None,
@@ -229,6 +266,7 @@ async def list_events(
     has_more = len(rows) > limit
     rows = rows[:limit]
 
+    await _refresh_account_names_if_stale()
     events = [_enrich(_row_to_event(r)) for r in rows]
 
     next_cursor: Optional[str] = None
@@ -387,6 +425,7 @@ async def events_export(
     async def json_generator():
         yield "["
         first = True
+        await _refresh_account_names_if_stale()
         async with pool.acquire() as conn:
             last_time: Optional[datetime] = None
             last_id: Optional[str] = None
@@ -463,6 +502,7 @@ async def stream_events(
                 continue
 
             idle_counter = 0
+            await _refresh_account_names_if_stale()
             for stream_id, event in batch:
                 last_id = stream_id
                 if not _match_filters_memory(
@@ -534,6 +574,7 @@ async def get_event_chain(event_id: str):
     def _slim(r: Any) -> dict[str, Any]:
         return {"id": r["id"], "module": r["module"], "type": r["type"], "status": r["status"]}
 
+    await _refresh_account_names_if_stale()
     return {
         "ancestors":   [_slim(r) for r in ancestors],
         "event":       _enrich(_row_to_event(center)),
@@ -555,4 +596,5 @@ async def get_event(event_id: str):
         )
     if not row:
         raise HTTPException(404, {"error": {"code": "EVENT_NOT_FOUND"}})
+    await _refresh_account_names_if_stale()
     return _enrich(_row_to_event(row))
