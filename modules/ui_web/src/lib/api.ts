@@ -386,7 +386,11 @@ export const api = {
   // соответствующий путь (см. session.py / service.py).
   getWorkerPrompts: (accountId: number) =>
     request<WorkerPrompts>(`/accounts/${accountId}/prompts`),
-  saveWorkerPrompts: (accountId: number, body: { initial_template: string; reply_template: string }) =>
+  saveWorkerPrompts: (accountId: number, body: {
+    initial_template: string;
+    reply_template: string;
+    evaluator_template: string;
+  }) =>
     request<WorkerPrompts>(`/accounts/${accountId}/prompts`, {
       method: "PUT", body: JSON.stringify(body),
     }),
@@ -398,9 +402,10 @@ export const api = {
   previewWorkerPrompts: (accountId: number, body: {
     initial_template: string;
     reply_template: string;
+    evaluator_template: string;
     dialog_id?: number | null;
   }) =>
-    request<{ initial: string; reply: string; dialog_id: number | null }>(
+    request<{ initial: string; reply: string; evaluator: string; dialog_id: number | null }>(
       `/accounts/${accountId}/prompts/preview`,
       { method: "POST", body: JSON.stringify(body) },
     ),

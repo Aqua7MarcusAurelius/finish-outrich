@@ -11,9 +11,14 @@ import { api, describeApiError } from "@/lib/api";
 import { useToast } from "@/lib/toast";
 import { useAccounts } from "@/hooks/useAccounts";
 
-// Свободный редактор per-worker промтов. Два текста (initial + reply),
-// плейсхолдеры подставляются на бэке во время генерации (см.
-// modules/autochat/generation.py). Превью без вызова LLM.
+// Свободный редактор per-worker промтов. Три текста: initial + reply
+// (autochat) и evaluator (оценщик лида). Плейсхолдеры подставляются на
+// бэке во время генерации/оценки (modules/autochat/generation.py,
+// modules/lead_evaluator/prompts.py). Превью без вызова LLM.
+//
+// evaluator_template — необязательный: пусто = используется глобальный
+// промт оценщика (prompts/lead_evaluator_system.md). Заполняется, когда
+// семейству воркеров нужен свой критерий «успеха» (другой поставщик лидов).
 
 type Placeholder = {
   name: string;
@@ -46,6 +51,7 @@ export function WorkerPromptPage() {
 
   const [initialTemplate, setInitialTemplate] = useState("");
   const [replyTemplate, setReplyTemplate] = useState("");
+  const [evaluatorTemplate, setEvaluatorTemplate] = useState("");
   const [updatedAt, setUpdatedAt] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -63,6 +69,7 @@ export function WorkerPromptPage() {
         if (cancelled) return;
         setInitialTemplate(p.initial_template);
         setReplyTemplate(p.reply_template);
+        setEvaluatorTemplate(p.evaluator_template);
         setUpdatedAt(p.updated_at);
       })
       .catch((e) => {
@@ -81,6 +88,7 @@ export function WorkerPromptPage() {
       const saved = await api.saveWorkerPrompts(accountId, {
         initial_template: initialTemplate,
         reply_template: replyTemplate,
+        evaluator_template: evaluatorTemplate,
       });
       setUpdatedAt(saved.updated_at);
       toast.success("Промт сохранён", account?.name || `account_${accountId}`);
@@ -189,6 +197,37 @@ export function WorkerPromptPage() {
                 rows={24}
                 placeholder="Например: Ты — Маша. {worker_name} ведёт диалог с {partner_name} (@{partner_username})..."
               />
+
+              {/* Evaluator template — промт оценщика лида */}
+              <PromptBlock
+                title="Оценщик — критерий «успеха» диалога"
+                description={
+                  <>
+                    Промт LLM-оценщика: он читает завершённую переписку и выдаёт
+                    вердикт <span className="mono">&lt;verdict&gt;success&lt;/verdict&gt;</span> или
+                    <span className="mono"> &lt;verdict&gt;archive&lt;/verdict&gt;</span>
+                    {" "}(опционально теги{" "}
+                    <span className="mono">&lt;name&gt;/&lt;age&gt;/&lt;city&gt;/&lt;workplace&gt;/&lt;interests&gt;</span>).
+                    Именно <span className="mono">success</span> определяет, попадёт ли
+                    отчёт в папку <span className="mono">success/</span> и уедет ли в группу
+                    выгрузки. Доступны <b>все</b> плейсхолдеры, включая
+                    <span className="mono"> {"{conversation_history}"}</span>.
+                    <br />
+                    <span className="text-status-success">Оставь пустым</span> — оценщик
+                    отработает по <b>глобальному</b> промту{" "}
+                    (<span className="mono">Настройки → Оценщик лидов</span>). Заполняй,
+                    только если этому воркеру нужен <b>свой</b> критерий успеха
+                    (другой поставщик лидов под другие задачи).
+                  </>
+                }
+                value={evaluatorTemplate}
+                onChange={setEvaluatorTemplate}
+                rows={20}
+                placeholder="Оставь пустым для глобального оценщика, либо напиши свой критерий: Диалог успешен, если собеседница согласилась на встречу. Выведи <verdict>success</verdict> или <verdict>archive</verdict>. История:\n{conversation_history}"
+                emptyNote={
+                  <>используется глобальный промт оценщика (это нормально)</>
+                }
+              />
             </div>
           )}
         </div>
@@ -216,6 +255,7 @@ export function WorkerPromptPage() {
           accountId={accountId}
           initialTemplate={initialTemplate}
           replyTemplate={replyTemplate}
+          evaluatorTemplate={evaluatorTemplate}
           onClose={() => setPreviewOpen(false)}
         />
       )}
@@ -282,7 +322,7 @@ function PlaceholderRow({
 }
 
 function PromptBlock({
-  title, description, value, onChange, rows, placeholder,
+  title, description, value, onChange, rows, placeholder, emptyNote,
 }: {
   title: string;
   description: React.ReactNode;
@@ -290,6 +330,10 @@ function PromptBlock({
   onChange: (v: string) => void;
   rows: number;
   placeholder: string;
+  // Если задано — пустое поле это НЕ ошибка: показываем нейтральную
+  // подсказку вместо красного «поле пустое» (как у промта оценщика,
+  // где пусто = глобальный по умолчанию).
+  emptyNote?: React.ReactNode;
 }) {
   const empty = value.trim().length === 0;
   return (
@@ -305,9 +349,9 @@ function PromptBlock({
         spellCheck={false}
       />
       {empty && (
-        <div className="text-[10px] text-destructive">
-          поле пустое
-        </div>
+        emptyNote
+          ? <div className="text-[10px] text-muted-foreground">{emptyNote}</div>
+          : <div className="text-[10px] text-destructive">поле пустое</div>
       )}
     </div>
   );

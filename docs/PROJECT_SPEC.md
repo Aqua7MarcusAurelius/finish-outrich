@@ -10,7 +10,7 @@
 > (настоящее время, «как работает сейчас»); раздел 20 — **хронологическая история
 > изменений** по всем этапам (1 → 10.27), отвечающая на вопрос «что и когда меняли».
 >
-> **Обновлено:** 2026-07-19.
+> **Обновлено:** 2026-07-20.
 >
 > **Регламент поддержки** (держим документ всегда актуальным):
 > 1. Любое изменение в коде сразу отражаем здесь; отдельные `.md` в `docs/` не заводим.
@@ -3263,16 +3263,19 @@ AutoChatError (base)
 
 ### 13.7. Редактируемые промты (per-worker, freeform editor, preview)
 
-Текущая модель — **per-worker freeform**: у каждого воркера (= аккаунта) свой промт в БД, два свободных текстовых поля. Таблица `account_prompts` (PK = `account_id`, 1:1, FK `ON DELETE CASCADE`):
+Текущая модель — **per-worker freeform**: у каждого воркера (= аккаунта) свой промт в БД, три свободных текстовых поля. Таблица `account_prompts` (PK = `account_id`, 1:1, FK `ON DELETE CASCADE`):
 
 ```
- account_id       | integer                  | not null
- updated_at       | timestamp with time zone | not null  default now()
- initial_template | text                     | not null  default ''
- reply_template   | text                     | not null  default ''
+ account_id         | integer                  | not null
+ updated_at         | timestamp with time zone | not null  default now()
+ initial_template   | text                     | not null  default ''
+ reply_template     | text                     | not null  default ''
+ evaluator_template | text                     | not null  default ''   (миграция 0023)
 ```
 
-`prompts.py` — `WorkerPrompts(initial_template, reply_template)` + `has_initial()` / `has_reply()`, `load_for_account()`. Промт читается **при каждой генерации** (read at every generation, не cache) — правка подхватывается на следующем триггере без рестарта и без перезапуска активной сессии. HTML-комментарии `<!-- ... -->` вырезаются перед отправкой в LLM.
+`initial_template` / `reply_template` принадлежат autochat (см. ниже гейты). `evaluator_template` (2026-07-20, миграция `0023`) принадлежит `lead_evaluator`: **per-account переопределение промта оценщика**. Непустой — используется он; пустой (дефолт у всех существующих воркеров) — берётся глобальный файл `prompts/lead_evaluator_system.md`. Даёт разным семействам воркеров свой критерий «успеха» диалога, не трогая остальных (другой поставщик лидов = другие задачи). Модель LLM, парсер вердикта и словарь `success`/`archive` от источника промта НЕ зависят — переопределяется только текст-критерии (подробнее — §15, `lead_evaluator/prompts.py`).
+
+`prompts.py` (autochat) — `WorkerPrompts(initial_template, reply_template)` + `has_initial()` / `has_reply()`, `load_for_account()`. Промт читается **при каждой генерации** (read at every generation, не cache) — правка подхватывается на следующем триггере без рестарта и без перезапуска активной сессии. `evaluator_template` читает `lead_evaluator/prompts.py` (`_load_account_evaluator_template` + чистая `resolve_evaluator_template`), тоже на каждой оценке. HTML-комментарии `<!-- ... -->` вырезаются перед отправкой в LLM во всех трёх.
 
 > Эволюция: ранее промты лежали в файлах `prompts/autochat_*.md` (читались при каждой генерации); затем — структурированный конфиг из 8 семантических полей (`fabula, bio, style, forbidden, length_hint, goals, format_reply, examples`) с фиксированной сборкой; сейчас — два свободных textarea. Структурированные поля помогали «не забыть» формат/запреты, но дробили промт искусственно. Файлы `prompts/*.md` остаются как dead-code fallback (`_read_prompt_file()` / `_REPLY_FALLBACK` / `_INITIAL_FALLBACK`) — в норме до них не доходит (гейт блокирует пустоту). Дефолтов при первом открытии нет: пустой воркер = пустой промт.
 
@@ -3310,11 +3313,11 @@ AutoChatError (base)
 
 | Метод | Путь | Тело / возврат |
 |---|---|---|
-| GET | `/accounts/{id}/prompts` | `{account_id, initial_template, reply_template, updated_at}` |
-| PUT | `/accounts/{id}/prompts` | сохранить два поля |
-| POST | `/accounts/{id}/prompts/preview` | body: `{initial_template, reply_template, dialog_id?, user_system_prompt?}` → `{initial, reply, dialog_id}` |
+| GET | `/accounts/{id}/prompts` | `{account_id, initial_template, reply_template, evaluator_template, updated_at}` |
+| PUT | `/accounts/{id}/prompts` | сохранить три поля |
+| POST | `/accounts/{id}/prompts/preview` | body: `{initial_template, reply_template, evaluator_template, dialog_id?}` → `{initial, reply, evaluator, dialog_id}` |
 
-Превью («Что уйдёт в LLM») собирает оба промта ровно как они уйдут в `chat_completion`, **без вызова LLM и без сохранения** — итерировать промт без живого Telegram и без расхода токенов. Эндпоинт принимает поля из тела, не читает БД — чтобы показывать несохранённые правки из textarea. `dialog_id` валидируется `WHERE id=$1 AND account_id=$2` (иначе data-leak чужой истории; 400 `DIALOG_NOT_FOUND`). Без `dialog_id` секция истории содержит placeholder-маркер. Внутри — публичный `render_preview_text(...)` (+ `build_conversation_context`). UI: страница `/workers/:accountId/prompt` — справочник плейсхолдеров с кнопками «Скопировать», два больших textarea с инструкциями (включая напоминание про `<msg>` и `<finishdialog/>` и последствия пустого поля), sticky-футер с превью/отменой/сохранить.
+Превью («Что уйдёт в LLM») собирает все три промта ровно как они уйдут в `chat_completion`, **без вызова LLM и без сохранения** — итерировать промт без живого Telegram и без расхода токенов. Эндпоинт принимает поля из тела, не читает БД — чтобы показывать несохранённые правки из textarea. `dialog_id` валидируется `WHERE id=$1 AND account_id=$2` (иначе data-leak чужой истории; 400 `DIALOG_NOT_FOUND`). Без `dialog_id` секция истории содержит placeholder-маркер. Внутри — публичный `render_preview_text(...)` (+ `build_conversation_context`); тем же хелпером рендерится и `evaluator` (превью пустого поля — «оценщик по глобальному промту»). UI: страница `/workers/:accountId/prompt` — справочник плейсхолдеров с кнопками «Скопировать», три больших textarea с инструкциями (initial/reply — про `<msg>` и `<finishdialog/>` и последствия пустого поля; evaluator — про `<verdict>` и что пустое поле = глобальный оценщик, это не ошибка), sticky-футер с превью/отменой/сохранить.
 
 ### 13.8. Endpoints `/autochat/*` и тумблер диалога
 
@@ -3902,7 +3905,9 @@ LLM-судья закрытого диалога: анализирует пер�
 
 #### Промт и плейсхолдеры
 
-`prompts/lead_evaluator_system.md` редактируется вживую. `build_evaluator_messages` переиспользует приватные хелперы `autochat.generation` (`_load_partner_info_for_dialog`, `_load_turns`, `_format_history_text`, `_load_message_stats`, `_load_worker_name`, `PartnerInfo`) — сознательный coupling вместо дублирования ~80 строк загрузки истории. Поддерживаемые плейсхолдеры:
+**Источник промта — двухуровневый (2026-07-20).** `build_evaluator_messages(conn, account_id, dialog_id, ...)` сначала читает per-account `account_prompts.evaluator_template` (`_load_account_evaluator_template`), затем через чистую `resolve_evaluator_template(account_template, global_template)` выбирает: **непустой per-account побеждает**, иначе глобальный `prompts/lead_evaluator_system.md` (или встроенный `_FALLBACK`, если файла нет). Так у разных семейств воркеров может быть свой критерий «успеха» диалога, а у остальных — общий глобальный промт, как было до миграции `0023`. Приоритет вынесен в чистую функцию (без БД/файлов) — покрыт `tests/smoke/test_evaluator_prompt_selection.py`. Глобальный файл редактируется вживую через `GET/PUT /lead-evaluator/prompt` (раздел «Настройки → Оценщик лидов»); per-account — через страницу промта воркера (`PUT /accounts/{id}/prompts`, поле `evaluator_template`, см. §13.7). Модель (`OPENROUTER_MODEL_EVALUATOR`), парсер вердикта и словарь `success`/`archive` от источника промта НЕ зависят.
+
+`build_evaluator_messages` переиспользует приватные хелперы `autochat.generation` (`_load_partner_info_for_dialog`, `_load_turns`, `_format_history_text`, `_load_message_stats`, `_load_worker_name`, `PartnerInfo`) — сознательный coupling вместо дублирования ~80 строк загрузки истории. Поддерживаемые плейсхолдеры:
 
 | Плейсхолдер | Подставляется |
 |---|---|
@@ -5075,8 +5080,8 @@ event: event   data: { ...полное событие шины с type=message.u
 
 | Метод | Путь | Что делает |
 |---|---|---|
-| GET / PUT | `/accounts/{id}/prompts` | Два свободных текста промтов воркера: `initial_template` и `reply_template` (до 50 000 символов каждый); при отсутствии строки оба пустые, `updated_at=null`, никаких overlay-дефолтов |
-| POST | `/accounts/{id}/prompts/preview` | Превью подстановки плейсхолдеров: возвращает `{ initial, reply, dialog_id }` |
+| GET / PUT | `/accounts/{id}/prompts` | Три свободных текста промтов воркера: `initial_template`, `reply_template` и `evaluator_template` (до 50 000 символов каждый); при отсутствии строки все пустые, `updated_at=null`, никаких overlay-дефолтов. Пустой `evaluator_template` = оценщик по глобальному промту (§13.7, §15) |
+| POST | `/accounts/{id}/prompts/preview` | Превью подстановки плейсхолдеров: возвращает `{ initial, reply, evaluator, dialog_id }` |
 | PATCH | `/accounts/{id}/lead-settings` | Изменить `lead_source` (`manual`/`partner_crm`) и `target_gender` (`any`/`male`/`female`); Pydantic принимает любое подмножество, но хотя бы одно поле обязательно (иначе `400 EMPTY_PATCH`) |
 | POST | `/accounts/{id}/dialogs/wipe?confirm=CONFIRM` | Полная очистка диалогов аккаунта (требует query `confirm=CONFIRM`; опциональный `revoke`, по умолчанию `true`) |
 
@@ -5551,6 +5556,17 @@ WHERE a.lead_source = 'partner_crm' AND war.is_running = TRUE
 ### Исправления по аудиту (2026-06-27 →)
 
 > Точечные фиксы по аудиту (2026-06-26). Аналитические доки (аудит, analytics, pipeline-fix, review) консолидированы сюда и удалены — спека единственный источник. Формат: дата, находка, суть, затронутые разделы. Новейшие записи — сверху.
+
+- **2026-07-20 — Per-account промт оценщика (свой критерий «успеха» для семейства воркеров). Миграция `0023`.**
+  *Задача.* Завести второе семейство воркеров под другого поставщика лидов и другие задачи. Всё остальное (автопропись из ручной очереди, автодиалог со своим промтом, доставка success-отчётов в свою группу, отсутствие пушей в партнёрскую CRM) уже работало без правок кода. Единственный блокер — **оценщик был один на всю систему**: промт в захардкоженном файле `prompts/lead_evaluator_system.md`, и именно его вердикт `success` определяет, попадёт ли диалог в папку `success/` и уедет ли в группу выгрузки. Разным задачам нужен разный критерий успеха.
+  *Ключевое наблюдение.* Вердикт оценщика — всего два значения (`success`/`archive`), а весь конвейер ниже вердикта (выбор папки в `report.py::_determine_folder`, доставка `report_delivery`, гейт CRM `finalizer` по `from_crm`, пузыри статусов) на «критерии» не смотрит — только на слово `success`. Значит «совсем другой оценщик» = **другой текст промта**, а модель, парсер, словарь вердиктов и весь downstream переиспользуются как есть.
+  *Решение (по образцу per-account промтов autochat).*
+  1. Миграция `0023_account_evaluator_prompt.py`: `ALTER TABLE account_prompts ADD COLUMN evaluator_template TEXT NOT NULL DEFAULT ''`. Аддитивно, применена вживую; существующие ~40 воркеров получили пустое поле = прежнее поведение (глобальный промт). Downgrade дропает колонку.
+  2. [modules/lead_evaluator/prompts.py](modules/lead_evaluator/prompts.py): `_load_account_evaluator_template(conn, account_id)` (читает колонку, стрипает) + чистая `resolve_evaluator_template(account_template, global_template)` (непустой per-account побеждает, иначе глобальный). `build_evaluator_messages` теперь выбирает промт через них. Модель (`OPENROUTER_MODEL_EVALUATOR`), `parser.py`, словарь `success`/`archive`, маппинги пузырей/CRM-reason — не тронуты.
+  3. [api/routes/accounts.py](api/routes/accounts.py): `GET/PUT /accounts/{id}/prompts` и `POST /accounts/{id}/prompts/preview` расширены третьим полем `evaluator_template` (один сейв на странице, превью через тот же `render_preview_text`).
+  4. UI [WorkerPromptPage.tsx](modules/ui_web/src/pages/WorkerPromptPage.tsx) + [PromptPreviewDialog.tsx](modules/ui_web/src/components/dialogs/PromptPreviewDialog.tsx): третья секция «Оценщик — критерий „успеха“ диалога» с textarea, подсказкой про `<verdict>` и явным «пусто = глобальный оценщик, это не ошибка» (пустое поле здесь нейтральное, а не красное как у autochat-промтов). Типы `WorkerPrompts`/`api.ts` дополнены.
+  5. Тест [tests/smoke/test_evaluator_prompt_selection.py](tests/smoke/test_evaluator_prompt_selection.py): 5 кейсов (чистый resolver override/fallback; loader на несуществующем account → `''`; per-account override читается — внутри транзакции с ROLLBACK, прод не трогаем; пробельный override → `''` → глобальный). Все PASS в контейнере.
+  **Итоговый прогон smoke после `0023`:** 13/14 сьютов PASS (включая новый evaluator-prompt-selection 5/5). `test_resilient_worker` — 2/5 FAIL, но это **пред-существующая** регрессия зоны Fix #12 (переключение прокси main→fallback + `worker.restarted`), к данному изменению отношения не имеет: `modules/worker/` не трогался. Зафиксировано для отдельного разбора (см. scrutiny post-June-23). Затронуто: `alembic/versions/0023_account_evaluator_prompt.py` (новая), `modules/lead_evaluator/prompts.py`, `api/routes/accounts.py`, `modules/ui_web/src/pages/WorkerPromptPage.tsx`, `modules/ui_web/src/components/dialogs/PromptPreviewDialog.tsx`, `modules/ui_web/src/lib/api.ts`, `modules/ui_web/src/types/api.ts`, `tests/smoke/test_evaluator_prompt_selection.py` (новый). Разделы 1–19: §13.7 (модель промтов, API), §15 (источник промта оценщика), §18 (эндпоинты).
 
 - **2026-07-19 — Фиксация релиза `v2.0.0` на `main` + ветка `dev` под новую разработку.**
   *Зачем.* Текущее состояние системы (этапы 1–10.27 + аудит 2026-06-26 + фиксы #1–#23 + корневой фикс дедупа) закреплено как цельная релизная версия: дальше новая функциональность идёт в отдельной ветке, а `main` остаётся воспроизводимой опорной точкой. Предыдущий тег `v1-release` (`62fa3a3`, 2026-05-07) отстал на 66 коммитов.

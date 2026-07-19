@@ -3,6 +3,17 @@
 Поддерживаемые плейсхолдеры — те же что в autochat-промтах плюс
 `{partner_gender}` (см. prompts/lead_evaluator_system.md).
 
+Источник промта — двухуровневый (2026-07-20):
+  1. Per-account: `account_prompts.evaluator_template` — если непустой,
+     используется он. Даёт разным семействам воркеров свой оценщик с
+     разными критериями «успеха» (другой поставщик лидов = другие задачи).
+  2. Глобальный fallback: файл `prompts/lead_evaluator_system.md`
+     (или встроенный `_FALLBACK`, если файла нет). Так работали все
+     воркеры до появления per-account поля — обратная совместимость.
+
+Модель, парсер вердикта и словарь вердиктов (`success`/`archive`) от
+источника промта НЕ зависят — переопределяется только текст-критерии.
+
 HTML-комментарии `<!-- ... -->` вырезаются перед отправкой в LLM — их
 можно использовать как заметки для редактора, в промт они не попадут.
 """
@@ -78,6 +89,30 @@ def _read_prompt_file() -> str:
     return text
 
 
+async def _load_account_evaluator_template(conn: Any, account_id: int) -> str:
+    """Per-account промт оценщика из `account_prompts.evaluator_template`.
+
+    Возвращает уже стрипнутую строку; '' если строки в таблице нет либо
+    поле пустое (оба случая означают «используй глобальный по умолчанию»).
+    """
+    row = await conn.fetchval(
+        "SELECT evaluator_template FROM account_prompts WHERE account_id = $1",
+        account_id,
+    )
+    return (row or "").strip()
+
+
+def resolve_evaluator_template(account_template: str, global_template: str) -> str:
+    """Выбор промта: непустой per-account побеждает, иначе глобальный.
+
+    Чистая функция (без БД/файлов) — вся логика приоритета здесь, чтобы
+    её можно было проверить smoke-тестом без Postgres.
+    """
+    if account_template and account_template.strip():
+        return account_template
+    return global_template
+
+
 def _build_placeholder_values(
     *,
     now: datetime,
@@ -118,12 +153,15 @@ async def build_evaluator_messages(
     """
     Собрать [{system: ...}, {user: "Оцени."}] для LLM.
 
-    Все плейсхолдеры в файле промта будут подставлены реальными значениями
-    из БД. Если плейсхолдера в файле нет — соответствующий запрос в БД
-    тоже делается (это копеечно и проще чем парсить и условно дёргать),
-    он просто не использован в финальной строке.
+    Источник системного промта: per-account `evaluator_template` если он
+    непустой, иначе глобальный файл (см. модуль-докстринг). Все плейсхолдеры
+    в промте будут подставлены реальными значениями из БД. Если плейсхолдера
+    в промте нет — соответствующий запрос в БД тоже делается (это копеечно и
+    проще чем парсить и условно дёргать), он просто не использован в
+    финальной строке.
     """
-    template_raw = _read_prompt_file()
+    account_template = await _load_account_evaluator_template(conn, account_id)
+    template_raw = resolve_evaluator_template(account_template, _read_prompt_file())
     template = _strip_comments(template_raw).strip() + "\n"
 
     worker_name = await _load_worker_name(conn, account_id)

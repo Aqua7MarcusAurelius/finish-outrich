@@ -75,15 +75,19 @@ export interface LeadEvaluation {
   updated_at: string;
 }
 
-// Per-worker AutoChat промт-конфиг (account_prompts).
-// Два свободных текста; в каждом доступны плейсхолдеры — система
-// подставляет реальные значения при генерации (см. generation.py).
-// Пустой reply_template блокирует генерацию ответов; пустой
-// initial_template блокирует POST /autochat/start.
+// Per-worker промт-конфиг (account_prompts). Три свободных текста; в
+// каждом доступны плейсхолдеры — система подставляет реальные значения
+// (см. generation.py / lead_evaluator/prompts.py).
+//   initial_template   — autochat, первое сообщение (пустой блокирует
+//                        POST /autochat/start);
+//   reply_template     — autochat, ответы (пустой блокирует генерацию);
+//   evaluator_template — lead_evaluator, промт оценщика. Пустой = берётся
+//                        глобальный prompts/lead_evaluator_system.md.
 export interface WorkerPrompts {
   account_id: number;
   initial_template: string;
   reply_template: string;
+  evaluator_template: string;
   updated_at: string | null;
 }
 

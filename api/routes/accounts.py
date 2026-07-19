@@ -8,9 +8,15 @@ GET /accounts — список аккаунтов для страницы «Ди
 для UI — она агрегирует данные из worker_manager, истории и шины.
 
 Также тут CRUD для per-worker промтов (account_prompts) — редактор в UI
-вызывает GET/PUT /accounts/{id}/prompts. Промты используются модулем
-autochat: пустой reply_system блокирует автоответы (см. session.py),
-пустой initial_system блокирует POST /autochat/start.
+вызывает GET/PUT /accounts/{id}/prompts. Три свободных текста:
+  - initial_template  — autochat, первое сообщение (пустой блокирует
+    POST /autochat/start);
+  - reply_template    — autochat, ответы в переписке (пустой блокирует
+    генерацию, см. session.py);
+  - evaluator_template — lead_evaluator, промт оценщика диалога. Пустой =
+    используется глобальный `prompts/lead_evaluator_system.md` (см.
+    modules/lead_evaluator/prompts.py). Даёт разным семействам воркеров
+    свой оценщик с разными критериями «успеха».
 """
 from __future__ import annotations
 
@@ -162,6 +168,8 @@ async def patch_lead_settings(account_id: int, payload: LeadSettingsPatch):
 class PromptsIn(BaseModel):
     initial_template: str = Field(default="", max_length=50000)
     reply_template: str = Field(default="", max_length=50000)
+    # Пустой = глобальный оценщик по умолчанию (prompts/lead_evaluator_system.md).
+    evaluator_template: str = Field(default="", max_length=50000)
 
 
 def _account_not_found() -> JSONResponse:
@@ -176,6 +184,7 @@ def _row_to_prompts_dict(account_id: int, row) -> dict[str, Any]:
         "account_id": account_id,
         "initial_template": row["initial_template"],
         "reply_template": row["reply_template"],
+        "evaluator_template": row["evaluator_template"],
         "updated_at": _iso(row["updated_at"]),
     }
 
@@ -185,9 +194,10 @@ async def get_account_prompts(account_id: int):
     """
     Возвращает per-worker промт-конфиг (два свободных текста).
 
-    Если строки в `account_prompts` ещё нет — оба поля пустые,
+    Если строки в `account_prompts` ещё нет — все поля пустые,
     `updated_at = null`. Никаких overlay-дефолтов: оператор сам пишет
-    что хочет, дефолт-каркас сейчас не предусмотрен.
+    что хочет, дефолт-каркас сейчас не предусмотрен. Пустой
+    `evaluator_template` означает «оценщик по глобальному промту».
     """
     pool = db.get_pool()
     async with pool.acquire() as conn:
@@ -196,7 +206,7 @@ async def get_account_prompts(account_id: int):
             return _account_not_found()
         row = await conn.fetchrow(
             """
-            SELECT initial_template, reply_template, updated_at
+            SELECT initial_template, reply_template, evaluator_template, updated_at
             FROM account_prompts WHERE account_id = $1
             """,
             account_id,
@@ -206,6 +216,7 @@ async def get_account_prompts(account_id: int):
             "account_id": account_id,
             "initial_template": "",
             "reply_template": "",
+            "evaluator_template": "",
             "updated_at": None,
         }
     return _row_to_prompts_dict(account_id, row)
@@ -221,15 +232,19 @@ async def put_account_prompts(account_id: int, payload: PromptsIn):
         row = await conn.fetchrow(
             """
             INSERT INTO account_prompts (
-                account_id, initial_template, reply_template, updated_at
-            ) VALUES ($1, $2, $3, NOW())
+                account_id, initial_template, reply_template,
+                evaluator_template, updated_at
+            ) VALUES ($1, $2, $3, $4, NOW())
             ON CONFLICT (account_id) DO UPDATE SET
                 initial_template = EXCLUDED.initial_template,
                 reply_template = EXCLUDED.reply_template,
+                evaluator_template = EXCLUDED.evaluator_template,
                 updated_at = NOW()
-            RETURNING initial_template, reply_template, updated_at
+            RETURNING initial_template, reply_template,
+                      evaluator_template, updated_at
             """,
             account_id, payload.initial_template, payload.reply_template,
+            payload.evaluator_template,
         )
     return _row_to_prompts_dict(account_id, row)
 
@@ -241,6 +256,7 @@ async def put_account_prompts(account_id: int, payload: PromptsIn):
 class PreviewIn(BaseModel):
     initial_template: str = Field(default="", max_length=50000)
     reply_template: str = Field(default="", max_length=50000)
+    evaluator_template: str = Field(default="", max_length=50000)
     # Опционально — какой диалог использовать как источник истории
     # и данных собеседника. None → плейсхолдеры partner_* пустые,
     # conversation_history с маркером.
@@ -293,10 +309,18 @@ async def preview_prompts(account_id: int, payload: PreviewIn):
             dialog_id=payload.dialog_id,
             now=now,
         )
+        evaluator_text = await render_preview_text(
+            conn,
+            template=payload.evaluator_template,
+            account_id=account_id,
+            dialog_id=payload.dialog_id,
+            now=now,
+        )
 
     return {
         "initial": initial_text,
         "reply": reply_text,
+        "evaluator": evaluator_text,
         "dialog_id": payload.dialog_id,
     }
 

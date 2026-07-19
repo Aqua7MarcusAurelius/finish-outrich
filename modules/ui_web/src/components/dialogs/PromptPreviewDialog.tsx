@@ -17,11 +17,12 @@ type Props = {
   accountId: number;
   initialTemplate: string;
   replyTemplate: string;
+  evaluatorTemplate: string;
   onClose: () => void;
 };
 
 export function PromptPreviewDialog({
-  open, accountId, initialTemplate, replyTemplate, onClose,
+  open, accountId, initialTemplate, replyTemplate, evaluatorTemplate, onClose,
 }: Props) {
   const toast = useToast();
   const dialogsQ = useDialogs(open ? accountId : null);
@@ -30,6 +31,7 @@ export function PromptPreviewDialog({
   const [dialogPicked, setDialogPicked] = useState(false);
   const [initialText, setInitialText] = useState("");
   const [replyText, setReplyText] = useState("");
+  const [evaluatorText, setEvaluatorText] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -40,10 +42,12 @@ export function PromptPreviewDialog({
       const r = await api.previewWorkerPrompts(accountId, {
         initial_template: initialTemplate,
         reply_template: replyTemplate,
+        evaluator_template: evaluatorTemplate,
         dialog_id: dialogId,
       });
       setInitialText(r.initial);
       setReplyText(r.reply);
+      setEvaluatorText(r.evaluator);
     } catch (e) {
       const d = describeApiError(e);
       setError(`${d.title}${d.detail ? ` (${d.detail})` : ""}`);
@@ -84,7 +88,8 @@ export function PromptPreviewDialog({
   async function copyAll() {
     const text =
       `=== INITIAL (system) ===\n${initialText || "(пусто)"}\n\n` +
-      `=== REPLY (system) ===\n${replyText || "(пусто)"}\n`;
+      `=== REPLY (system) ===\n${replyText || "(пусто)"}\n\n` +
+      `=== EVALUATOR (system) ===\n${evaluatorText || "(пусто — глобальный оценщик)"}\n`;
     try {
       await navigator.clipboard.writeText(text);
       toast.success("Скопировано в буфер");
@@ -122,7 +127,7 @@ export function PromptPreviewDialog({
           <Button size="sm" variant="outline" onClick={fetchPreview} disabled={loading}>
             <RefreshCw className={`h-3 w-3 ${loading ? "animate-spin" : ""}`} /> Обновить
           </Button>
-          <Button size="sm" variant="outline" onClick={copyAll} disabled={!initialText && !replyText}>
+          <Button size="sm" variant="outline" onClick={copyAll} disabled={!initialText && !replyText && !evaluatorText}>
             <Copy className="h-3 w-3" /> Скопировать
           </Button>
         </div>
@@ -132,6 +137,12 @@ export function PromptPreviewDialog({
         <div className="mt-2 flex flex-col gap-3">
           <PreviewBlock label="initial · system" text={initialText} loading={loading} />
           <PreviewBlock label="reply · system"   text={replyText}   loading={loading} />
+          <PreviewBlock
+            label="evaluator · system"
+            text={evaluatorText}
+            loading={loading}
+            emptyText="(пусто — оценщик по глобальному промту)"
+          />
         </div>
 
         <div className="flex justify-end pt-1">
@@ -142,14 +153,21 @@ export function PromptPreviewDialog({
   );
 }
 
-function PreviewBlock({ label, text, loading }: { label: string; text: string; loading: boolean }) {
+function PreviewBlock({
+  label, text, loading, emptyText = "(пусто)",
+}: {
+  label: string;
+  text: string;
+  loading: boolean;
+  emptyText?: string;
+}) {
   return (
     <div>
       <div className="mb-1 text-[10px] uppercase tracking-wider text-muted-foreground">
         {label}
       </div>
       <pre className="mono max-h-[40vh] overflow-auto whitespace-pre-wrap rounded-md bg-muted/40 p-3 text-[11px] leading-relaxed hairline border-border">
-        {loading ? "загрузка…" : text || "(пусто)"}
+        {loading ? "загрузка…" : text || emptyText}
       </pre>
     </div>
   );
