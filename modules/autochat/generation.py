@@ -588,10 +588,63 @@ def extract_finish_marker(response: str) -> tuple[str, bool]:
     return cleaned, found
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Фильтр инородных письменностей (Fix #24, 2026-08-02)
+# ─────────────────────────────────────────────────────────────────────
+# LLM изредка вставляет одиночный CJK-иероглиф посреди русского текста —
+# артефакт токенизации/семплинга. Лид видит «привет, как 好 дела» и
+# понимает что переписывается с ботом. Вырезаем весь CJK-блок целиком.
+#
+# НЕ трогаем: эмодзи (U+1F300–U+1FAFF, U+2600–U+27BF), общую пунктуацию
+# (U+2000–U+206F: тире, кавычки-ёлочки, многоточие) — они легитимны
+# в русском тексте.
+_FOREIGN_SCRIPT_RE = re.compile(
+    "["
+    "　-〿"   # CJK пунктуация 、。「」
+    "぀-ゟ"   # Hiragana
+    "゠-ヿ"   # Katakana
+    "㐀-䶿"   # CJK Ext A
+    "一-鿿"   # CJK Unified Ideographs — основной источник мусора
+    "가-힯"   # Hangul
+    "豈-﫿"   # CJK Compatibility Ideographs
+    "＀-￯"   # Halfwidth/Fullwidth forms
+    "]+"
+)
+
+# После вырезания остаются двойные пробелы и пробел перед пунктуацией.
+_DOUBLE_SPACE_RE = re.compile(r"[ \t]{2,}")
+_SPACE_BEFORE_PUNCT_RE = re.compile(r" +([,.!?;:)])")
+
+
+def strip_foreign_scripts(text: str) -> str:
+    """
+    Вырезать CJK/Hangul-символы из ответа LLM и нормализовать пробелы.
+
+    Fix #24: артефакты семплинга вида «как 好 дела» демаскируют бота.
+    Возвращает очищенный текст; при срабатывании пишет WARNING в лог,
+    чтобы можно было отследить частоту проблемы по семействам.
+    """
+    if not text:
+        return text
+    cleaned = _FOREIGN_SCRIPT_RE.sub("", text)
+    if cleaned == text:
+        return text
+    log.warning(
+        "autochat: stripped foreign-script chars from LLM response "
+        "(before=%r, after=%r)",
+        text[:120], cleaned[:120],
+    )
+    cleaned = _DOUBLE_SPACE_RE.sub(" ", cleaned)
+    cleaned = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", cleaned)
+    return cleaned.strip()
+
+
 def parse_segments(response: str) -> list[str]:
     """
     Разобрать ответ Opus на сегменты по <msg>-тегам.
     Fallback: если тегов нет — весь ответ = один сегмент.
+
+    Fix #24: каждый сегмент проходит через `strip_foreign_scripts`.
     """
     if response is None:
         return []
@@ -616,6 +669,9 @@ def parse_segments(response: str) -> list[str]:
 
     out: list[str] = []
     for s in segments:
+        # Fix #24: вырезаем CJK ДО обрезки по длине — иначе лимит
+        # съедят символы которые мы всё равно удалим.
+        s = strip_foreign_scripts(s)
         if len(s) > MAX_SEGMENT_LEN:
             s = s[:MAX_SEGMENT_LEN].rstrip()
         if s:
@@ -632,5 +688,7 @@ def sanitize_initial_response(response: str) -> str:
         return ""
     segments = parse_segments(response)
     if not segments:
-        return response.strip()
+        # Fix #24: fallback-ветка тоже должна фильтроваться —
+        # parse_segments сюда не дошёл, CJK останется без чистки.
+        return strip_foreign_scripts(response.strip())
     return " ".join(segments).strip()

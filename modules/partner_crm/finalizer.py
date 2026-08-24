@@ -141,6 +141,24 @@ class PartnerCrmFinalizer:
             )
             return
 
+        # 2026-08-23: успешные диалоги проходят модерацию в TG-группе
+        # (modules/report_bot). Она сама пушит статус и ПОСЛЕ этого
+        # ставит терминальный пузырь — событие о котором прилетает сюда.
+        # Без этой проверки мы бы отправили партнёру второй статус,
+        # затерев решение модератора (`transferred` → `ready_for_transfer`).
+        async with pool.acquire() as conn:
+            moderated = await conn.fetchval(
+                "SELECT pushed_status FROM report_moderation "
+                "WHERE dialog_id = $1 AND pushed_at IS NOT NULL",
+                int(dialog_id),
+            )
+        if moderated is not None:
+            log.debug(
+                "partner_crm finalizer: диалог %s уже финализирован "
+                "модерацией (%s) — пропуск", dialog_id, moderated,
+            )
+            return
+
         # Приоритет: stored_reason из dialogs (точная причина закрытия).
         # Если NULL (оператор сам нажал терминальный пузырь) — берём
         # маппинг пузыря.

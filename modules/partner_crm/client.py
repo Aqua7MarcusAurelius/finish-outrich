@@ -150,3 +150,32 @@ class PartnerCrmClient:
             "POST", f"/api/l1/leads/{username}/status",
             json={"status": status},
         )
+
+    # ─── v2 API (docs/CRM_API_TOKEN_V2.md) ───────────────────────────
+
+    async def list_l2_managers(self) -> list[dict[str, Any]]:
+        """Активные L2-менеджеры партнёра: [{login, name}, ...].
+
+        Нужен чтобы проверить, что логин из `report_families.l2_login`
+        ещё жив — CRM отдаёт 400 `l2_not_found` на неактивного.
+        """
+        r = await self._request("GET", "/api/l1/l2-managers")
+        managers = r.get("managers") if isinstance(r, dict) else r
+        return list(managers or [])
+
+    async def assign_to_l2(self, username: str, l2_login: str) -> dict[str, Any]:
+        """Передать лида конкретному L2 (v2 §2.3).
+
+        ВАЖНО: эндпоинт сам переводит лида в `transferred` — отдельный
+        вызов `/status` не нужен и невозможен (менять статус лида,
+        уже попавшего в финал, CRM запрещает).
+
+        Ошибки CRM: 400 `l2_login_required` / `l2_not_found`,
+        404 `lead_not_found` — приходят как CrmHttpError.
+        """
+        if not l2_login:
+            raise InvalidStatus("assign_to_l2: пустой l2_login")
+        return await self._request(
+            "POST", f"/api/l1/leads/{username}/assign-l2",
+            json={"l2_login": l2_login},
+        )

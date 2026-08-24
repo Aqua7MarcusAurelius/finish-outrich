@@ -49,7 +49,19 @@ _DEFAULTS: dict[str, int] = {
     "autochat.idle_leave_sec":        180,
     "autochat.reply_timer_sec":       30,
     "autochat.openrouter_retries":    2,
-    "autochat.typing_ms_per_char":    40,
+    # Fix #24 (2026-08-02): было 40 мс/символ = 25 символов/сек — нереально
+    # быстро, лид видит что «печатает» доли секунды. Живой человек в
+    # мессенджере набирает 6–10 символов/сек → 110 мс/символ.
+    "autochat.typing_ms_per_char":    110,
+    # Fix #24: пауза МЕЖДУ сегментами одного ответа. Раньше была зашита
+    # константой rand(1.0, 3.0) — сегменты прилетали пачкой. Человек
+    # между сообщениями думает 3–8 сек.
+    "autochat.segment_gap_min_ms":    3000,
+    "autochat.segment_gap_max_ms":    8000,
+    # Fix #24: границы длительности «печатает». min — даже «ок» человек
+    # не отправит мгновенно; max — потолок для длинных сообщений.
+    "autochat.typing_min_ms":         1200,
+    "autochat.typing_max_ms":         15000,
 }
 
 
@@ -78,6 +90,11 @@ EV_INBOUND = "inbound"            # inbound message.saved
 EV_OUTBOUND = "outbound"          # наше исходящее (is_outgoing=True)
 EV_MEDIA_UPDATED = "media_updated"  # message.updated с dialog_id == наш
 EV_TYPING = "typing"              # dialog.typing_observed с user_id == наш
+
+# Fix #24 (2026-08-03): Telegram гасит typing-статус через ~6 секунд после
+# SetTypingRequest. Обновляем чаще, чтобы индикатор «печатает» горел
+# непрерывно всю сессию набора ответа (все сегменты + паузы между ними).
+_TYPING_REFRESH_SEC = 4.0
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -729,6 +746,30 @@ class AutoChatSession:
         except Exception:
             log.exception("autochat session %s: sender_loop crashed", self.id)
 
+    async def _sleep_keeping_typing(self, wrapper: Any, seconds: float) -> None:
+        """
+        Спать `seconds`, поддерживая индикатор «печатает» непрерывным.
+
+        Fix #24 (2026-08-03): Telegram гасит typing-статус сам примерно
+        через 6 секунд после `SetTypingRequest`. При длинных сегментах
+        (до 15с) и паузах между ними (до 8с) индикатор мигал бы —
+        собеседник видит «печатает… пропал… печатает». Обновляем
+        статус каждые `_TYPING_REFRESH_SEC`, чтобы он горел ровно.
+
+        Ошибки set_typing глушим: индикатор — косметика, из-за него
+        отправку ронять нельзя.
+        """
+        remaining = seconds
+        while remaining > 0:
+            chunk = min(_TYPING_REFRESH_SEC, remaining)
+            await asyncio.sleep(chunk)
+            remaining -= chunk
+            if remaining > 0:
+                try:
+                    await wrapper.set_typing(self.telegram_user_id)
+                except Exception:
+                    pass
+
     async def _send_segment(self, item: dict[str, Any]) -> None:
         text: str = item["text"]
         index: int = item["index"]
@@ -739,21 +780,34 @@ class AutoChatSession:
         if wrapper is None:
             raise RuntimeError("worker not running")
 
-        # Имитация печати
+        # Имитация печати (Fix #24: границы вынесены в settings, дефолты
+        # подняты — 110 мс/символ, min 1.2с, max 15с).
         ms_per_char = await _get_setting_int("autochat.typing_ms_per_char")
-        typing_sec = max(0.6, min(8.0, len(text) * ms_per_char / 1000 + random.uniform(0.3, 0.9)))
+        typing_min = await _get_setting_int("autochat.typing_min_ms") / 1000
+        typing_max = await _get_setting_int("autochat.typing_max_ms") / 1000
+        typing_sec = max(
+            typing_min,
+            min(typing_max, len(text) * ms_per_char / 1000 + random.uniform(0.3, 0.9)),
+        )
 
         try:
             await wrapper.set_typing(self.telegram_user_id)
         except Exception:
             log.debug("autochat session %s: set_typing failed (non-fatal)", self.id)
 
-        await asyncio.sleep(typing_sec)
+        await self._sleep_keeping_typing(wrapper, typing_sec)
 
-        try:
-            await wrapper.cancel_typing(self.telegram_user_id)
-        except Exception:
-            pass
+        # Fix #24: гасим индикатор ТОЛЬКО после последнего сегмента ответа.
+        # Между сегментами typing продолжает гореть (см. паузу ниже) —
+        # собеседник видит непрерывное «печатает» от начала ответа и до
+        # последнего сообщения, как будто человек набирает длинную мысль
+        # и шлёт её частями. Telegram сам гасит индикатор при доставке
+        # сообщения, поэтому явный cancel нужен только в конце.
+        if index >= total:
+            try:
+                await wrapper.cancel_typing(self.telegram_user_id)
+            except Exception:
+                pass
 
         # Отправка
         sent = await wrapper.send_message(self.telegram_user_id, text)
@@ -802,9 +856,23 @@ class AutoChatSession:
             },
         )
 
-        # Пауза между сегментами 1–3 сек (кроме последнего)
+        # Пауза между сегментами (кроме последнего). Fix #24: было
+        # rand(1.0, 3.0) константой — вместе с быстрой «печатью» сегменты
+        # прилетали пачкой. Теперь настраивается, дефолт 3–8 сек.
+        # Индикатор «печатает» держим живым всю паузу — ответ выглядит
+        # как одна непрерывная сессия набора.
         if index < total:
-            await asyncio.sleep(random.uniform(1.0, 3.0))
+            gap_min = await _get_setting_int("autochat.segment_gap_min_ms") / 1000
+            gap_max = await _get_setting_int("autochat.segment_gap_max_ms") / 1000
+            if gap_max < gap_min:
+                gap_max = gap_min
+            try:
+                await wrapper.set_typing(self.telegram_user_id)
+            except Exception:
+                pass
+            await self._sleep_keeping_typing(
+                wrapper, random.uniform(gap_min, gap_max),
+            )
 
         # Финиш по сигналу LLM — после отправки последнего сегмента.
         # Делаем в фоновой таске, чтобы sender_loop успел вернуться из

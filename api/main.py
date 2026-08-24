@@ -46,7 +46,7 @@ from modules.partner_crm.poller import PartnerCrmPoller
 from modules.partner_crm.routes import router as partner_crm_router
 from modules.partner_crm.service import PartnerCrmService
 from modules.peer_profile.service import PeerProfileService
-from modules.report_delivery.service import ReportDeliveryService
+from modules.report_bot.service import ReportBotService
 from modules.transcription.service import TranscriptionService
 from modules.worker_auto_runner.routes import router as auto_runner_router
 from modules.worker_auto_runner.service import WorkerAutoRunnerService
@@ -130,14 +130,12 @@ async def lifespan(app: FastAPI):
     report_consumer_task = asyncio.create_task(report_consumer.run())
     app.state.report_consumer_task = report_consumer_task
 
-    # ReportDeliveryService: на autochat.report_saved с folder=success
-    # сервис-аккаунт заливает HTML-отчёт в группу выгрузки воркера. Держит
-    # своё TG-подключение (не через WorkerManager). Если карта групп пуста
-    # или сервис-аккаунт не настроен/не авторизован — тихо выключается.
-    report_delivery_service = ReportDeliveryService()
-    app.state.report_delivery_service = report_delivery_service
-    report_delivery_task = asyncio.create_task(report_delivery_service.run())
-    app.state.report_delivery_task = report_delivery_task
+    # ReportDeliveryService отключён 2026-08-23 — его заменил
+    # ReportBotService (создаётся ниже, после partner_crm_service).
+    # Старый слал те же отчёты сервис-аккаунтом и пушил статус
+    # автоматически; вместе с ботом это дало бы дубль сообщения в группе
+    # и предрешённый статус мимо модератора. Код модуля оставлен для
+    # отката — вместе с REPORT_GROUP_MAP в .env.
 
     # SilenceWatcher: фоновый процесс переходов "Общение→Обрыв" по 4ч
     # тишины и "Первый контакт/Обрыв → Завершен провал" по 48ч.
@@ -165,6 +163,19 @@ async def lifespan(app: FastAPI):
     app.state.partner_crm_finalizer = partner_crm_finalizer
     partner_crm_finalizer_task = asyncio.create_task(partner_crm_finalizer.run())
     app.state.partner_crm_finalizer_task = partner_crm_finalizer_task
+
+    # ReportBot (2026-08-23): публикует отчёты по успешным диалогам в
+    # группы семейств С КНОПКАМИ модерации и откладывает пуш статуса в
+    # CRM на 4 часа после последнего нажатия. Работает в bot-режиме —
+    # inline-кнопки юзер-аккаунтам в MTProto недоступны, поэтому это не
+    # сервис-аккаунт, а отдельный бот. Создаётся после partner_crm_service,
+    # потому что через него финализирует лида (assign-l2 / status).
+    # Без REPORT_BOT_TOKEN тихо выключается: успехи копятся в пузыре
+    # «Модерация» и ждут, ничего не теряется.
+    report_bot_service = ReportBotService(partner_crm_service)
+    app.state.report_bot_service = report_bot_service
+    report_bot_task = asyncio.create_task(report_bot_service.run())
+    app.state.report_bot_task = report_bot_task
 
     # WorkerAutoRunner: per-account автомат старта диалогов по окну.
     # Создаётся ПОСЛЕ AutoChat, потому что зовёт его create_session.
@@ -250,13 +261,13 @@ async def lifespan(app: FastAPI):
             pass
 
         try:
-            await report_delivery_service.stop()
+            await report_bot_service.stop()
         except Exception:
-            log.exception("report_delivery_service stop error")
+            log.exception("report_bot_service stop error")
 
-        report_delivery_task.cancel()
+        report_bot_task.cancel()
         try:
-            await report_delivery_task
+            await report_bot_task
         except asyncio.CancelledError:
             pass
 

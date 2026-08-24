@@ -195,7 +195,8 @@ Telegram Automation Framework — система управления пулом
 | `peer_profile` | `service.py` | Ленивая дозагрузка профиля собеседника: фоновый consumer на каждый `dialog.created` дотягивает bio и день рождения через `GetFullUserRequest` (нужен `get_wrapper`). |
 | `lead_evaluator` | `service.py`, `routes.py`, `silence_watcher.py` | LLM-оценка закрытого диалога как лида (судья на `autochat.finished_by_llm`) + извлечение полей. `silence_watcher` — таймеры тишины: переходы «Общение → Обрыв» по 4 ч и «Первый контакт/Обрыв → Завершён провал» по 48 ч. |
 | `partner_crm` | `service.py`, `routes.py`, `poller.py`, `finalizer.py` | Интеграция с внешней CRM партнёра. `service` — httpx-клиент (keep-alive) + локальный пул лидов; `poller` докачивает пул из CRM по интервалу, если есть активные CRM-воркеры и пул просел ниже порога; `finalizer` слушает `dialog.status_changed` и при терминальном пузыре с `from_crm=TRUE` пушит финальный статус обратно в CRM. |
-| `report_delivery` | `service.py` | Доставка success-отчётов: на `autochat.report_saved` с `folder=success` сервис-аккаунт заливает HTML-отчёт в TG-группу выгрузки воркера. Держит собственное TG-подключение (не через WorkerManager); при пустой карте групп или ненастроенном сервис-аккаунте тихо выключается. |
+| `report_bot` | `service.py` | Модерация success-отчётов: на `autochat.report_saved` с `folder=success` **бот** (`REPORT_BOT_TOKEN`, Telethon в bot-режиме) заливает HTML-отчёт в TG-группу семейства с тремя inline-кнопками «Валид, беру / Валид, не беру / Невалид». Статус в CRM **не** ставится сразу: после первого нажатия запускается таймер 4 ч (перевыбор сдвигает его от последнего нажатия), затем сервис пушит выбранный статус, убирает кнопки и дописывает решение в текст. Карта семейство → `chat_id` + `l2_login` живёт в БД (`report_families`), состояние модерации — в `report_moderation`. Держит собственное TG-подключение; при пустом токене тихо выключается. |
+| `report_delivery` | `service.py` | **Отключён 2026-08-23** (заменён на `report_bot`). Код оставлен в репозитории, из `api/main.py` не создаётся. Старое поведение: сервис-аккаунт заливал HTML-отчёт в группу без кнопок, статус в CRM ставил `partner_crm/finalizer` автоматически. |
 | `ui_web` | `modules/ui_web/` | React + Vite фронтенд (дашборд) — статика веб-интерфейса (см. подраздел «Дашборд»). |
 
 > Новые модули добавляются без изменения существующих.
@@ -217,7 +218,7 @@ Telegram Automation Framework — система управления пулом
 - **peer-profile-fetcher** — `PeerProfileService` (модуль `peer_profile`): дотягивает bio/день рождения по `dialog.created`.
 - **lead-evaluator** — `LeadEvaluatorService` + `SilenceWatcher` (модуль `lead_evaluator`): LLM-судья закрытых диалогов и таймеры тишины (4 ч / 48 ч).
 - **partner-crm** — `PartnerCrmService` + `PartnerCrmPoller` (докачка пула лидов) + `PartnerCrmFinalizer` (финализация статуса в CRM).
-- **report-delivery** — `ReportDeliveryService` (модуль `report_delivery`): доставка success-отчётов сервис-аккаунтом в TG-группы.
+- **report-bot** — `ReportBotService` (модуль `report_bot`): доставка success-отчётов ботом в TG-группы с кнопками модерации и отложенным пушем статуса в CRM. Группа `report-delivery` осталась в Redis от предыдущей версии, консьюмера у неё больше нет.
 - **worker-auto-runner** — `WorkerAutoRunnerService` (модуль `worker_auto_runner`): per-account автозапуск диалогов по расписанию окна; на старте `reset_on_boot()` гасит только «мёртвые» сессии (истёкшие / без окна), затем `resume_running_loops()` подхватывает живые.
 
 Кроме того в `lifespan` создаются (без отдельной фоновой петли как consumer) `AuthService` и `WorkerManager`. Порядок остановки обратный порядку запуска зависимостей: сначала гасится `worker_auto_runner` (перестаёт звать `autochat.create_session`), затем `autochat`, `peer_profile` и остальные сервисы, и лишь потом закрываются `WorkerManager`, пулы БД и Redis.
@@ -317,7 +318,7 @@ Telegram Automation Framework — система управления пулом
 | **Воркер** | Изолированный процесс для одного Telegram-аккаунта. Запускается, останавливается и управляется независимо от остальных; падение одного воркера не влияет на другие. |
 | **Враппер (Telegram Wrapper)** | Часть внутри воркера (`modules/worker/wrapper.py`), отвечающая только за общение с Telegram. Получила событие — передала на шину; нужно отправить — отправила. Любое взаимодействие с Telegram идёт только через враппер. |
 | **Менеджер воркеров** | Модуль (`worker_manager`), который запускает, останавливает и удаляет воркеры без перезапуска всей системы. |
-| **Семейство воркера (family)** | Логическая группа воркеров. Определяется первым сегментом имени воркера формата `{СЕМЕЙСТВО}_{NN}_{СТРАНА}` (например, `KALAW_01_PL`, `AFERIST_01_RU` → семейства `KALAW`, `AFERIST`). Код семейства нормализуется к ВЕРХНЕМУ регистру (`worker_name.split("_", 1)[0].upper()`). Используется модулем `report_delivery` для маршрутизации: одна группа доставки на семейство (1:N), а не на отдельный воркер. |
+| **Семейство воркера (family)** | Логическая группа воркеров. Определяется первым сегментом имени воркера формата `{СЕМЕЙСТВО}_{NN}_{СТРАНА}` (например, `KALAW_01_PL`, `AFERIST_01_RU` → семейства `KALAW`, `AFERIST`). Код семейства нормализуется к ВЕРХНЕМУ регистру (`worker_name.split("_", 1)[0].upper()`). Используется модулем `report_bot` для маршрутизации: одна группа доставки на семейство (1:N), а не на отдельный воркер; там же к семейству привязан `l2_login` менеджера, которому лид назначается при выборе «Валид, беру». |
 | **Модуль** | Независимая часть системы, которая слушает шину и реагирует на нужные ей события. Модули знают только о шине, не друг о друге. В каждую таблицу пишет ровно один модуль. |
 | **Шина событий (Event Bus)** | Центральное место, через которое все компоненты общаются. Никто не говорит с другими напрямую — только через шину. Является основным логом системы: все ошибки идут туда. Шина — только для уведомлений, за данными модули идут в Postgres/MinIO/Telegram. См. раздел «Шина событий». |
 | **Паб/Саб (Pub/Sub)** | Принцип работы шины: один компонент публикует событие, все подписанные — получают его. |
@@ -372,7 +373,8 @@ Telegram Automation Framework — система управления пулом
 | **Лид-эвалюатор (оценщик лидов)** | Модуль (`lead_evaluator`), фоновый consumer шины: собирает сообщения диалога с системным промтом из `prompts/lead_evaluator_system.md`, получает вердикт от LLM, делает UPSERT в `lead_evaluations` (UNIQUE по `dialog_id`) и публикует `lead_evaluator.completed` / `lead_evaluator.parse_failed`. Вердикт `archive` означает «лид не подходит». |
 | **partner_crm** | Модуль интеграции с внешней CRM: сторожит пул лидов и пополняет его, выгружает результаты оценки. |
 | **Refill (пополнение пула)** | Процесс пополнения пула лидов из CRM. Когда размер пула опускается ниже `partner_crm.pool_low_threshold`, poller запрашивает партию `POST /api/l1/leads/request-new {count: partner_crm.refill_batch_size}` (дефолт `refill_batch_size = 50`) и публикует `partner_crm.pool_refilled {count_added}` либо `partner_crm.refill_failed` при ошибке. Возможен ручной триггер через UI. |
-| **report_delivery** | Модуль доставки отчётов: маршрутизирует отчёты по семейству воркера (см. «Семейство воркера»), одна группа доставки на семейство. |
+| **report_bot** | Модуль модерации отчётов: маршрутизирует отчёты по семейству воркера (см. «Семейство воркера»), одна группа на семейство, публикует их ботом с кнопками и пушит статус в CRM через 4 ч после решения модератора. |
+| **Модерация** | Промежуточный пузырь (`dialog_statuses`, `partner_terminal_status = NULL`), в который оценщик ставит успешный диалог. Означает «отчёт ушёл в группу, ждём решения модератора». Терминальный пузырь выставляет `report_bot` уже после пуша статуса в CRM. |
 
 ### 3.6. Внешние библиотеки и ошибки
 
@@ -477,7 +479,8 @@ tg-framework/
 │   │   ├── routes.py            ← API endpoints
 │   │   └── errors.py            ← ошибки интеграции
 │   │
-│   └── report_delivery/         ← доставка success-отчётов в Telegram-группы
+│   ├── report_bot/              ← модерация success-отчётов ботом (кнопки + отложенный пуш в CRM)
+│   └── report_delivery/         ← доставка success-отчётов в TG-группы (ОТКЛЮЧЁН, заменён на report_bot)
 │       └── service.py           ← маршрутизация отчётов по семейству воркера (1 группа на семейство)
 │
 ├── api/
@@ -538,7 +541,8 @@ tg-framework/
 | Профиль собеседника | `modules/peer_profile/service.py` |
 | Оценка лидов | `modules/lead_evaluator/service.py` |
 | Выгрузка лидов в CRM | `modules/partner_crm/service.py` |
-| Доставка success-отчётов в TG-группы | `modules/report_delivery/service.py` |
+| Модерация success-отчётов (кнопки + пуш в CRM) | `modules/report_bot/service.py` |
+| Доставка success-отчётов в TG-группы (отключено) | `modules/report_delivery/service.py` |
 | SSE-потоки для дашборда | `api/sse.py` |
 | Регистрация роутеров / точка входа | `api/main.py` |
 | Подключение к базе | `core/db.py` |
@@ -682,7 +686,8 @@ CRM_API_TOKEN=
 
 # Доставка success-отчётов в TG-группы (report_delivery)
 SERVICE_ACCOUNT_NAME=service  # имя сервис-аккаунта (accounts.name), скрыт из UI
-REPORT_GROUP_MAP=             # JSON {семейство_воркера: chat_id}, напр. {"SAD": -100...}; пусто = выключено
+REPORT_GROUP_MAP=             # DEPRECATED: карта переехала в таблицу report_families (миграция 0024)
+REPORT_BOT_TOKEN=             # токен бота модерации отчётов (@batyara7_bot); пусто = report_bot выключен
 ```
 
 Назначение ключей по группам:
@@ -697,7 +702,8 @@ REPORT_GROUP_MAP=             # JSON {семейство_воркера: chat_id
 | OpenRouter | `OPENROUTER_API_KEY`, `OPENROUTER_MODEL_TRANSCRIPTION/DESCRIPTION/DESCRIPTION_DOCUMENTS/AUTOCHAT/EVALUATOR` | ключ и модели для транскрибации (`gpt-4o-mini-transcribe` через `/api/v1/audio/transcriptions`), описания медиа (GPT-4o), описания документов (Gemini 2.5 Flash), автодиалогов и оценщика лидов |
 | Telegram API | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | общие креды для всех аккаунтов с my.telegram.org |
 | CRM коллеги | `CRM_BASE_URL`, `CRM_API_TOKEN` | адрес и токен партнёрской CRM (модуль `partner_crm` / `scripts/crm_probe.py`) |
-| report_delivery | `SERVICE_ACCOUNT_NAME`, `REPORT_GROUP_MAP` | сервис-аккаунт доставки отчётов (скрыт из UI) и карта семейство воркера → `chat_id` группы; пустая карта выключает доставку (см. раздел «report_delivery») |
+| report_bot | `REPORT_BOT_TOKEN` | токен бота, который публикует success-отчёты с кнопками модерации. Пустой токен выключает модуль. Карта семейство → `chat_id` + `l2_login` живёт в БД (`report_families`), не в `.env` |
+| report_delivery (отключён) | `SERVICE_ACCOUNT_NAME`, `REPORT_GROUP_MAP` | сервис-аккаунт (скрыт из UI) и старая карта групп. Модуль заменён на `report_bot`; ключи оставлены ради `SERVICE_ACCOUNT_NAME` — он всё ещё прячет служебный аккаунт из `GET /workers` |
 
 Ротация `API_TOKEN` — ручная, через `.env`.
 
@@ -1097,6 +1103,9 @@ Writer — history. При каждом редактировании новый 
 | Обрыв | NULL |
 | Завершен успешно | `ready_for_transfer` |
 | Завершен провал | `no_response` |
+| Модерация | NULL |
+
+Миграция `0024` добавила седьмой пузырь **«Модерация»** (промежуточный) — в него оценщик ставит успешный диалог вместо «Завершен успешно». Терминальный пузырь выставляет `report_bot` уже после того, как модератор нажал кнопку и статус ушёл в CRM.
 
 Сиды переписываются только если каталог пуст ИЛИ совпадает с дефолтом из 0009 — иначе оператор уже накастомил статусы руками, и DELETE снёс бы его работу. В таком случае новые терминальные пузыри добавляются вручную через UI.
 
@@ -1352,9 +1361,9 @@ HTML-выгрузка по сессии, завершённой штатным L
 | `lead-evaluator` | `EVALUATOR_GROUP` — `lead_evaluator/service.py` | Оценивает диалог через LLM, маппит verdict в terminal-статус / метку лида. |
 | `partner-crm-finalizer` | `FINALIZER_GROUP` — `partner_crm/finalizer.py` | Bus-consumer terminal-статуса: финализирует запись в Partner CRM. |
 | `auto-runner-worker` | `AUTO_RUNNER_GROUP` — `worker_auto_runner/service.py` | Слушает `worker.stopped`/`worker.crashed`, гасит соответствующий per-account автомат. Сами стартовые тики автомата — не через шину, а через локальный `asyncio.Task` со сном до `schedule[0]`. |
-| `report-delivery` | `GROUP` — `report_delivery/service.py` | На `autochat.report_saved` (folder=success) заливает HTML-отчёт в TG-группу по семейству воркера. |
+| `report-bot` | `GROUP` — `report_bot/service.py` | На `autochat.report_saved` (folder=success) заливает HTML-отчёт ботом в TG-группу семейства с кнопками модерации. Отдельно от шины крутит `events.CallbackQuery` handler (нажатия) и тикер раз в 60 с (отложенный пуш в CRM). |
 
-Имена групп подтверждены по константам в коде: `AUTOCHAT_GROUP = "autochat-worker"`, `REPORT_GROUP = "autochat-report-builder"`, `PEER_PROFILE_GROUP = "peer-profile-fetcher"`, `EVALUATOR_GROUP = "lead-evaluator"`, `FINALIZER_GROUP = "partner-crm-finalizer"`, `AUTO_RUNNER_GROUP = "auto-runner-worker"`, `GROUP = "report-delivery"` (в `report_delivery/service.py`).
+Имена групп подтверждены по константам в коде: `AUTOCHAT_GROUP = "autochat-worker"`, `REPORT_GROUP = "autochat-report-builder"`, `PEER_PROFILE_GROUP = "peer-profile-fetcher"`, `EVALUATOR_GROUP = "lead-evaluator"`, `FINALIZER_GROUP = "partner-crm-finalizer"`, `AUTO_RUNNER_GROUP = "auto-runner-worker"`, `GROUP = "report-bot"` (в `report_bot/service.py`).
 
 Consumer-группа подтверждает событие через `XACK` **только после успешной обработки**. Если обработчик упал, событие не ack'ается и прочитается заново в следующем проходе. Это защищает от потери событий при временных сбоях (БД подвисла, OpenRouter ответил 500) и обеспечивает повторную обработку до успеха.
 
@@ -1479,7 +1488,7 @@ data: {
 
 #### Выгрузка отчётов
 
-**`report.delivered` / `report.delivery_failed` / `report.delivery_skipped`** — выгрузка отчёта в TG-группу. Публикует модуль `report_delivery`. На `autochat.report_saved` с `folder=success` сервис-аккаунт заливает HTML-отчёт в группу выгрузки. Группа определяется по **семейству** воркера: `account_id` события → `accounts.name` → префикс до `_` (`SAD_03_RU → SAD`) → `chat_id` из `REPORT_GROUP_MAP`.
+**`report.delivered` / `report.delivery_failed` / `report.delivery_skipped`** — выгрузка отчёта в TG-группу. Публикует модуль `report_bot` (до 2026-08-23 — `report_delivery`; имена событий сохранены ради непрерывности статистики). На `autochat.report_saved` с `folder=success` бот заливает HTML-отчёт с кнопками модерации в группу выгрузки. Группа определяется по **семейству** воркера: `account_id` события → `accounts.name` → префикс до `_` (`SAD_03_RU → SAD`) → `chat_id` из таблицы `report_families`.
 
 | Событие | Когда | `data` |
 |---|---|---|
@@ -3855,7 +3864,7 @@ publish partner_crm.status_pushed | partner_crm.status_push_failed
 
 Источник правды для кода — `dialogs.partner_crm_terminal_reason` (что решили послать), а не `partner_terminal_status` пузыря; пузырь — fallback на случай ручного выставления оператором (тогда `stored_reason` пуст). После push `stored_reason` обнуляется — защита от повторной отправки. Push не блокирует ack: если CRM недоступна, ловится `PartnerCrmError`, событие ack-ается, на шину уходит `partner_crm.status_push_failed` (иначе consumer-group завис бы на одной группе событий при долгом сбое CRM).
 
-### Локальные статусы: 6 пузырей
+### Локальные статусы: 7 пузырей
 
 Терминальность пузыря определяется заполненным `partner_terminal_status`; такой пузырь триггерит финализацию (push в CRM). Каталог `dialog_statuses` сидится миграцией:
 
@@ -3867,6 +3876,7 @@ publish partner_crm.status_pushed | partner_crm.status_push_failed
 | Обрыв | amber | NULL | промежуточный (тишина после ответа) |
 | Завершен успешно | green | `ready_for_transfer` | терминальный |
 | Завершен провал | red | `no_response` | терминальный |
+| Модерация | violet | NULL | промежуточный (ждём решения в TG-группе) |
 
 Оператор может вручную выставить любой пузырь: терминальные триггерят push в CRM, промежуточные — нет.
 
@@ -3956,12 +3966,12 @@ LLM возвращает теги по аналогии с `<msg>`/`<finishdialo
      verdict=success → 'ready_for_transfer'
      verdict=archive → 'no_response'
 7. dialog_statuses.set_dialog_status — терминальный пузырь:
-     success → "Завершен успешно"
+     success → "Модерация"   (терминальный пузырь ставит report_bot после пуша)
      archive → "Завершен провал"
 8. publish lead_evaluator.completed  (или .parse_failed при битом парсинге)
 ```
 
-`set_dialog_status` публикует `dialog.status_changed` внутри себя — это и есть сигнал финализатору `partner_crm` запушить статус в CRM. `partner_crm_terminal_reason` пишет именно `lead_evaluator` (там принимается решение «что хотим послать»), а читает `partner_crm` в момент push — один писатель. Маппинг вердикта в пузырь — лукапом по лейблу (`"Завершен успешно"`/`"Завершен провал"`); при переименовании терминального пузыря оператором привязка теряется, пишется warning.
+`set_dialog_status` публикует `dialog.status_changed` внутри себя — это и есть сигнал финализатору `partner_crm` запушить статус в CRM. `partner_crm_terminal_reason` пишет именно `lead_evaluator` (там принимается решение «что хотим послать»), а читает `partner_crm` в момент push — один писатель. Маппинг вердикта в пузырь — лукапом по лейблу (`"Модерация"`/`"Завершен провал"`); при переименовании терминального пузыря оператором привязка теряется, пишется warning.
 
 #### Эндпоинты `/lead-evaluator/*`
 
@@ -4043,7 +4053,7 @@ PartnerCrmService.claim_lead_for_account  (FOR UPDATE SKIP LOCKED + DELETE)  →
    "Первый контакт" → (лид ответил) → "Общение" → (4ч тишины) → "Обрыв" ⇄ "Общение"
    таймеры: Первый контакт/Обрыв + 48ч → "Завершен провал" (no_response)
    <finishdialog/> от LLM → lead_evaluator:
-        verdict=success → "Завершен успешно" (ready_for_transfer)
+        verdict=success → "Модерация" (terminal_reason=NULL, статус пушит report_bot)
         verdict=archive → "Завершен провал" (no_response)
         парсинг сломан после ретрая → "Завершен провал" (no_response), отчёт в archive/
         ▼ терминальный пузырь → dialog.status_changed
@@ -5967,3 +5977,16 @@ WHERE a.lead_source = 'partner_crm' AND war.is_running = TRUE
   *Проблема:* оператор указал что 2ч cooldown для PEER_FLOOD (Fix #5/#10 default) слишком консервативен. Данные подтверждают: за неделю (5-11 июля) из 106 flood-стопов **все 100% были PEER_FLOOD без секунд от TG** (0 настоящих FloodWait с явными секундами). @SpamBot `/start` на Premium (все наши воркеры) реально снимает PEER_FLOOD — оператор подтвердил личной практикой. Значит cooldown нужен не «дать флагу самоочиститься», а «дать боту прожевать снятие» — это минуты, не часы.
   *Фикс:* константа `FLOOD_COOLDOWN_HOURS = 2` заменена на `FLOOD_COOLDOWN_BASE_SEC = 15 * 60`. `_trigger_flood_recovery` теперь для PEER_FLOOD (без seconds) считает `cooldown = 15 мин + rand(10-20 мин) = 25-35 мин`. Для FloodWait с явными секундами N: `cooldown = N + rand(10-20 мин)` как и было.
   *Тесты:* `test_flood_recovery.py::test_constants_sanity` обновлён под новую константу. Все 8 сьютов (58/58) продолжают PASS. Затронуто: `modules/worker_auto_runner/service.py` (константа + один docstring + один call site в `_trigger_flood_recovery`), `tests/smoke/test_flood_recovery.py`.
+- **2026-08-23/24 — Модерация success-отчётов в TG-группе: кнопки вместо автоматического статуса (модуль `report_bot`).**
+  *Проблема:* успешный диалог автоматически получал терминальный пузырь «Завершен успешно», финализатор `partner_crm` немедленно пушил `ready_for_transfer` в CRM, и только потом отчёт падал в группу. Оператор видел результат постфактум и не мог повлиять: отсеять невалид, забрать лида себе или отдать дальше. Решение о судьбе лида принимал код, человек — нет.
+  *Фикс:* success-ветка развёрнута в модерацию с человеком в контуре.
+  1. **Новый модуль `modules/report_bot/`** (`ReportBotService`, consumer group `report-bot`). Держит собственный Telethon-клиент **в bot-режиме** (`start(bot_token=...)`) — inline-кнопки в MTProto может слать только бот, user-аккаунт получает `ReplyInlineMarkup` запрещённым. Три параллельные задачи: консьюмер шины (`autochat.report_saved`/`folder=success`), handler `events.CallbackQuery` (нажатия) и тикер раз в 60 с (отложенный пуш). Новых зависимостей не потребовалось — Telethon 1.36 покрывает всё.
+  2. **Кнопки и таймер.** Отчёт уходит в группу семейства с тремя кнопками: `Валид, беру` / `Валид, не беру` / `Невалид` (`callback_data = m:<choice>:<dialog_id>`). При нажатии рядом с выбранным лейблом появляется ✅, статус в CRM **не** идёт. Таймер `MODERATION_DELAY_SEC = 4 ч` стартует **с первого нажатия** — до него сообщение висит без срока сколько угодно. Перевыбор разрешён, отсчёт всегда от последнего нажатия. Нажать может **любой участник группы**. По истечении срока тикер пушит статус, снимает кнопки и дописывает в текст «📤 Передано в CRM со статусом: {лейбл}» + кто решил.
+  3. **Маппинг решения в CRM** (`PartnerCrmService.push_lead_moderated`): `Валид, беру` → `POST /assign-l2` на `l2_login` семейства (эндпоинт сам переводит лида в `transferred`), при отсутствии логина или ошибке HTTP — деградация в `ready_for_transfer`; `Валид, не беру` → `ready_for_transfer` без назначения; `Невалид` → `invalid` + добавление в блэклист. Назначаем на L2 **того семейства, чья группа**, а не того, кто нажал.
+  4. **Новый пузырь «Модерация»** (промежуточный, `partner_terminal_status = NULL`). Оценщик на `verdict=success` теперь ставит его и **не** пишет `partner_crm_terminal_reason` — то есть финализатор молчит. Терминальный пузырь («Завершен успешно» для обоих валидных исходов, «Невалид» для невалида) выставляет сам `report_bot` уже **после** успешного пуша.
+  5. **Защита от двойного пуша.** Когда бот ставит терминальный пузырь, `dialog.status_changed` прилетает финализатору — без защиты тот отправил бы партнёру второй статус, затерев решение модератора (`transferred` → `ready_for_transfer`). `PartnerCrmFinalizer._handle` теперь проверяет `report_moderation.pushed_at IS NOT NULL` и молча выходит.
+  6. **Состояние — в БД, не в памяти** (миграция `0024_report_moderation.py`): `report_families` (семейство → `chat_id` + `l2_login`, засеяно 13 семейств, 8 с логинами: sad, joker, Pipito, Kalaw, Afferist, Face, Extaz, Yasya) и `report_moderation` (выбор, кто и когда нажал, `push_after`, `pushed_at`, `pushed_status`, `push_error`; CHECK на три значения `choice`). Перезапуск приложения не теряет и не дублирует отложенные пуши. Дедуп отправки — Redis-ключ `report_moderation_sent:{dialog_id}` (событие может обогнать появление строки в БД).
+  7. **`report_delivery` отключён** — из `api/main.py` больше не создаётся, код оставлен в репозитории. `REPORT_GROUP_MAP` помечен deprecated (карта переехала в `report_families`), `SERVICE_ACCOUNT_NAME` продолжает прятать служебный аккаунт из `GET /workers`. Имена событий `report.delivered` / `report.delivery_failed` / `report.delivery_skipped` сохранены — статистика по группам осталась непрерывной.
+  *Тесты:* `tests/smoke/test_report_moderation.py` — 10 кейсов: три ветки маппинга в CRM, деградация `take` без `l2_login`, таймер не стартует без нажатия, нажатие ставит +4 ч, перевыбор сдвигает срок, после пуша выбор не меняется, «Модерация» не терминальна, оценщик ставит именно её, финализатор видит отметку модерации, карта семейств читается из БД. Все PASS; общий прогон — 16/17 сьютов (падение `test_resilient_worker` предсуществующее, к этой правке отношения не имеет).
+  *Проверено вживую:* бот `@batyara7_bot` (id `8999124533`) видит все 13 групп; вброс события по диалогу 226319 (SAD_05_RU / @Natalimurrrr) → отчёт с HTML-файлом, подписью и тремя кнопками доставлен в группу SAD, `push_after = NULL` (таймер корректно ждёт первого нажатия).
+  Затронуто: `modules/report_bot/` (новый), `modules/partner_crm/client.py` (+`assign_to_l2`, +`get_l2_managers`), `modules/partner_crm/service.py` (+`push_lead_moderated`), `modules/partner_crm/finalizer.py` (guard на модерацию), `modules/lead_evaluator/service.py` (success → «Модерация», без terminal_reason), `api/main.py` (`ReportDeliveryService` → `ReportBotService`), `core/config.py` (+`REPORT_BOT_TOKEN`), `alembic/versions/0024_report_moderation.py` (новая), `tests/smoke/test_report_moderation.py` (новый).

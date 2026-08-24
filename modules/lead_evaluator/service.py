@@ -47,15 +47,26 @@ DEFAULT_PARSE_RETRIES = 1
 
 # ─── маппинг verdict → terminal_reason / label ──────────────────────────
 
-# Локальные пузыри из миграции 0012:
+# Локальные пузыри из миграции 0012 + «Модерация» из 0024.
+#
+# 2026-08-23: успех больше НЕ закрывается автоматически. Оценщик ставит
+# «Модерация» — не терминальный пузырь, поэтому partner_crm/finalizer его
+# игнорирует и партнёр продолжает видеть лида как in_progress. Решение
+# принимает человек кнопкой под отчётом в TG-группе, и уже modules/
+# report_bot пушит статус и переводит пузырь в «Завершен успешно».
+# Провал (archive) закрывается как раньше — модерировать нечего.
 _LABEL_BY_VERDICT = {
-    "success": "Завершен успешно",
+    "success": "Модерация",
     "archive": "Завершен провал",
 }
 
 # В terminal_reason пишем то, что partner_crm потом отправит в CRM.
 _TERMINAL_REASON_BY_VERDICT = {
-    "success": "ready_for_transfer",
+    # success → None: конкретный статус (`transferred` при «беру»,
+    # `ready_for_transfer` при «не беру», `invalid` при «Невалид»)
+    # выберет модератор. Записать сюда что-либо заранее нельзя — это
+    # предрешило бы исход, а поменять статус после финала CRM не даёт.
+    "success": None,
     # archive у оценщика = "лид не подходит". По договорённости в CRM
     # шлём no_response (см. 10.0). Если позже партнёр добавит archive
     # как отдельный статус — поменяем здесь.
@@ -392,6 +403,7 @@ class LeadEvaluatorService:
 
             # Записать причину для будущего push в CRM (всегда — это
             # owned by lead_evaluator, не нарушает 1-writer principle).
+            # При success тут NULL: статус выберет модератор кнопкой.
             terminal_reason = _TERMINAL_REASON_BY_VERDICT[result.verdict or "archive"]
             await conn.execute(
                 """
@@ -401,9 +413,11 @@ class LeadEvaluatorService:
                 dialog_id, terminal_reason,
             )
 
-        # Проставить терминальный пузырь через dialog_statuses
-        # (тот опубликует dialog.status_changed; partner_crm в 10.8
-        # подхватит и пушнёт финальный статус в CRM).
+        # Проставить пузырь через dialog_statuses (тот опубликует
+        # dialog.status_changed). При archive пузырь терминальный и
+        # partner_crm/finalizer сразу пушнёт статус в CRM; при success —
+        # это «Модерация», финалайзер её пропустит, а решение примет
+        # человек кнопкой в TG-группе (modules/report_bot).
         label = _LABEL_BY_VERDICT[result.verdict or "archive"]
         status_card = await _find_status_by_label(label)
         if status_card is not None:

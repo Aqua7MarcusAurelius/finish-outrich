@@ -474,6 +474,79 @@ class PartnerCrmService:
                     username, f"pushed_invalid_via_finalize",
                 )
 
+    async def push_lead_moderated(
+        self,
+        *,
+        account_id: int | None,
+        username: str,
+        choice: str,
+        l2_login: str | None,
+    ) -> str:
+        """
+        Финализировать лида по решению модератора из TG-группы.
+
+        Три исхода (кнопки под отчётом):
+          * `take`    — «Валид, беру»: `assign-l2` на L2 семейства.
+                        CRM сама переведёт лида в `transferred`.
+                        Если `l2_login` пуст или CRM его не знает —
+                        деградируем до `ready_for_transfer`, чтобы
+                        успех не потерялся из-за настройки.
+          * `no_take` — «Валид, не беру»: `ready_for_transfer`.
+          * `invalid` — «Невалид»: `invalid` + запись в blacklist.
+
+        Возвращает фактический статус в CRM (`transferred` /
+        `ready_for_transfer` / `invalid`) — он попадёт в подпись
+        сообщения и в `report_moderation.pushed_status`.
+
+        Исключения PartnerCrmError пробрасываются: тикер оставит
+        строку неотправленной и повторит на следующем круге.
+        """
+        if choice == "take" and l2_login:
+            try:
+                await self._client.assign_to_l2(username, l2_login)
+            except CrmHttpError as e:
+                # l2_not_found / логин отозвали — не теряем успех,
+                # отдаём партнёру как готового к передаче.
+                log.warning(
+                    "partner_crm: assign-l2 %s→%s не прошёл (%s), "
+                    "деградирую до ready_for_transfer",
+                    username, l2_login, e,
+                )
+                await self.push_lead_finalized(
+                    account_id=account_id,
+                    username=username,
+                    terminal_status="ready_for_transfer",
+                )
+                return "ready_for_transfer"
+
+            await bus.publish(
+                module=Module.PARTNER_CRM,
+                type=EventType.PARTNER_CRM_STATUS_PUSHED,
+                status=Status.SUCCESS,
+                account_id=account_id,
+                data={
+                    "username": username,
+                    "status": "transferred",
+                    "l2_login": l2_login,
+                    "via": "moderation",
+                },
+            )
+            # Лид ушёл в воронку L2 — в нашем пуле ему делать нечего.
+            pool_db = db.get_pool()
+            async with pool_db.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM crm_lead_pool WHERE username = $1", username,
+                )
+            return "transferred"
+
+        terminal = "invalid" if choice == "invalid" else "ready_for_transfer"
+        await self.push_lead_finalized(
+            account_id=account_id,
+            username=username,
+            terminal_status=terminal,
+        )
+        return terminal
+
     # ─── Внутреннее ──────────────────────────────────────────────────
 
     async def _publish_failed(
