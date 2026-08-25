@@ -420,7 +420,7 @@ async def test_new_choice_resets_attempts() -> bool:
                 (dialog_id, username, account_id, family, chat_id,
                  message_id, choice, push_after, push_attempts, push_error)
             VALUES ($1, $2, 1, 'SAD', -1, 1, 'no_take',
-                    NOW() - INTERVAL '1 minute', 6, 'CRM responded 403')
+                    NOW() - INTERVAL '1 minute', 99, 'CRM responded 403')
             """,
             TEST_DIALOG_ID, TEST_USERNAME,
         )
