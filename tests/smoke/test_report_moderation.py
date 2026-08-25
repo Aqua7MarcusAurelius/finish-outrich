@@ -346,6 +346,112 @@ async def test_families_map_loaded() -> bool:
     return True
 
 
+async def test_push_error_backs_off_and_gives_up() -> bool:
+    """Ошибка CRM: попытки растут, срок сдвигается, после лимита — стоп.
+
+    Регресс, ради которого это написано: раньше неудачный пуш оставлял
+    строку «просроченной» навсегда, и тикер долбил партнёрский API раз
+    в минуту бесконечно (реально поймано на 403 по лиду, уже
+    финализированному партнёром).
+    """
+    from modules.report_bot.service import MAX_PUSH_ATTEMPTS
+
+    pool = db.get_pool()
+    async with pool.acquire() as conn:
+        await _cleanup(conn)
+        await conn.execute(
+            """
+            INSERT INTO report_moderation
+                (dialog_id, username, account_id, family, chat_id,
+                 message_id, choice, push_after, push_attempts)
+            VALUES ($1, $2, 1, 'SAD', -1, 1, 'no_take',
+                    NOW() - INTERVAL '1 minute', 0)
+            """,
+            TEST_DIALOG_ID, TEST_USERNAME,
+        )
+
+        # Строка должна быть в выборке тикера, пока попыток мало.
+        due = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM report_moderation
+            WHERE dialog_id = $1 AND pushed_at IS NULL
+              AND push_after IS NOT NULL AND push_after <= NOW()
+              AND push_attempts < $2
+            """,
+            TEST_DIALOG_ID, MAX_PUSH_ATTEMPTS,
+        )
+        if due != 1:
+            print(f"  FAIL: свежая строка не попала в выборку (due={due})")
+            await _cleanup(conn)
+            return False
+
+        # Имитируем исчерпанные попытки — строка обязана выпасть.
+        await conn.execute(
+            "UPDATE report_moderation SET push_attempts = $2 "
+            "WHERE dialog_id = $1",
+            TEST_DIALOG_ID, MAX_PUSH_ATTEMPTS,
+        )
+        due_after = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM report_moderation
+            WHERE dialog_id = $1 AND pushed_at IS NULL
+              AND push_after IS NOT NULL AND push_after <= NOW()
+              AND push_attempts < $2
+            """,
+            TEST_DIALOG_ID, MAX_PUSH_ATTEMPTS,
+        )
+        await _cleanup(conn)
+
+    if due_after != 0:
+        print(f"  FAIL: после {MAX_PUSH_ATTEMPTS} попыток строка всё ещё "
+              f"в выборке (due={due_after}) — это и есть вечный ретрай")
+        return False
+    return True
+
+
+async def test_new_choice_resets_attempts() -> bool:
+    """Новое нажатие обнуляет счётчик — застрявший лид можно перезапустить."""
+    pool = db.get_pool()
+    async with pool.acquire() as conn:
+        await _cleanup(conn)
+        await conn.execute(
+            """
+            INSERT INTO report_moderation
+                (dialog_id, username, account_id, family, chat_id,
+                 message_id, choice, push_after, push_attempts, push_error)
+            VALUES ($1, $2, 1, 'SAD', -1, 1, 'no_take',
+                    NOW() - INTERVAL '1 minute', 6, 'CRM responded 403')
+            """,
+            TEST_DIALOG_ID, TEST_USERNAME,
+        )
+        # Ровно тот UPDATE, что делает _on_callback при нажатии.
+        await conn.execute(
+            """
+            UPDATE report_moderation
+            SET choice = 'take', chosen_by = 1, chosen_by_name = 'tester',
+                chosen_at = NOW(), push_after = NOW() + INTERVAL '4 hours',
+                push_attempts = 0, push_error = NULL
+            WHERE dialog_id = $1 AND pushed_at IS NULL
+            """,
+            TEST_DIALOG_ID,
+        )
+        row = await conn.fetchrow(
+            "SELECT push_attempts, push_error, choice FROM report_moderation "
+            "WHERE dialog_id = $1",
+            TEST_DIALOG_ID,
+        )
+        await _cleanup(conn)
+
+    if row["push_attempts"] != 0 or row["push_error"] is not None:
+        print(f"  FAIL: счётчик не сброшен (attempts={row['push_attempts']}, "
+              f"error={row['push_error']!r})")
+        return False
+    if row["choice"] != "take":
+        print(f"  FAIL: выбор не перезаписан ({row['choice']})")
+        return False
+    return True
+
+
 async def _run_all() -> int:
     await db.init_pool()
     try:
@@ -360,6 +466,8 @@ async def _run_all() -> int:
             ("оценщик: success → Модерация", await test_evaluator_success_maps_to_moderation()),
             ("finalizer видит отметку модерации", await test_finalizer_skips_moderated()),
             ("карта семейств в БД", await test_families_map_loaded()),
+            ("ошибка CRM: backoff и отказ после лимита", await test_push_error_backs_off_and_gives_up()),
+            ("новое нажатие сбрасывает счётчик", await test_new_choice_resets_attempts()),
         ]
     finally:
         await db.close_pool()

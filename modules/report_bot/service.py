@@ -63,6 +63,13 @@ MODERATION_DELAY_SEC = 4 * 3600
 # точностью (±60с на 4-часовом окне незаметно) и нагрузкой на БД.
 TICKER_INTERVAL_SEC = 60
 
+#: Сколько раз пробуем пушить статус, если CRM отвечает ошибкой. Исчерпав
+#: лимит, строка выпадает из выборки тикера — иначе постоянный отказ
+#: (403 на лиде, уже финализированном партнёром) крутится вечно раз в минуту.
+MAX_PUSH_ATTEMPTS = 6
+#: Пауза перед N-й повторной попыткой: 5 мин, 15, 45, 2 ч, 4 ч (потолок).
+_PUSH_BACKOFF_SEC = (5 * 60, 15 * 60, 45 * 60, 2 * 3600, 4 * 3600)
+
 # Карту семейств перечитываем на лету: новое семейство добавляется
 # INSERT'ом в report_families и подхватывается без рестарта app
 # (в .env-эпоху это стоило нам двух пересборок — EKSTAZ и ALADIN).
@@ -450,7 +457,9 @@ class ReportBotService:
                     chosen_by      = $3,
                     chosen_by_name = $4,
                     chosen_at      = NOW(),
-                    push_after     = $5
+                    push_after     = $5,
+                    push_attempts  = 0,
+                    push_error     = NULL
                 WHERE dialog_id = $1
                   AND pushed_at IS NULL
                 RETURNING dialog_id
@@ -511,14 +520,17 @@ class ReportBotService:
             due = await conn.fetch(
                 """
                 SELECT dialog_id, username, account_id, family,
-                       chat_id, message_id, choice, chosen_by_name
+                       chat_id, message_id, choice, chosen_by_name,
+                       push_attempts
                 FROM report_moderation
                 WHERE pushed_at IS NULL
                   AND push_after IS NOT NULL
                   AND push_after <= NOW()
+                  AND push_attempts < $1
                 ORDER BY push_after
                 LIMIT 50
                 """,
+                MAX_PUSH_ATTEMPTS,
             )
         if not due:
             return
@@ -549,19 +561,40 @@ class ReportBotService:
                 l2_login=l2_login,
             )
         except PartnerCrmError as e:
-            # CRM недоступна/ответила ошибкой — оставляем строку
-            # неотправленной, следующий круг тикера повторит.
+            # CRM недоступна/ответила ошибкой. Строку не закрываем, но
+            # следующую попытку отодвигаем — и после MAX_PUSH_ATTEMPTS
+            # перестаём брать её в выборку совсем (см. _push_due).
+            attempts = int(r.get("push_attempts") or 0) + 1
+            idx = min(attempts - 1, len(_PUSH_BACKOFF_SEC) - 1)
+            next_at = _now() + timedelta(seconds=_PUSH_BACKOFF_SEC[idx])
+            gave_up = attempts >= MAX_PUSH_ATTEMPTS
+
             pool = db.get_pool()
             async with pool.acquire() as conn:
                 await conn.execute(
-                    "UPDATE report_moderation SET push_error = $2 "
-                    "WHERE dialog_id = $1",
-                    dialog_id, str(e)[:300],
+                    """
+                    UPDATE report_moderation
+                    SET push_error    = $2,
+                        push_attempts = $3,
+                        push_after    = $4
+                    WHERE dialog_id = $1
+                    """,
+                    dialog_id, str(e)[:300], attempts, next_at,
                 )
-            log.warning(
-                "report_bot: пуш диалога %s не прошёл (%s) — повторим",
-                dialog_id, e,
-            )
+
+            if gave_up:
+                log.error(
+                    "report_bot: пуш диалога %s не прошёл %d раз (%s) — "
+                    "сдаёмся, нужен оператор", dialog_id, attempts, e,
+                )
+                await self._warn_push_failed(r, str(e), attempts)
+            else:
+                log.warning(
+                    "report_bot: пуш диалога %s не прошёл (%s), попытка %d/%d, "
+                    "следующая через %dс",
+                    dialog_id, e, attempts, MAX_PUSH_ATTEMPTS,
+                    _PUSH_BACKOFF_SEC[idx],
+                )
             return
 
         pool = db.get_pool()
@@ -571,7 +604,8 @@ class ReportBotService:
                 UPDATE report_moderation
                 SET pushed_at     = NOW(),
                     pushed_status = $2,
-                    push_error    = NULL
+                    push_error    = NULL,
+                    push_attempts = 0
                 WHERE dialog_id = $1
                 """,
                 dialog_id, pushed_status,
@@ -588,6 +622,35 @@ class ReportBotService:
             "report_bot: диалог %s финализирован (%s → CRM %s)",
             dialog_id, choice, pushed_status,
         )
+
+    async def _warn_push_failed(
+        self, r: dict[str, Any], err: str, attempts: int,
+    ) -> None:
+        """Сказать в группу, что статус так и не ушёл в CRM.
+
+        Кнопки НЕ снимаем и пузырь не трогаем: диалог остаётся в
+        «Модерации», нажатие обнулит счётчик и запустит цикл заново.
+        Отвечаем на исходное сообщение, чтобы предупреждение не потерялось.
+        """
+        if self._client is None:
+            return
+        choice_label = CHOICES.get(r.get("choice") or "", "?")
+        text = (
+            f"⚠️ Не удалось передать в CRM статус «{choice_label}» "
+            f"после {attempts} попыток.\n"
+            f"Ошибка: {err[:200]}\n"
+            f"Диалог остаётся в модерации — нажмите кнопку ещё раз, "
+            f"чтобы повторить."
+        )
+        try:
+            await self._client.send_message(
+                int(r["chat_id"]), text, reply_to=int(r["message_id"]),
+            )
+        except Exception:
+            log.warning(
+                "report_bot: не удалось отправить предупреждение по диалогу %s",
+                r.get("dialog_id"), exc_info=True,
+            )
 
     async def _seal_message(self, r: dict[str, Any], pushed_status: str) -> None:
         """Убрать кнопки и дописать итог в подпись."""
