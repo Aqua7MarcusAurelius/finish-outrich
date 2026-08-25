@@ -40,14 +40,17 @@ async def _is_terminal_status(status_id: int | None) -> bool:
         return False
     pool = db.get_pool()
     async with pool.acquire() as conn:
-        terminal = await conn.fetchval(
+        closes = await conn.fetchval(
             """
-            SELECT partner_terminal_status
+            SELECT closes_dialog
             FROM dialog_statuses WHERE id = $1
             """,
             int(status_id),
         )
-    return terminal is not None
+    # closes_dialog, а НЕ partner_terminal_status: «Модерация» закрывает
+    # диалог (отчёт пора строить), но кода для CRM у неё нет — статус
+    # туда отправит модератор кнопкой. См. миграцию 0026.
+    return bool(closes)
 
 
 class ReportConsumer:

@@ -452,6 +452,59 @@ async def test_new_choice_resets_attempts() -> bool:
     return True
 
 
+async def test_moderation_closes_dialog_for_report_builder() -> bool:
+    """«Модерация» закрывает диалог → отчёт строится и уходит в группу.
+
+    Регресс, ради которого написано: построитель отчётов решал «пора ли
+    строить» по `partner_terminal_status IS NOT NULL`. Когда 0024 сделала
+    «Модерацию» промежуточной для CRM, успешные диалоги перестали попадать
+    в отчёты вообще — а значит и в TG-группы. 0026 развела два понятия:
+    `closes_dialog` (диалог доведён до конца) и `partner_terminal_status`
+    (что слать партнёру).
+    """
+    from modules.autochat.report_consumer import _is_terminal_status
+
+    pool = db.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, label, closes_dialog, partner_terminal_status "
+            "FROM dialog_statuses"
+        )
+    by_label = {r["label"]: r for r in rows}
+
+    mod = by_label.get("Модерация")
+    if mod is None:
+        print("  FAIL: пузыря «Модерация» нет")
+        return False
+    if not mod["closes_dialog"]:
+        print("  FAIL: «Модерация» не закрывает диалог — отчёт не построится")
+        return False
+    if mod["partner_terminal_status"] is not None:
+        print("  FAIL: у «Модерации» появился код CRM — finalizer запушит "
+              "статус в обход модератора")
+        return False
+
+    # Построитель обязан согласиться, что по этому пузырю пора строить отчёт.
+    if not await _is_terminal_status(mod["id"]):
+        print("  FAIL: построитель отчётов не считает «Модерацию» закрывающей")
+        return False
+
+    # Промежуточные пузыри отчёт триггерить не должны.
+    for label in ("Первый контакт", "Общение", "Обрыв"):
+        r = by_label.get(label)
+        if r is not None and await _is_terminal_status(r["id"]):
+            print(f"  FAIL: промежуточный «{label}» триггерит построение отчёта")
+            return False
+
+    # А все терминальные для CRM — обязаны закрывать диалог.
+    for r in rows:
+        if r["partner_terminal_status"] is not None and not r["closes_dialog"]:
+            print(f"  FAIL: «{r['label']}» шлёт статус в CRM, но не закрывает "
+                  f"диалог — отчёта не будет")
+            return False
+    return True
+
+
 async def _run_all() -> int:
     await db.init_pool()
     try:
@@ -468,6 +521,7 @@ async def _run_all() -> int:
             ("карта семейств в БД", await test_families_map_loaded()),
             ("ошибка CRM: backoff и отказ после лимита", await test_push_error_backs_off_and_gives_up()),
             ("новое нажатие сбрасывает счётчик", await test_new_choice_resets_attempts()),
+            ("«Модерация» закрывает диалог (отчёт строится)", await test_moderation_closes_dialog_for_report_builder()),
         ]
     finally:
         await db.close_pool()
