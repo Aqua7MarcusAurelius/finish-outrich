@@ -35,6 +35,7 @@ Owns: `report_moderation` (INSERT/UPDATE). Читает: `report_families`,
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -332,11 +333,18 @@ class ReportBotService:
                 minio_key, bucket=settings.MINIO_REPORTS_BUCKET,
             )
             caption = await self._build_caption(dialog_id, worker_name)
+            # Telethon берёт имя вложения из `.name` потока — параметра
+            # file_name у send_file нет (1.36), он молча уходил в kwargs,
+            # и отчёт приезжал в группу как «unnamed» без расширения.
+            # force_document=True — иначе Telegram пытается отрисовать HTML
+            # как медиа вместо того чтобы отдать файлом.
+            buf = io.BytesIO(blob)
+            buf.name = minio_key.rsplit("/", 1)[-1]
             sent = await self._client.send_file(   # type: ignore[union-attr]
                 fam["chat_id"],
-                blob,
-                file_name=minio_key.rsplit("/", 1)[-1],
+                buf,
                 caption=caption,
+                force_document=True,
                 buttons=self._buttons(dialog_id, chosen=None),
             )
         except Exception as e:
