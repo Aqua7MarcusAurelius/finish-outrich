@@ -179,3 +179,28 @@ class PartnerCrmClient:
             "POST", f"/api/l1/leads/{username}/assign-l2",
             json={"l2_login": l2_login},
         )
+
+    async def get_lead_card(self, username: str) -> dict[str, Any]:
+        """Карточка любого лида через bot-поверхность (скоуп `leads:all`).
+
+        Нужна, чтобы понять, почему `/api/l1/.../status` ответил 403:
+        лид стоит в финале, и важно знать, в каком именно.
+        """
+        r = await self._request("GET", f"/api/bot/leads/{username}")
+        return (r.get("lead") if isinstance(r, dict) else None) or {}
+
+    async def set_lead_status_admin(
+        self, username: str, status: str, *, force: bool = False,
+    ) -> dict[str, Any]:
+        """Смена статуса через bot-поверхность (скоуп `leads:all`).
+
+        В отличие от `/api/l1/.../status` она не запрещает трогать лида,
+        уже стоящего в финале. Запасной путь для решения живого модератора
+        (см. `PartnerCrmService._push_moderated_terminal`).
+        """
+        body: dict[str, Any] = {"status": status}
+        if force:
+            body["force"] = True
+        return await self._request(
+            "POST", f"/api/bot/leads/{username}/status", json=body,
+        )

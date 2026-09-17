@@ -454,9 +454,16 @@ class PartnerCrmService:
             data={"username": username, "status": terminal_status},
         )
 
-        # Fix #13 + #14: после успешного финального push'а лид уходит из
-        # активного пула. При status=invalid дополнительно кладём в
-        # `invalid_leads` чтобы партнёр не смог подсунуть его повторно.
+        await self._cleanup_after_terminal(username, terminal_status)
+
+    async def _cleanup_after_terminal(
+        self, username: str, terminal_status: str,
+        *, reason: str = "pushed_invalid_via_finalize",
+    ) -> None:
+        """Fix #13 + #14: после успешного финального push'а лид уходит из
+        активного пула. При status=invalid дополнительно кладём в
+        `invalid_leads`, чтобы партнёр не смог подсунуть его повторно.
+        """
         pool_db = db.get_pool()
         async with pool_db.acquire() as conn:
             await conn.execute(
@@ -471,8 +478,69 @@ class PartnerCrmService:
                         SET invalidated_at = NOW(),
                             reason         = EXCLUDED.reason
                     """,
-                    username, f"pushed_invalid_via_finalize",
+                    username, reason,
                 )
+
+    async def _push_moderated_terminal(
+        self, *, account_id: int | None, username: str, terminal: str,
+    ) -> str:
+        """Пуш решения модератора с запасным путём на случай 403.
+
+        `/api/l1/.../status` запрещает менять статус лида, уже стоящего в
+        финале. Так бывает штатно: silence_watcher закрыл молчуна как
+        `no_response`, человек ответил через несколько дней, диалог дошёл
+        до успеха — и решение модератора упирается в блокировку. На проде
+        так застряло 6.6% решений (91 из 1511 на 17.09.2026).
+
+        Решение живого человека важнее автоматики, поэтому на 403 идём
+        через bot-поверхность (скоуп `leads:all`), где блокировки нет.
+        Не трогаем только лидов, которых L2 уже увёл дальше
+        (`approved` / `transferred`) — там наше решение опоздало, и
+        перезаписью мы бы испортили чужую работу.
+        """
+        try:
+            await self.push_lead_finalized(
+                account_id=account_id, username=username,
+                terminal_status=terminal,
+            )
+            return terminal
+        except CrmHttpError as e:
+            if e.status != 403:
+                raise
+
+        current = ""
+        try:
+            card = await self._client.get_lead_card(username)
+            current = str(card.get("lead_status") or "")
+        except PartnerCrmError as e:
+            log.warning(
+                "partner_crm: карточка %s недоступна (%s), "
+                "применяю решение вслепую", username, e,
+            )
+
+        if current in ("approved", "transferred"):
+            log.info(
+                "partner_crm: %s уже %s у партнёра — решение модератора "
+                "(%s) не применяем", username, current, terminal,
+            )
+            await self._cleanup_after_terminal(username, current)
+            return current
+
+        await self._client.set_lead_status_admin(username, terminal)
+        await bus.publish(
+            module=Module.PARTNER_CRM,
+            type=EventType.PARTNER_CRM_STATUS_PUSHED,
+            status=Status.SUCCESS,
+            account_id=account_id,
+            data={
+                "username": username, "status": terminal,
+                "via": "admin_override", "was": current or "?",
+            },
+        )
+        await self._cleanup_after_terminal(
+            username, terminal, reason="pushed_invalid_via_moderation",
+        )
+        return terminal
 
     async def push_lead_moderated(
         self,
@@ -512,12 +580,10 @@ class PartnerCrmService:
                     "деградирую до ready_for_transfer",
                     username, l2_login, e,
                 )
-                await self.push_lead_finalized(
-                    account_id=account_id,
-                    username=username,
-                    terminal_status="ready_for_transfer",
+                return await self._push_moderated_terminal(
+                    account_id=account_id, username=username,
+                    terminal="ready_for_transfer",
                 )
-                return "ready_for_transfer"
 
             await bus.publish(
                 module=Module.PARTNER_CRM,
@@ -540,12 +606,9 @@ class PartnerCrmService:
             return "transferred"
 
         terminal = "invalid" if choice == "invalid" else "ready_for_transfer"
-        await self.push_lead_finalized(
-            account_id=account_id,
-            username=username,
-            terminal_status=terminal,
+        return await self._push_moderated_terminal(
+            account_id=account_id, username=username, terminal=terminal,
         )
-        return terminal
 
     # ─── Внутреннее ──────────────────────────────────────────────────
 

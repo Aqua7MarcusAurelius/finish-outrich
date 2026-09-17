@@ -505,6 +505,109 @@ async def test_moderation_closes_dialog_for_report_builder() -> bool:
     return True
 
 
+async def test_locked_lead_falls_back_to_admin_path() -> bool:
+    """403 «лид в финале» → решение модератора применяем через bot-поверхность.
+
+    Реальный случай: silence_watcher закрыл молчуна как no_response,
+    человек ответил через двое суток, диалог дошёл до успеха — и кнопка
+    модератора упиралась в блокировку. На проде так застряло 91 решение.
+    """
+    from modules.partner_crm.errors import CrmHttpError
+    from modules.partner_crm.service import PartnerCrmService
+
+    svc = PartnerCrmService()
+    svc._client.set_lead_status = AsyncMock(
+        side_effect=CrmHttpError("CRM responded 403", status=403))
+    svc._client.get_lead_card = AsyncMock(return_value={"lead_status": "no_response"})
+    svc._client.set_lead_status_admin = AsyncMock(return_value={})
+
+    from core import bus as bus_mod
+    orig = bus_mod.publish
+    bus_mod.publish = AsyncMock()
+    try:
+        got = await svc.push_lead_moderated(
+            account_id=23, username=TEST_USERNAME,
+            choice="no_take", l2_login=None,
+        )
+    finally:
+        bus_mod.publish = orig
+
+    if got != "ready_for_transfer":
+        print(f"  FAIL: вернулось {got!r}, ожидалось 'ready_for_transfer'")
+        return False
+    if not svc._client.set_lead_status_admin.await_count:
+        print("  FAIL: запасной путь не использован — решение потеряно")
+        return False
+    return True
+
+
+async def test_lead_already_moved_by_l2_is_not_overwritten() -> bool:
+    """Лида уже увёл L2 (approved/transferred) — наше решение не перезаписывает."""
+    from modules.partner_crm.errors import CrmHttpError
+    from modules.partner_crm.service import PartnerCrmService
+
+    for already in ("approved", "transferred"):
+        svc = PartnerCrmService()
+        svc._client.set_lead_status = AsyncMock(
+            side_effect=CrmHttpError("CRM responded 403", status=403))
+        svc._client.get_lead_card = AsyncMock(return_value={"lead_status": already})
+        svc._client.set_lead_status_admin = AsyncMock()
+
+        from core import bus as bus_mod
+        orig = bus_mod.publish
+        bus_mod.publish = AsyncMock()
+        try:
+            got = await svc.push_lead_moderated(
+                account_id=23, username=TEST_USERNAME,
+                choice="invalid", l2_login=None,
+            )
+        finally:
+            bus_mod.publish = orig
+
+        if svc._client.set_lead_status_admin.await_count:
+            print(f"  FAIL: перезаписали чужую работу поверх {already}")
+            return False
+        if got != already:
+            print(f"  FAIL: вернулось {got!r}, ожидалось {already!r}")
+            return False
+    return True
+
+
+async def test_non_403_error_still_retries() -> bool:
+    """Не-403 (CRM лежит) — по-прежнему ошибка, тикер повторит позже."""
+    from modules.partner_crm.errors import CrmHttpError
+    from modules.partner_crm.service import PartnerCrmService
+
+    svc = PartnerCrmService()
+    svc._client.set_lead_status = AsyncMock(
+        side_effect=CrmHttpError("CRM responded 500", status=500))
+    svc._client.get_lead_card = AsyncMock()
+    svc._client.set_lead_status_admin = AsyncMock()
+
+    from core import bus as bus_mod
+    orig = bus_mod.publish
+    bus_mod.publish = AsyncMock()
+    try:
+        await svc.push_lead_moderated(
+            account_id=23, username=TEST_USERNAME,
+            choice="no_take", l2_login=None,
+        )
+    except CrmHttpError:
+        ok = True
+    else:
+        ok = False
+    finally:
+        bus_mod.publish = orig
+
+    if not ok:
+        print("  FAIL: 500 проглочен — решение молча потерялось бы")
+        return False
+    if svc._client.set_lead_status_admin.await_count:
+        print("  FAIL: на 500 не нужно лезть в обход")
+        return False
+    return True
+
+
 async def _run_all() -> int:
     await db.init_pool()
     try:
@@ -522,6 +625,9 @@ async def _run_all() -> int:
             ("ошибка CRM: backoff и отказ после лимита", await test_push_error_backs_off_and_gives_up()),
             ("новое нажатие сбрасывает счётчик", await test_new_choice_resets_attempts()),
             ("«Модерация» закрывает диалог (отчёт строится)", await test_moderation_closes_dialog_for_report_builder()),
+            ("403 в финале → обход через bot-поверхность", await test_locked_lead_falls_back_to_admin_path()),
+            ("лида увёл L2 → не перезаписываем", await test_lead_already_moved_by_l2_is_not_overwritten()),
+            ("не-403 остаётся ошибкой", await test_non_403_error_still_retries()),
         ]
     finally:
         await db.close_pool()
