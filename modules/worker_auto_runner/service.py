@@ -57,13 +57,12 @@ MAX_QUEUE_LEN = 1000
 # Flood-recovery через @SpamBot (Fix #5, 2026-07-11).
 # При срабатывании PEER_FLOOD ("Too many requests" без секунд) или
 # FloodWaitError у воркера, автоматически:
-#   1. Шлём @SpamBot команду /start ДВА раза с паузой ~3 сек. Это снимает
-#      флуд-ограничение на Premium-аккаунтах (все наши — Premium).
-#   2. Ставим воркеру `cooldown_until = NOW() + FLOOD_COOLDOWN_BASE_SEC + rand(10-20 мин)`.
+#   1. Шлём @SpamBot команду /start ДВА раза с паузой ~3 сек.
+#      Ответ бота здесь не проверяется, снятие ограничения не гарантируется.
+#   2. Ставим `cooldown_until = NOW() + base + rand(0-5 мин)`, где base —
+#      положительное число секунд от TG, иначе FLOOD_COOLDOWN_BASE_SEC.
 #      `_account_loop` не отправляет ни одного лида пока cooldown не
-#      истёк — расписание при этом НЕ пересобирается, слоты просто
-#      пропускаются (то же поведение что при пустой очереди).
-# Отдых 2 часа даёт TG antifraud время расслабиться после /start к боту.
+#      истёк; затем оставшиеся слоты распределяются по оставшемуся окну.
 SPAM_BOT_USERNAME = "SpamBot"
 SPAM_BOT_START_ATTEMPTS = 2
 SPAM_BOT_DELAY_SEC = 3.0
@@ -84,19 +83,16 @@ WRAPPER_MISS_SLEEP_SEC = 180
 # last_status, а после STARTUP_MAX_WAIT_SEC без воркера — честно стопаемся.
 STARTUP_MAX_WAIT_SEC = 30 * 60   # ~30 мин (запас на stagger-старт воркеров)
 
-# Базовый cooldown для PEER_FLOOD (без секунд от TG). Fix #11, 2026-07-12:
-# по данным недельного окна 100% flood-стопов = PEER_FLOOD (0 FloodWait с
-# секундами). Оператор подтвердил что @SpamBot /start у Premium снимает
-# PEER_FLOOD → 2ч ожидания было избыточно. 15 мин + rand(10-20 мин) =
-# 25-35 мин cooldown. Дать боту время "прожевать" + запас.
+# Базовый cooldown без секунд от TG — 15 мин (Fix #11, 2026-07-12).
+# По указанию оператора 2026-10-10 общая случайная добавка сокращена:
+# 15 мин + rand(0-5 мин) = 15-20 мин. Общий расчёт для обоих типов сохранён.
 FLOOD_COOLDOWN_BASE_SEC = 15 * 60
 
-# Дополнительный «случайный отдых» который прибавляется поверх временени
+# Дополнительный «случайный отдых» который прибавляется поверх времени
 # запрошенного TG (для FloodWait) или поверх `FLOOD_COOLDOWN_BASE_SEC`
-# (для PEER_FLOOD без секунд). Fix #10, 2026-07-11 — распределяет пик
-# восстановлений во времени и даёт запас на неточность серверного счётчика.
-FLOOD_EXTRA_REST_MIN_SEC = 10 * 60
-FLOOD_EXTRA_REST_MAX_SEC = 20 * 60
+# (для PEER_FLOOD без секунд), распределяет восстановления во времени.
+FLOOD_EXTRA_REST_MIN_SEC = 0
+FLOOD_EXTRA_REST_MAX_SEC = 5 * 60
 
 # Первый лид ложится в диапазон [warmup_end, warmup_end + FIRST_SPREAD_SEC],
 # ограниченный session_ends_at. Это гарантирует что автомат не выстрелит
@@ -1211,13 +1207,11 @@ class WorkerAutoRunnerService:
         """Автоматика при PEER_FLOOD / FloodWait:
 
           1. Через wrapper воркера шлём @SpamBot команду `/start` дважды с
-             паузой `SPAM_BOT_DELAY_SEC` (снимает FloodWait у Premium
-             для длинных вейтов; для PEER_FLOOD плацебо, не мешает).
-          2. Ставим `cooldown_until = NOW() + base + rand(10-20 мин)`:
+             паузой `SPAM_BOT_DELAY_SEC`; ответ бота здесь не проверяется.
+          2. Ставим `cooldown_until = NOW() + base + rand(0-5 мин)`:
              - `base = seconds` если TG прислал явные секунды (FloodWait);
              - `base = FLOOD_COOLDOWN_BASE_SEC` (15 мин) если секунд нет (PEER_FLOOD).
-             Extra rest — Fix #10 (случайный запас чтобы восстановления
-             не сгущались во времени и был запас на неточность).
+             Общая случайная добавка распределяет восстановления во времени.
           3. Публикуем событие `auto_runner.lead_skipped` с `flood_recovery=True`.
           4. Обновляем `last_status='cooldown (flood, until ...)'` для UI.
 

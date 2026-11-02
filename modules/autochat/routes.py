@@ -40,6 +40,21 @@ class StartIn(BaseModel):
 
 # ─── Endpoints ────────────────────────────────────────────────────────
 
+@router.get("/attention")
+async def autochat_attention(
+    request: Request,
+    account_id: Optional[int] = Query(None, gt=0),
+    limit: int = Query(100, ge=1, le=500),
+    after_dialog_id: int = Query(0, ge=0),
+):
+    """Read-only processing diagnostics. Counts apply to this dialog page only."""
+    from .attention import inspect_attention
+    return await inspect_attention(
+        getattr(_service(request), "diagnostic_snapshot", None),
+        account_id=account_id, limit=limit, after_dialog_id=after_dialog_id,
+    )
+
+
 @router.post("/start")
 async def autochat_start(payload: StartIn, request: Request):
     """

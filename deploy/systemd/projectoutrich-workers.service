@@ -1,0 +1,36 @@
+[Unit]
+Description=ProjectOutRich recover explicitly desired Telegram workers
+Requires=projectoutrich-compose.service
+After=projectoutrich-compose.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/projectoutrich/docker-compose.vps.yml
+ConditionPathExists=!/opt/projectoutrich/.maintenance
+
+[Service]
+Type=oneshot
+User=projectoutrich
+Group=projectoutrich
+WorkingDirectory=/opt/projectoutrich
+ExecStart=/usr/bin/python3 /opt/projectoutrich/scripts/recover_workers_linux.py --project-path /opt/projectoutrich --timeout-seconds 600
+RuntimeDirectory=projectoutrich-worker-recovery
+RuntimeDirectoryMode=0750
+# Keep the flock inode stable if a manual helper is running during unit restart.
+RuntimeDirectoryPreserve=yes
+TimeoutStartSec=630
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+ReadWritePaths=/run/projectoutrich-worker-recovery
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

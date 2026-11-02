@@ -32,6 +32,7 @@ from core.config import settings
 from core.events import EventType, Module, Status
 
 from modules.dialog_statuses import service as dialog_statuses_service
+from modules.autochat import reply_journal
 
 from .errors import DialogNotFound, EvaluationAlreadyRunning, LlmCallFailed, PromptNotFound
 from .parser import EvaluationResult, parse_evaluator_response
@@ -99,6 +100,42 @@ async def _find_status_by_label(label: str) -> dict[str, Any] | None:
             label,
         )
     return dict(row) if row else None
+
+
+class _FinishHistoryPending(RuntimeError):
+    """Confirmed reply parts have not reached the history writer yet."""
+
+
+async def _finish_guard(conn, dialog_id, expected_batch_id=None, expected_input_message_id=None):
+    """Freshness metadata only; caller locks the dialog for the final check."""
+    state = await conn.fetchrow("""SELECT d.status_id, d.status_source,
+        COALESCE(st.closes_dialog,false) AS terminal,
+        EXISTS(SELECT 1 FROM report_moderation m WHERE m.dialog_id=d.id) AS moderated,
+        EXISTS(SELECT 1 FROM lead_evaluations e WHERE e.dialog_id=d.id) AS evaluated,
+        (SELECT id FROM messages WHERE dialog_id=d.id AND deleted_at IS NULL
+         ORDER BY date DESC,telegram_message_id DESC LIMIT 1) AS latest_message_id
+        FROM dialogs d LEFT JOIN dialog_statuses st ON st.id=d.status_id WHERE d.id=$1""", dialog_id)
+    if not state or state["terminal"] or state["moderated"] or state["evaluated"]:
+        return None
+    if expected_batch_id is not None:
+        batch = await conn.fetchrow("""SELECT * FROM autochat_reply_batches
+            WHERE id=$1 AND dialog_id=$2 AND phase IN ('finishing','complete')
+              AND finish_requested
+              AND id=(SELECT max(id) FROM autochat_reply_batches WHERE dialog_id=$2)""",
+            expected_batch_id, dialog_id)
+        if not batch or (expected_input_message_id is not None
+                         and batch["inbound_message_id"] != expected_input_message_id):
+            return None
+        if not await reply_journal.current_input(conn, batch):
+            return None
+        confirmed = [part["telegram_message_id"] for part in reply_journal.unpack(batch)["segments"]
+                     if part.get("telegram_message_id") is not None]
+        if confirmed:
+            saved = await conn.fetchval("""SELECT count(*) FROM messages WHERE dialog_id=$1
+                AND telegram_message_id=ANY($2::bigint[]) AND deleted_at IS NULL""", dialog_id, confirmed)
+            if saved != len(confirmed):
+                raise _FinishHistoryPending("reply history is not saved yet")
+    return dict(state)
 
 
 class LeadEvaluatorService:
@@ -200,7 +237,9 @@ class LeadEvaluatorService:
             return
 
         try:
-            await self.evaluate(int(dialog_id), source="autochat.finished_by_llm")
+            await self.evaluate(int(dialog_id), source="autochat.finished_by_llm",
+                expected_batch_id=data.get("reply_batch_id"),
+                expected_input_message_id=data.get("input_message_id"))
         except EvaluationAlreadyRunning:
             log.info(
                 "lead_evaluator: dialog %s already being evaluated, skip",
@@ -210,6 +249,10 @@ class LeadEvaluatorService:
             log.exception(
                 "lead_evaluator: evaluate failed for dialog %s", dialog_id,
             )
+            if data.get("reply_batch_id") is not None:
+                # Preserve the unhandled event instead of acknowledging a new
+                # durable finish whose outcome was never committed.
+                raise
 
     async def _on_message_saved(self, event: dict) -> None:
         """
@@ -252,6 +295,7 @@ class LeadEvaluatorService:
             await dialog_statuses_service.set_dialog_status(
                 int(dialog_id), target,
                 source="event:message_saved.auto_transition",
+                expected_status_id=current_status_id,
             )
         except dialog_statuses_service.DialogStatusError as e:
             log.warning(
@@ -288,6 +332,8 @@ class LeadEvaluatorService:
         dialog_id: int,
         *,
         source: str = "manual",
+        expected_batch_id: int | None = None,
+        expected_input_message_id: int | None = None,
     ) -> dict[str, Any]:
         """
         Прогнать оценщика по диалогу. Идемпотентный по dialog_id (UPSERT).
@@ -300,17 +346,37 @@ class LeadEvaluatorService:
             self._running.add(dialog_id)
 
         try:
-            return await self._evaluate_inner(dialog_id, source=source)
+            return await self._evaluate_inner(dialog_id, source=source,
+                expected_batch_id=expected_batch_id,
+                expected_input_message_id=expected_input_message_id)
         finally:
             async with self._running_lock:
                 self._running.discard(dialog_id)
 
     async def _evaluate_inner(
         self, dialog_id: int, *, source: str,
+        expected_batch_id: int | None = None,
+        expected_input_message_id: int | None = None,
     ) -> dict[str, Any]:
         pool = db.get_pool()
+        guarded = source != "manual" or expected_batch_id is not None
+        guard = None
 
         async with pool.acquire() as conn:
+            if guarded:
+                # The sender and history consumer are independent. Wait briefly
+                # for confirmed outgoing parts, without holding a DB row lock.
+                for attempt in range(20):
+                    try:
+                        guard = await _finish_guard(conn, dialog_id, expected_batch_id,
+                                                    expected_input_message_id)
+                        break
+                    except _FinishHistoryPending:
+                        if attempt == 19:
+                            raise
+                        await asyncio.sleep(0.5)
+                if guard is None:
+                    return {"dialog_id": dialog_id, "skipped": True, "reason": "stale_or_protected_finish"}
             dialog_row = await conn.fetchrow(
                 """
                 SELECT id, account_id, telegram_user_id, username,
@@ -367,7 +433,18 @@ class LeadEvaluatorService:
 
         # UPSERT в lead_evaluations
         payload = result.to_db_payload()
-        async with pool.acquire() as conn:
+        label = _LABEL_BY_VERDICT[result.verdict or "archive"]
+        status_card = await _find_status_by_label(label)
+        async with pool.acquire() as conn, conn.transaction():
+            # History's upsert, status changes and silence closure use this row
+            # lock too. Evaluation/reason/status commit together; no LLM/network
+            # request occurs under the lock.
+            await conn.fetchval("SELECT id FROM dialogs WHERE id=$1 FOR UPDATE", dialog_id)
+            if guarded:
+                current = await _finish_guard(conn, dialog_id, expected_batch_id,
+                                              expected_input_message_id)
+                if current is None or current != guard:
+                    return {"dialog_id": dialog_id, "skipped": True, "reason": "stale_or_protected_finish"}
             row = await conn.fetchrow(
                 """
                 INSERT INTO lead_evaluations (
@@ -412,25 +489,22 @@ class LeadEvaluatorService:
                 """,
                 dialog_id, terminal_reason,
             )
+            if status_card is not None:
+                await conn.execute("""UPDATE dialogs SET status_id=$2, status_source=$3,
+                    status_source_message_id=(SELECT id FROM messages
+                        WHERE dialog_id=$1 AND deleted_at IS NULL
+                        ORDER BY date DESC,telegram_message_id DESC LIMIT 1), updated_at=NOW()
+                    WHERE id=$1""", dialog_id, status_card["id"], f"event:{source}")
 
         # Проставить пузырь через dialog_statuses (тот опубликует
         # dialog.status_changed). При archive пузырь терминальный и
         # partner_crm/finalizer сразу пушнёт статус в CRM; при success —
         # это «Модерация», финалайзер её пропустит, а решение примет
         # человек кнопкой в TG-группе (modules/report_bot).
-        label = _LABEL_BY_VERDICT[result.verdict or "archive"]
-        status_card = await _find_status_by_label(label)
         if status_card is not None:
-            try:
-                await dialog_statuses_service.set_dialog_status(
-                    dialog_id, status_card["id"],
-                    source=f"event:{source}",
-                )
-            except dialog_statuses_service.DialogStatusError as e:
-                log.warning(
-                    "lead_evaluator: failed to set status on dialog %s: %s",
-                    dialog_id, e,
-                )
+            await dialog_statuses_service.publish_status_changed(
+                dialog_id, account_id, status_card["id"], f"event:{source}",
+            )
         else:
             log.warning(
                 "lead_evaluator: status with label %r not in catalog — "

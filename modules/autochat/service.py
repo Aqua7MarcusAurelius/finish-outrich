@@ -95,6 +95,7 @@ from .generation import (
     sanitize_initial_response,
 )
 from .prompts import load_for_account
+from . import reply_journal
 from .session import AutoChatSession, _call_llm_with_retries, _get_setting_int, _now
 
 log = logging.getLogger(__name__)
@@ -108,6 +109,7 @@ _INTERESTING_TYPES = {
     EventType.MESSAGE_UPDATED,
     EventType.DIALOG_TYPING_OBSERVED,
     EventType.WORKER_STARTED,  # Fix #22: триггер для догона missed inbound
+    EventType.SYNC_DONE,
 }
 
 # Fix #22: окно «свежести» пропущенного inbound. Сессия воскрешается через
@@ -142,6 +144,12 @@ class AutoChatService:
         # LLM-вызовов разом. Задачи держим в set'е (иначе GC их соберёт).
         self._regen_sem = asyncio.Semaphore(4)
         self._bg_tasks: set[asyncio.Task] = set()
+        self._recovery_accounts: set[int] = set()
+        self._recovery_again: set[int] = set()
+
+    def diagnostic_snapshot(self, session_id):
+        session = self._sessions_by_id.get(session_id)
+        return session.diagnostic_snapshot() if session else None
 
     # ─────────────────────────────────────────────────────────────────
     # Жизненный цикл
@@ -261,6 +269,40 @@ class AutoChatService:
         if account_id is None:
             return
 
+        if await reply_journal.enabled("autochat.reply_journal_enabled"):
+            # Legacy timestamp-only candidates are diagnostic, not automatically replayed.
+            if not await reply_journal.enabled("autochat.recovery_enabled"):
+                return
+            async with db.get_pool().acquire() as conn:
+                ids = await conn.fetch("""SELECT DISTINCT b.session_id FROM autochat_reply_batches b
+                    JOIN autochat_sessions s ON s.id=b.session_id
+                    WHERE b.account_id=$1 AND s.status='active'
+                      AND b.phase IN ('generating','ready','sending','finishing')""", account_id)
+            pending_ids = [row["session_id"] for row in ids]
+            # sync.done can precede the history writer's final commits. Retry
+            # only those selected sessions that explicitly wait for this local
+            # catch-up, with a finite budget under the existing account singleflight.
+            # Missing anchors/unknown transport outcomes are not polling targets.
+            for delay in (0, 1, 5, 15):
+                if not pending_ids or self._stop_event.is_set():
+                    break
+                if delay:
+                    await asyncio.sleep(delay)
+                deferred_ids = []
+                for session_id in pending_ids:
+                    session = self._sessions_by_id.get(session_id)
+                    if session is None:
+                        continue
+                    try:
+                        result = await session.recover_reply()
+                        log.info("autochat recovery account=%s session=%s result=%s", account_id, session.id, result)
+                        if result == "history_not_caught_up":
+                            deferred_ids.append(session_id)
+                    except Exception:
+                        log.exception("autochat recovery failed account=%s session=%s", account_id, session_id)
+                pending_ids = deferred_ids
+            return
+
         pool = db.get_pool()
         try:
             async with pool.acquire() as conn:
@@ -348,7 +390,13 @@ class AutoChatService:
             await self._on_message_updated(account_id, data)
         elif etype == EventType.DIALOG_TYPING_OBSERVED:
             await self._on_typing(account_id, data)
-        elif etype == EventType.WORKER_STARTED:
+        elif etype in (EventType.WORKER_STARTED, EventType.SYNC_DONE):
+            if etype == EventType.SYNC_DONE and not await reply_journal.enabled("autochat.reply_journal_enabled"):
+                return
+            if account_id in self._recovery_accounts:
+                self._recovery_again.add(account_id)
+                return
+            self._recovery_accounts.add(account_id)
             # C4: НЕ блокируем диспетчер — догон missed-inbound уходит в фон.
             task = asyncio.create_task(
                 self._regen_missed_inbound(account_id, data),
@@ -373,6 +421,14 @@ class AutoChatService:
                 log.exception(
                     "autochat: regen missed inbound failed acc=%s", account_id,
                 )
+            finally:
+                self._recovery_accounts.discard(account_id)
+                if account_id in self._recovery_again and not self._stop_event.is_set():
+                    self._recovery_again.discard(account_id)
+                    self._recovery_accounts.add(account_id)
+                    task = asyncio.create_task(self._regen_missed_inbound(account_id, data))
+                    self._bg_tasks.add(task)
+                    task.add_done_callback(self._bg_tasks.discard)
 
     async def _on_message_saved(
         self, account_id: int | None, data: dict[str, Any],
@@ -417,7 +473,7 @@ class AutoChatService:
             "telegram_message_id": data.get("telegram_message_id"),
             "dialog_id": dialog_id,
             "is_outgoing": is_outgoing,
-            "date": _now(),   # message.saved не содержит сырой date; используем now
+            "date": data.get("date") or _now(),
         }
         kind = "outbound" if is_outgoing else "inbound"
         await session.handle_event(kind, payload)
@@ -727,7 +783,35 @@ class AutoChatService:
 
         return _row_to_dict(final_row)
 
-    async def stop_session(self, session_id: int) -> dict[str, Any]:
+    async def stop_session(
+        self, session_id: int, *, expected_batch_id: int | None = None,
+    ) -> dict[str, Any] | None:
+        # An LLM finish may arrive after another inbound. Commit its conditional
+        # stop under the same dialog row lock used by the history writer BEFORE
+        # removing in-memory routing. A failed guard leaves the live chat alone.
+        guarded_row = None
+        if expected_batch_id is not None:
+            from . import reply_journal
+            async with db.get_pool().acquire() as conn:
+                dialog_id = await conn.fetchval(
+                    "SELECT dialog_id FROM autochat_sessions WHERE id=$1", session_id,
+                )
+            if dialog_id is None:
+                return None
+            async with reply_journal.locked(dialog_id) as conn:
+                batch = await conn.fetchrow("""SELECT * FROM autochat_reply_batches
+                    WHERE id=$1 AND session_id=$2 AND dialog_id=$3
+                      AND phase IN ('finishing','complete') AND finish_requested
+                      AND id=(SELECT max(id) FROM autochat_reply_batches WHERE session_id=$2)
+                    FOR UPDATE""", expected_batch_id, session_id, dialog_id)
+                if batch is None or not await reply_journal.current_input(conn, batch):
+                    return None
+                guarded_row = await conn.fetchrow("""UPDATE autochat_sessions
+                    SET status='stopped', updated_at=NOW()
+                    WHERE id=$1 AND status='active' RETURNING *""", session_id)
+                if guarded_row is None:
+                    return None
+
         async with self._lock:
             session = self._sessions_by_id.pop(session_id, None)
             # Почистим индексы
@@ -739,23 +823,25 @@ class AutoChatService:
                     self._by_tg_user.pop(key, None)
 
         if session is not None:
-            await session.stop(reason="manual_stop")
+            await session.stop(reason="llm_finish" if expected_batch_id is not None else "manual_stop")
 
         pool = db.get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                UPDATE autochat_sessions SET
-                    status = CASE
-                        WHEN status IN ('failed','stopped') THEN status
-                        ELSE 'stopped'
-                    END,
-                    updated_at = NOW()
-                WHERE id = $1
-                RETURNING *
-                """,
-                session_id,
-            )
+        row = guarded_row
+        if row is None:
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    UPDATE autochat_sessions SET
+                        status = CASE
+                            WHEN status IN ('failed','stopped') THEN status
+                            ELSE 'stopped'
+                        END,
+                        updated_at = NOW()
+                    WHERE id = $1
+                    RETURNING *
+                    """,
+                    session_id,
+                )
         if row is None:
             raise SessionNotFound()
 
@@ -973,7 +1059,9 @@ class AutoChatService:
             raise NoActiveSession()
         return await session.force_generate_reply()
 
-    async def _on_session_finished_by_llm(self, session_id: int) -> None:
+    async def _on_session_finished_by_llm(
+        self, session_id: int, *, expected_batch_id: int | None = None,
+    ) -> bool:
         """
         Callback от AutoChatSession когда LLM поставила <finishdialog/>
         и последний сегмент уже отправлен.
@@ -985,11 +1073,12 @@ class AutoChatService:
         запустится по autochat.finished_by_llm и проставит пузырь.
         """
         try:
-            await self.stop_session(session_id)
+            return await self.stop_session(session_id, expected_batch_id=expected_batch_id) is not None
         except Exception:
             log.exception(
                 "autochat: finish-by-llm handler failed for session %s", session_id,
             )
+            return False
 
     # ─────────────────────────────────────────────────────────────────
     # Вспомогательные запросы

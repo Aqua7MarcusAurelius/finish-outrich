@@ -34,6 +34,7 @@ from .generation import (
     parse_segments,
 )
 from .prompts import load_for_account
+from . import reply_journal
 
 log = logging.getLogger(__name__)
 
@@ -160,6 +161,12 @@ class AutoChatSession:
         self._generating: asyncio.Lock = asyncio.Lock()
 
         self._stopped: asyncio.Event = asyncio.Event()
+        self._sending = False
+        self._waiting_media = False
+        self._phase_started_at = None
+        self._last_inbound_seen_at = None
+        self._last_inbound_message_id = None
+        self._last_error_kind = None
 
     # ─────────────────────────────────────────────────────────────────
     # Жизненный цикл
@@ -276,6 +283,8 @@ class AutoChatSession:
         Inbound сообщение от собеседника (message.saved, is_outgoing=false).
         """
         msg_time = _parse_dt(payload.get("date")) or _now()
+        self._last_inbound_seen_at = _now()
+        self._last_inbound_message_id = payload.get("message_id")
 
         # 1. Запомним возраст последнего сообщения ДО этого inbound —
         # нужен для расчёта enter-delay.
@@ -324,6 +333,10 @@ class AutoChatSession:
         await self._persist_state()
         if self.in_chat:
             self._reset_idle()
+            self._bump_planner()
+        batch = await reply_journal.pending(self.id)
+        if batch and batch["phase"] == "ready" and batch["finish_requested"] and batch["next_index"] == len(batch["segments"]):
+            await self._finish_reply(batch["parent_id"], batch["id"])
 
     async def _on_media_updated(self, payload: dict[str, Any]) -> None:
         """
@@ -444,17 +457,24 @@ class AutoChatSession:
                             self.last_our_activity_at is not None
                             and self.last_their_message_at is not None
                             and self.last_our_activity_at >= self.last_their_message_at
+                            and not await reply_journal.enabled("autochat.reply_journal_enabled")
                         ):
                             continue
                         # Перед генерацией — дождаться готовности всех
                         # транскрипций/описаний (polling 30с, max 10 попыток).
-                        await self._wait_for_transcriptions()
-                        await self._generate_and_enqueue()
+                        self._phase_started_at = _now()
+                        self._waiting_media = True
+                        try:
+                            await self._wait_for_transcriptions()
+                        finally:
+                            self._waiting_media = False
+                        generated = await self._generate_and_enqueue()
                         # Метим last_our СРАЗУ после enqueue (как force) — чтобы
                         # параллельный триггер не сгенерил дубль.
-                        self.last_our_activity_at = _now()
-                        self.last_any_message_at = self.last_our_activity_at
-                        await self._persist_state()
+                        if generated and not await reply_journal.enabled("autochat.reply_journal_enabled"):
+                            self.last_our_activity_at = _now()
+                            self.last_any_message_at = self.last_our_activity_at
+                            await self._persist_state()
                 except AutoSessionExpired:
                     # Сессия TG протухла — выходим и завершаем AutoChat-сессию.
                     await self._fail("session_expired")
@@ -584,36 +604,42 @@ class AutoChatSession:
         async with self._generating:
             # Дождёмся медиа (как делает обычный planner) — иначе LLM увидит
             # сырое сообщение без транскрипции и ответит мимо темы.
-            await self._wait_for_transcriptions()
+            self._phase_started_at = _now()
+            self._waiting_media = True
+            try:
+                await self._wait_for_transcriptions()
+            finally:
+                self._waiting_media = False
 
             # _generate_and_enqueue сам ловит OpenRouterError →
             # AUTOCHAT_SESSION_ERROR и просто возвращается, не валя сессию.
-            await self._generate_and_enqueue()
+            generated = await self._generate_and_enqueue(manual=True)
 
             # M2: метим last_our СРАЗУ после постановки в очередь (а не
             # только после реальной отправки в _send_segment). Иначе селектор
             # missed-inbound (last_their > last_our) продолжает выбирать эту
             # сессию до окончания отправки → повторный worker.started
             # регенерит дубль. _send_segment всё равно обновит метку позже.
-            self.last_our_activity_at = _now()
-            self.last_any_message_at = self.last_our_activity_at
-            await self._persist_state()
+            if generated and not await reply_journal.enabled("autochat.reply_journal_enabled"):
+                self.last_our_activity_at = _now()
+                self.last_any_message_at = self.last_our_activity_at
+                await self._persist_state()
 
         return {
             "session_id": self.id,
             "dialog_id": self.dialog_id,
-            "queued": True,
+            "queued": bool(generated),
         }
 
     # ─── Генерация ───────────────────────────────────────────────────
 
-    async def _generate_and_enqueue(self) -> None:
+    async def _generate_and_enqueue(self, *, manual=False) -> bool:
         if self.dialog_id is None:
             log.warning(
                 "autochat session %s: dialog_id not set, cannot build context",
                 self.id,
             )
-            return
+            return False
 
         # Гейт по per-worker reply_template: если пусто — автоответ не
         # генерируем. Сессия остаётся живой; следующий bump попробует
@@ -635,7 +661,17 @@ class AutoChatSession:
                     "message": "У воркера пустой reply-промт — заполни в редакторе.",
                 },
             )
-            return
+            return False
+
+        batch = None
+        journal_enabled = await reply_journal.enabled("autochat.reply_journal_enabled")
+        if not journal_enabled and await reply_journal.pending(self.id):
+            return False  # Turning a flag off must not bypass unconfirmed delivery.
+        if journal_enabled:
+            batch = await reply_journal.begin(self.id, self.dialog_id, self.account_id,
+                                              manual=manual, reuse_intent=True)
+            if batch is None:
+                return False
 
         pool = db.get_pool()
         async with pool.acquire() as conn:
@@ -660,13 +696,24 @@ class AutoChatSession:
         parent_id = req_event["id"]
 
         retries = await _get_setting_int("autochat.openrouter_retries")
-        response = await _call_llm_with_retries(messages, retries=retries)
+        try:
+            response = await _call_llm_with_retries(messages, retries=retries)
+        except Exception:
+            self._last_error_kind = "generation_failed"
+            if batch:
+                await reply_journal.review(batch["id"], self.dialog_id, "generation_failed")
+            raise
 
         # <finishdialog/> вырезаем ДО parse_segments — иначе маркер
         # может попасть в конец последнего <msg> или сесть отдельным
         # сегментом и улететь в Telegram.
         response_clean, finish_requested = extract_finish_marker(response)
         segments = parse_segments(response_clean)
+        if batch:
+            batch = await reply_journal.store_result(batch, segments, finish_requested, parent_id)
+            if batch is None:
+                await self._rearm_pending_input()
+                return False
         log.info(
             "autochat session %s: LLM answered %d segments (finish=%s)",
             self.id, len(segments), finish_requested,
@@ -691,6 +738,8 @@ class AutoChatSession:
         total = len(segments)
         for i, seg in enumerate(segments, 1):
             item = {"index": i, "total": total, "text": seg, "parent_id": parent_id}
+            if batch:
+                item["batch_id"] = batch["id"]
             # Финиш триггерим после отправки ПОСЛЕДНЕГО сегмента — чтобы
             # прощальный реплай уехал, а потом сессия погасла.
             if finish_requested and i == total:
@@ -703,9 +752,29 @@ class AutoChatSession:
                 "autochat session %s: finish requested but no segments — stopping immediately",
                 self.id,
             )
-            await self._publish_finished_by_llm(parent_id)
-            if self._on_finished_by_llm is not None:
-                asyncio.create_task(self._on_finished_by_llm(self.id))
+            await self._finish_reply(parent_id, batch["id"] if batch else None)
+        return bool(segments or finish_requested)
+
+    async def _rearm_pending_input(self):
+        """A newer input outliving a long LLM call still gets its normal enter delay."""
+        if self._stopped.is_set():
+            return
+        pending = await reply_journal.pending(self.id)
+        if not pending or pending["phase"] != "generating":
+            return
+        if self.in_chat:
+            self._bump_planner()
+            return
+        delay = await _get_setting_int(
+            _enter_delay_key(_age_sec(self.last_any_message_at, _now())),
+        )
+        # A concurrent inbound may already have armed its own enter timer.
+        if self._stopped.is_set() or self.in_chat:
+            return
+        if self._enter_task is None or self._enter_task.done():
+            self._enter_task = asyncio.create_task(
+                self._enter_after(delay), name=f"autochat_enter_{self.id}",
+            )
 
     # ─────────────────────────────────────────────────────────────────
     # sender_loop — отправка сегментов с имитацией печати
@@ -718,11 +787,22 @@ class AutoChatSession:
                 if item is None:  # маркер остановки
                     return
                 try:
+                    self._sending = True
+                    self._phase_started_at = _now()
                     await self._send_segment(item)
                 except AutoSessionExpired:
                     await self._fail("session_expired")
                     return
                 except Exception as e:
+                    if item.get("batch_id"):
+                        pending = await reply_journal.pending(self.id)
+                        if pending and pending["id"] == item["batch_id"] and pending["phase"] in ("sending", "finishing"):
+                            self._last_error_kind = "delivery_unknown"
+                            await reply_journal.review(item["batch_id"], self.dialog_id, "delivery_unknown")
+                        else:
+                            self._last_error_kind = "send_deferred"
+                        log.exception("autochat session %s: reply send deferred or needs review", self.id)
+                        continue
                     log.exception(
                         "autochat session %s: send_segment failed", self.id,
                     )
@@ -741,6 +821,10 @@ class AutoChatSession:
                     # завалившейся. Скорее всего нас заблокировали.
                     await self._fail("send_failed")
                     return
+                finally:
+                    self._sending = False
+                    if self.in_chat:
+                        self._bump_planner()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -810,8 +894,14 @@ class AutoChatSession:
                 pass
 
         # Отправка
+        batch_id = item.get("batch_id")
+        if batch_id and not await reply_journal.before_send(batch_id, self.dialog_id, index - 1):
+            self._bump_planner()
+            return
         sent = await wrapper.send_message(self.telegram_user_id, text)
         tg_msg_id = sent.get("telegram_message_id")
+        if batch_id:
+            await reply_journal.confirm_send(batch_id, self.dialog_id, index - 1, tg_msg_id)
 
         # Публикуем message.received для history — Telethon сам не триггерит
         # NewMessage handler для собственных отправок (см. STAGE_4_REPORT).
@@ -879,9 +969,89 @@ class AutoChatSession:
         # _send_segment до того как service.stop_session начнёт его
         # отменять (иначе будет ждать самого себя).
         if item.get("finish_after"):
-            await self._publish_finished_by_llm(parent_id)
-            if self._on_finished_by_llm is not None:
+            await self._finish_reply(parent_id, batch_id)
+
+    async def _finish_reply(self, parent_id, batch_id=None):
+        if batch_id and not await reply_journal.start_finish(batch_id, self.dialog_id):
+            self._bump_planner()
+            return
+        published = await self._publish_finished_by_llm(parent_id, batch_id=batch_id)
+        if batch_id:
+            if not published:
+                await reply_journal.review(batch_id, self.dialog_id, "finish_delivery_unknown")
+                return
+            await reply_journal.finish_confirmed(batch_id, self.dialog_id)
+        if self._on_finished_by_llm is not None:
+            if batch_id:
+                asyncio.create_task(self._on_finished_by_llm(self.id, expected_batch_id=batch_id))
+            else:
                 asyncio.create_task(self._on_finished_by_llm(self.id))
+
+    def diagnostic_snapshot(self):
+        return {
+            "registered": True, "stopped": self._stopped.is_set(),
+            "worker_connected": self._get_wrapper(self.account_id) is not None,
+            "generating": self._generating.locked(), "sending": self._sending,
+            "queued_segments": self._send_queue.qsize(), "event_queue_size": self._queue.qsize(),
+            "entering": bool(self._enter_task and not self._enter_task.done()),
+            "reply_waiting": bool(self.in_chat and not self._generating.locked()),
+            "waiting_media": self._waiting_media, "phase_started_at": self._phase_started_at,
+            "last_inbound_seen_at": self._last_inbound_seen_at,
+            "last_inbound_message_id": self._last_inbound_message_id,
+            "last_error_kind": self._last_error_kind,
+        }
+
+    async def recover_reply(self):
+        """Resume only journalled work, never legacy sessions or ambiguous RPCs."""
+        if self._stopped.is_set() or self._generating.locked() or self._sending or not self._send_queue.empty():
+            return "busy"
+        if not await reply_journal.enabled("autochat.recovery_enabled"):
+            return "disabled"
+        async with self._generating:
+            batch = await reply_journal.pending(self.id)
+            if not batch:
+                return "no_journal"
+            if batch["phase"] in ("sending", "finishing"):
+                await reply_journal.review(batch["id"], self.dialog_id, "delivery_unknown")
+                return "review"
+            if batch["phase"] == "review":
+                return "review"
+            wrapper = self._get_wrapper(self.account_id)
+            if wrapper is None:
+                return "worker_unavailable"
+            # Read through the existing connected client, never a second session.
+            remote = await wrapper.get_history(self.telegram_user_id, limit=100)
+            ids = [m.id for m in remote if getattr(m, "id", None)]
+            if not ids:
+                return "history_unknown"
+            async with db.get_pool().acquire() as conn:
+                saved = await conn.fetchval("""SELECT count(*) FROM messages
+                    WHERE dialog_id=$1 AND telegram_message_id=ANY($2::bigint[]) AND deleted_at IS NULL""", self.dialog_id, ids)
+                anchor = await conn.fetchval("SELECT telegram_message_id FROM messages WHERE id=$1", batch["inbound_message_id"])
+            if anchor not in ids:
+                return "history_anchor_outside_window"
+            if saved != len(ids):
+                return "history_not_caught_up"
+            if batch["phase"] == "generating":
+                # Keep the durable intent through media waits and cancellation.
+                # _generate_and_enqueue claims this existing intent with
+                # reuse_intent=True under the same generation lock. Marking it
+                # superseded first would lose it if this process stops here.
+                await self._wait_for_transcriptions()
+                await self._generate_and_enqueue()
+                return "regenerated_intent"
+            if batch["phase"] != "ready":
+                return "not_ready"
+            total = len(batch["segments"])
+            for index in range(batch["next_index"], total):
+                item = {"index": index+1, "total": total, "text": batch["segments"][index]["text"],
+                        "parent_id": batch["parent_id"], "batch_id": batch["id"]}
+                if batch["finish_requested"] and index+1 == total:
+                    item["finish_after"] = True
+                await self._send_queue.put(item)
+            if batch["next_index"] == total and batch["finish_requested"]:
+                await self._finish_reply(batch["parent_id"], batch["id"])
+            return "resumed"
 
     # ─────────────────────────────────────────────────────────────────
     # Сервисные запросы к БД
@@ -934,7 +1104,7 @@ class AutoChatSession:
 
     # ─── Финиш по сигналу LLM ────────────────────────────────────────
 
-    async def _publish_finished_by_llm(self, parent_id: str | None) -> None:
+    async def _publish_finished_by_llm(self, parent_id: str | None, *, batch_id=None) -> bool:
         """Публикует событие autochat.finished_by_llm. Сам stop делает callback."""
         try:
             data: dict[str, Any] = {"session_id": self.id}
@@ -944,6 +1114,8 @@ class AutoChatSession:
             # делает INSERT dialogs до отправки первого сообщения).
             if self.dialog_id is not None:
                 data["dialog_id"] = self.dialog_id
+            if batch_id is not None:
+                data["reply_batch_id"] = batch_id
             await bus.publish(
                 module=Module.AUTOCHAT,
                 type=EventType.AUTOCHAT_FINISHED_BY_LLM,
@@ -952,10 +1124,12 @@ class AutoChatSession:
                 account_id=self.account_id,
                 data=data,
             )
+            return True
         except Exception:
             log.exception(
                 "autochat session %s: publish finished_by_llm failed", self.id,
             )
+            return False
 
     # ─── Фатальные ошибки ────────────────────────────────────────────
 

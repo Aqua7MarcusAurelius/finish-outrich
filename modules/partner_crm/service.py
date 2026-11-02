@@ -508,15 +508,12 @@ class PartnerCrmService:
             if e.status != 403:
                 raise
 
-        current = ""
-        try:
-            card = await self._client.get_lead_card(username)
-            current = str(card.get("lead_status") or "")
-        except PartnerCrmError as e:
-            log.warning(
-                "partner_crm: карточка %s недоступна (%s), "
-                "применяю решение вслепую", username, e,
-            )
+        # A failed GET is not evidence that overwriting the current result is
+        # safe. Keep the moderator's choice pending for the existing retry path.
+        card = await self._client.get_lead_card(username)
+        current = str(card.get("lead_status") or "")
+        if not current:
+            raise CrmHttpError("CRM card has no lead_status; manual review required", status=409)
 
         if current in ("approved", "transferred"):
             log.info(
@@ -573,6 +570,12 @@ class PartnerCrmService:
             try:
                 await self._client.assign_to_l2(username, l2_login)
             except CrmHttpError as e:
+                # Transport/5xx failures do not mean the recipient is invalid;
+                # assignment may already have succeeded. Preserve the choice.
+                if e.status != 400 or not any(
+                    code in (e.body or "") for code in ("l2_not_found", "l2_login_required")
+                ):
+                    raise
                 # l2_not_found / логин отозвали — не теряем успех,
                 # отдаём партнёру как готового к передаче.
                 log.warning(

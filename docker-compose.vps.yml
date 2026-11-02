@@ -1,0 +1,88 @@
+# Independent production stack. Images are imported/tagged from verified artifacts.
+# Never run the same Telegram sessions on this VPS and the old host together.
+name: projectoutrich
+services:
+  app:
+    image: projectoutrich/app:2026-11-02
+    pull_policy: never
+    env_file: .env
+    ports: ["127.0.0.1:8000:8000"]
+    volumes: ["./:/app"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+    cpus: 4.0
+    mem_limit: 8g
+    restart: unless-stopped
+    networks: [project]
+  ui:
+    image: projectoutrich/ui:2026-11-02
+    pull_policy: never
+    environment:
+      VITE_API_URL: http://app:8000
+    ports: ["127.0.0.1:3000:3000"]
+    volumes:
+      - ./modules/ui_web:/app
+      - ui_node_modules:/app/node_modules
+    depends_on: [app]
+    cpus: 0.5
+    mem_limit: 512m
+    restart: unless-stopped
+    networks: [project]
+  postgres:
+    image: projectoutrich/postgres:2026-11-02
+    pull_policy: never
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    cpus: 2.0
+    mem_limit: 4g
+    restart: unless-stopped
+    networks: [project]
+  redis:
+    image: projectoutrich/redis:2026-11-02
+    pull_policy: never
+    volumes: ["redis_data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    cpus: 0.5
+    mem_limit: 1g
+    restart: unless-stopped
+    networks: [project]
+  minio:
+    image: projectoutrich/minio:2026-11-02
+    pull_policy: never
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports: ["127.0.0.1:9001:9001"]
+    volumes: ["minio_data:/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    cpus: 1.0
+    mem_limit: 2g
+    restart: unless-stopped
+    networks: [project]
+networks:
+  project:
+    name: projectoutrich_private
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  ui_node_modules:

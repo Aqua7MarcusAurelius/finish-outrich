@@ -27,6 +27,7 @@ def _make_svc_with_mock_pool(fetch_return):
 
     fake_conn = MagicMock()
     fake_conn.fetch = AsyncMock(return_value=fetch_return)
+    fake_conn.fetchval = AsyncMock(return_value=None)
     fake_conn.__aenter__ = AsyncMock(return_value=fake_conn)
     fake_conn.__aexit__ = AsyncMock(return_value=None)
     fake_pool = MagicMock()

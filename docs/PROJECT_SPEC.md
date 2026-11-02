@@ -10,7 +10,10 @@
 > (настоящее время, «как работает сейчас»); раздел 20 — **хронологическая история
 > изменений** по всем этапам (1 → 10.27), отвечающая на вопрос «что и когда меняли».
 >
-> **Обновлено:** 2026-07-20.
+> **Обновлено:** 2026-11-02 (подготовлены Linux helper и systemd units для VPS; их установка и фактический перенос фиксируются отдельно от проверки исходников).
+>
+> **Внедрение:** 27 октября применена схема 0029, загружен новый код и включены reply journal/recovery/CRM retry. Проверка в 18:40:51 МСК: 64 живых подключения через основные прокси, MESSI_05/71 остаётся session_expired; расписания выключены и сохранены. Установлена задача Windows AtLogOn. Квитанции: `.claude/operations/2026-10-27-recovery-implementation/`. Defaults миграций остаются false; включение на данном хосте выполнено отдельно.
+
 >
 > **Регламент поддержки** (держим документ всегда актуальным):
 > 1. Любое изменение в коде сразу отражаем здесь; отдельные `.md` в `docs/` не заводим.
@@ -499,12 +502,17 @@ tg-framework/
 │   ├── autochat_reply_system.md    ← системный промпт ответов автодиалога
 │   └── lead_evaluator_system.md    ← системный промпт оценки лида
 │
-├── scripts/                     ← вспомогательные скрипты (запуск вручную)
+├── scripts/                     ← вспомогательные скрипты и управляемое восстановление
+│   ├── recover_workers.ps1      ← ограниченное восстановление Windows AtLogOn
+│   ├── install_worker_recovery.ps1 ← установка одной Windows-задачи
+│   ├── recover_workers_linux.py ← Linux helper: health/readiness → native recover
 │   ├── register_account.py      ← CLI-регистрация аккаунта (fingerprint, one-shot)
 │   ├── proxy_diag.py            ← диагностика прокси: Telegram-DC vs 1.1.1.1
 │   ├── crm_probe.py             ← проба партнёрской CRM
 │   ├── report_delivery_selftest.py  ← офлайн-самопроверка логики доставки отчётов
 │   └── report_delivery_preflight.py ← пре-флайт групп сервис-аккаунта доставки
+│
+├── deploy/systemd/              ← start-only Compose unit и ограниченный worker recovery unit
 │
 ├── tests/smoke/                 ← смоук-тесты (запуск: docker compose exec app python -m tests.smoke.<name>)
 │
@@ -737,6 +745,17 @@ REPORT_BOT_TOKEN=             # токен бота модерации отчё�
 
 Ключи с префиксом `partner_crm.*` принадлежат модулю `partner_crm` (сторож CRM-пула `crm_lead_pool`), ключи `lead_evaluator.*` — модулю `lead_evaluator` (таймеры тишины и оценщик закрытых диалогов LLM-судьёй). Обе группы засевает миграция `0012_crm_integration` вместе с таблицами `crm_lead_pool` и `lead_evaluations`.
 
+**Флаги восстановления (миграции 0027–0028).** Это глобальные настройки, отдельного включения по аккаунтам нет:
+
+| Ключ | Дефолт | Назначение |
+|---|---|---|
+| `autochat.reply_journal_enabled` | `false` | Сохранять новые намерения и результаты ответов в PostgreSQL |
+| `autochat.recovery_enabled` | `false` | Продолжать подтверждённо незавершённые записи журнала на `worker.started`; требует включённого журнала |
+| `partner_crm.finalizer_retry_enabled` | `false` | Запускать ограниченный тикер повторов terminal finalizer |
+| `partner_crm.retry_owner_id` | пустая строка | Проверенный числовой L1-владелец; без него повторная CRM-мутация не разрешается |
+
+Журнал не создаёт задания для старого архива. Выключение recovery прекращает новые попытки восстановления, но не отменяет уже начатый Telegram RPC. Выключение самого журнала возвращает прежнюю ветку обработки, включая старый recovery по timestamp; это не равнозначно безопасному выключению всех повторов.
+
 ### 5.4. Последовательность старта приложения
 
 После того как PostgreSQL, Redis и MinIO прошли healthcheck, стартует приложение. Порядок:
@@ -769,7 +788,7 @@ REPORT_BOT_TOKEN=             # токен бота модерации отчё�
 
 **Шаг 4 — Модули.** Каждый модуль подписывается на нужные ему события шины (`history`, `transcription`, `media_description` и др.). Порядок подписки не важен — шина хранит события, модуль прочитает всё что пропустил (см. раздел «Шина событий»).
 
-**Шаг 5 — Менеджер воркеров.** Читает таблицу `accounts`, видит все авторизованные аккаунты, ждёт команд через API. Воркеры при старте системы автоматически не запускаются — только вручную через дашборд или `POST /workers/{account_id}/start`.
+**Шаг 5 — Менеджер воркеров.** Инициализирует пул и приводит stale Redis-статусы к текущему процессу. Сам lifespan не запускает Telegram-воркеры. Явный запуск идёт через `POST /workers/{account_id}/start`; отдельно установленная Windows-задача либо подготовленный Linux systemd helper используют `/recover` и сохранённое разрешение `worker_desired_running` (§5.8, §10). Одновременно допускается только один app-процесс и один хост с этими Telegram-сессиями.
 
 > Инфраструктурные ошибки на этапах 1–3 пишутся в stdout контейнера — шина ещё не готова. Это единственный случай, когда лог идёт не через шину. Все ошибки после готовности API идут через шину.
 
@@ -817,6 +836,12 @@ curl http://localhost:8000/system/health
 
 Первый аккаунт авторизуется через форму дашборда или напрямую: `POST /auth/start` → `POST /auth/code` → (при 2FA) `POST /auth/2fa`. Затем воркер запускается через `POST /workers/{account_id}/start` (см. разделы «auth» и «worker_manager»).
 
+#### Границы автоматического восстановления (проверено 2026-10-27)
+
+`restart: unless-stopped` в Compose восстанавливает контейнеры при работающем Docker Engine. Это не запускает Telegram-воркеры внутри приложения. `WorkerManager.reconcile_on_boot()` сбрасывает устаревшие `running/starting/stopping` в `stopped`; обычный запуск воркера выполняется через `POST /workers/{id}/start`. `/system/health` проверяет PostgreSQL, Redis, MinIO и наличие AuthService, но не подключения Telegram и не обработку входящих. Поэтому HTTP 200 совместим с нулём работающих воркеров.
+
+На Windows-хосте установлена задача `ProjectOutRich-WorkerRecovery` (§5.8): при входе текущего пользователя она проверяет Docker и восстанавливает разрешённые воркеры. Это дополняет прежнюю запись Docker Desktop в HKCU Run; его исходное `AutoStart=false` не менялось. `OutRich Morning Start` — историческая одноразовая задача на 2026-08-05. Восстановление до входа пользователя и автоматическое создание новых кампаний не предусмотрены.
+
 ### 5.6. Полезные команды
 
 ```bash
@@ -862,6 +887,30 @@ docker compose exec postgres psql -U tgframework -d tgframework -c "SELECT key, 
 | `/docs` открывается, но `/system/health` возвращает `degraded` | Один из компонентов лёг — смотреть `docker compose ps` и `docker compose logs <сервис>` |
 | Миграция упала | Ошибка в stdout, контейнер падает; `restart: unless-stopped` попробует поднять снова — но без исправления упадёт опять |
 
+
+---
+
+### 5.8. Восстановление Windows/Linux и разрешённых воркеров
+
+`scripts/recover_workers.ps1` совместим с Windows PowerShell 5.1. Параметры: `-ProjectPath` (при установке — путь рабочего production-каталога), `-TimeoutSeconds` (по умолчанию 600, диапазон 30–1800), `-DryRun`. Скрипт проверяет Engine, при необходимости один раз запускает установленный Docker Desktop скрыто, выполняет `docker compose start` для существующих контейнеров, ждёт HTTP health и readiness. Затем последовательно вызывает native `/workers/{id}/recover` только для разрешённых активных аккаунтов без живой task и без `session_expired`. API повторно проверяет разрешение, поэтому ручной stop после снимка не отменяется скриптом. Проверяется реальное подключение; ожидание ограничено общим deadline. Mutex защищает от параллельных ручных запусков, каждый ID запрашивается не более одного раза за прогон.
+
+`scripts/install_worker_recovery.ps1` с `SupportsShouldProcess`/`-WhatIf` регистрирует **одну** задачу `ProjectOutRich-WorkerRecovery`, **AtLogOn текущего пользователя**, Interactive/Limited, без SYSTEM и без сохранения пароля. PowerShell запускается скрыто; `MultipleInstances=IgnoreNew`, execution limit 15 минут. Задача установлена 27 октября с production ProjectPath. Первый ручной прогон восстановил 64 разрешённых воркера; повторный прогон подтвердил 64 подключения без нового вызова recover. Реальная перезагрузка Windows для теста не выполнялась; запуск до входа пользователя не обещается.
+
+Логи — `.claude/operations/worker-recovery/boot-*.jsonl`, без токенов, сессий и proxy credentials. `-DryRun` не вызывает Docker или HTTP. Нет удаления runtime-сокетов/томов, reset/rebuild, reauthorization, принудительной смены прокси, новых кампаний или импорта лидов. Уже существующий непросроченный runner может продолжиться штатным путём старта воркера; просроченные расписания не создаются заново.
+
+**Linux — подготовленные исходники для VPS.** `scripts/recover_workers_linux.py` работает на host Python 3.10+ со стандартной библиотекой; не требует Docker socket, доступа к БД или секретам. После `/system/health` со status=ok читает полный `/system/readiness` и последовательно вызывает только `POST /workers/{id}/recover`. Требуются одновременно desired_running, is_active, recoverable; живая task, подключение или session_expired запрещают новый запрос. Дополнительный неизменяемый через CLI denylist — service22 и отложенный MESSI_05/71; `--exclude-id` только расширяет его. Разрешение определяется сохранённым intent, а не списком outreach-семейств: ручной stop сохраняется, новые аккаунты сами не включаются. Helper не устанавливает intent и не создаёт расписаний, не импортирует лидов и не вызывает reauth; существующие непросроченные runners может продолжить только штатный код приложения.
+
+В подготовленном коде менеджера отдельно защищена штатная остановка app: `shutdown()` сохраняет intent и помечает конкретный slot для подавления `worker.stopped` при нормальном завершении. Иначе событие попадает в durable stream после остановки AutoRunner-consumer и на следующем boot очищает сохранённое расписание. Ручной stop имеет приоритет; настоящий final crash и session expiry не маскируются (§10.3). Изменение не переписывает старые события и расписания; внедрение этого исправления требует загрузки нового app-кода.
+
+Общий deadline по умолчанию 600 секунд (`--timeout-seconds`, 30–1800), каждый HTTP-вызов ограничен оставшимся временем и максимум 10 секундами; пауза между проходами — до 5 секунд. После неясного ответа/ошибки POST повтор для того же ID в этом прогоне запрещён. Готовность подтверждается следующим снимком actual task+connected всех desired аккаунтов; кэшированный status=running и успешный ответ POST её не доказывают. Некорректный/неполный снимок не даёт разрешения на запуск. Helper использует только literal loopback HTTP без credentials/path/query, игнорирует proxy-переменные окружения, не следует redirects и ограничивает размер JSON. Вывод — безопасные JSONL в stdout/journald с ID, счётчиками и фиксированными именами событий, без тела ошибок, токенов, телефонов, сессий и прокси.
+
+`deploy/systemd/projectoutrich-compose.service` — root oneshot после Docker/network, `WorkingDirectory=/opt/projectoutrich`, строго `docker compose -p projectoutrich -f docker-compose.vps.yml start`. Он запускает только заранее созданные контейнеры: первичный provision, точные образы, восстановление volume-данных и проверка Compose labels/mounts выполняются отдельным этапом миграции. Нет up/build/recreate/down/ExecStop. Unit остаётся active(exited); его stop не останавливает контейнеры. `projectoutrich-workers.service` — отдельный oneshot после Compose, User/Group=projectoutrich без Docker group, RuntimeDirectory с mode0750 и стабильным flock-файлом. Нет RemainAfterExit и Restart/таймера; повторный `systemctl start projectoutrich-workers.service` запускает ограниченную проверку вновь. Защиты filesystem/privileges ограничивают helper; TimeoutStartSec=630 даёт внешний предел времени. Одновременные systemd/manual вызовы с общим lock-path используют nonblocking flock; второй завершится без запросов.
+
+Оба unit имеют `ConditionPathExists=!/opt/projectoutrich/.maintenance`; helper дополнительно проверяет marker перед каждым POST. **Marker не останавливает уже работающие контейнеры и не отменяет Docker restart policy**, поэтому maintenance/cutover требуют отдельной контролируемой остановки старого экземпляра. Новые units покрывают boot и явный запуск; самостоятельный restart app-контейнера при живом Docker не запускает их повторно. После такого рестарта нужен явный worker recovery; непрерывный watchdog не реализован. Не запускать два app-процесса/реплики либо старый и новый хосты с теми же сессиями одновременно.
+
+При установке нужны `/usr/bin/docker` с Compose plugin, `/usr/bin/python3`, system user/group `projectoutrich` без интерактивного shell и доступ на чтение helper/проход к project-path; чтение `.env` helper не требуется. Unit-файлы копируются в `/etc/systemd/system/`, проверяются `systemd-analyze verify`, затем выполняются daemon-reload и enable **после** импорта и проверки состояния. Запуск units — отдельное действие cutover. До него безопасны `python3 scripts/recover_workers_linux.py --dry-run` и изолированные тесты `python3 tests/smoke/test_linux_worker_recovery.py -v`; dry-run не делает HTTP/Docker/lock или записи файлов. Подготовка этих файлов сама по себе не означает завершённую миграцию или установку units на VPS.
+
+**Изоляция VPS-проекта.** Для переноса выделен `/opt/projectoutrich` и самостоятельный `docker-compose.vps.yml` с project name `projectoutrich`: свои bridge network и именованные volumes, без присоединения к сетям/данным других проектов. Manifest использует точные миграционные image tags и публикует порты только на127.0.0.1; внешний доступ оформляется отдельно. Лимиты контейнеров: app4CPU/8GiB, PostgreSQL2CPU/4GiB, MinIO1CPU/2GiB, Redis0,5CPU/1GiB, UI0,5CPU/512MiB — суммарный потолок8CPU/15,5GiB. Это ограничения потребления, а не резервирование ресурсов или измеренный пик. Единственный app-процесс обслуживает все workers; масштабирование реплик с теми же сессиями запрещено. Наличие manifest не подтверждает завершённый перенос данных; фактический cutover и проверка сохранности оформляются отдельно.
 
 ---
 
@@ -1111,7 +1160,7 @@ Writer — history. При каждом редактировании новый 
 
 Сиды переписываются только если каталог пуст ИЛИ совпадает с дефолтом из 0009 — иначе оператор уже накастомил статусы руками, и DELETE снёс бы его работу. В таком случае новые терминальные пузыри добавляются вручную через UI.
 
-**API и события.** Модуль предоставляет `service.list_statuses / create_status / update_status / delete_status / get_status` (каталог) и единую точку присвоения `service.set_dialog_status(dialog_id, status_id, *, source)` — её зовут и UI, и будущая автоматизация (listener событий шины с `source="event:autochat.finished_by_llm"` и т.п.). Endpoint'ы: `GET/POST/PATCH/DELETE /dialog-statuses`, а также переехавший из history `PATCH /dialogs/{id}/status` с телом `{status_id: int | null}`. События шины: `dialog.status_changed` (per-assignment, с полем `source` в `data` для аудита «кто проставил») и `dialog_statuses.catalog_changed` (агрегатный, `action ∈ created/updated/deleted`). В выдаче истории статус сериализуется как `status: {id, label, color} | null` через `LEFT JOIN dialog_statuses`.
+**API и события.** Модуль предоставляет `service.list_statuses / create_status / update_status / delete_status / get_status` (каталог) и guarded-точку присвоения `service.set_dialog_status(dialog_id, status_id, *, source, expected_status_id=UNSET)`; она сохраняет происхождение и watermark, optional CAS защищает от смены статуса после снимка. Автоматические составные переходы выполняются в общей транзакции с публикацией после commit (§14–15). Endpoint'ы: `GET/POST/PATCH/DELETE /dialog-statuses`, а также переехавший из history `PATCH /dialogs/{id}/status` с телом `{status_id: int | null}`. События шины: `dialog.status_changed` (per-assignment, с полем `source` в `data` для аудита «кто проставил») и `dialog_statuses.catalog_changed` (агрегатный, `action ∈ created/updated/deleted`). В выдаче истории статус сериализуется как `status: {id, label, color} | null` через `LEFT JOIN dialog_statuses`.
 
 ---
 
@@ -1188,7 +1237,7 @@ CRM-интеграция (`0012`) добавила 7 ключей:
 | `initial_sent_text` | text | что реально отправили первым |
 | `status` | string | `starting` / `active` / `paused` / `failed` / `stopped` |
 | `in_chat` | bool | текущее состояние InChat (дубликат для восстановления при рестарте) |
-| `last_our_activity_at` | timestamp | время последнего нашего сообщения |
+| `last_our_activity_at` | timestamp | служебная метка нашей активности: обновляется также после генерации/enqueue, до отправки; не является подтверждением доставки |
 | `last_their_message_at` | timestamp | время последнего сообщения собеседника |
 | `last_any_message_at` | timestamp | max двух выше — для расчёта enter-timer |
 | `last_error` | text | последняя ошибка (nullable) |
@@ -1312,6 +1361,23 @@ HTML-выгрузка по сессии, завершённой штатным L
 
 ---
 
+### Дополнения схемы для восстановления (0027–0029)
+
+| Поле / таблица | Семантика |
+|---|---|
+| `messages.saved_at TIMESTAMPTZ` | Момент первого сохранения: DEFAULT NOW() только для будущих вставок; исторические NULL не заполняются выдуманным временем |
+| `dialogs.status_source`, `status_source_message_id` | Источник последнего перехода и watermark последнего неудалённого сообщения для проверки позднего входящего |
+| `dialogs.crm_finalization_version BIGINT DEFAULT 0` | Триггер увеличивает версию при изменении status/reason; защита от устаревшего CRM push |
+| `accounts.worker_desired_running BOOLEAN NOT NULL DEFAULT FALSE` | Сохранённое разрешение восстанавливать Telegram-воркер; миграция не выводит его из старого Redis running/is_active |
+| `autochat_reply_batches` | Durable-намерение и ответ: session/dialog/account, исходное входящее, phase, JSON segments, next_index, finish_requested, parent/error/timestamps |
+| `partner_crm_finalizations` | Одна запись на dialog: desired version/status, source status/reason, account/username, state, attempts, reconcile flag, next attempt, подтверждение/ошибка |
+
+Фазы ответа: `generating`, `ready`, `sending`, `finishing`, `review`, `complete`, `superseded`. Частичный уникальный индекс разрешает одну незавершённую запись на диалог (первые пять фаз), включая неоднозначный `review`; подтверждения отправленных сегментов сохраняются. Фазы CRM: `pending`, `sending`, `retry`, `confirmed`, `review`, `superseded`. Добавлены индексы для journal/recovery и поиска медиа сообщения; индекс media создаётся обычным транзакционным DDL, без разрыва атомарности миграции. Downgrade 0027 отказывается удалять журнал с незавершёнными строками.
+
+Владелец journal — AutoChat, CRM-журнала — partner_crm. Изменения связанных колонок dialogs выполняют history/statuses/watcher/evaluator под общим порядком блокировки строки диалога; сетевые вызовы не держат эту транзакцию. `history` может вызвать `reply_journal.stage_input` на уже захваченном соединении, не открывая вторую транзакцию и не отправляя сообщения.
+
+---
+
 ## 7. Шина событий
 
 Шина событий — центральное место, через которое все компоненты системы обмениваются информацией. Модули не общаются друг с другом напрямую: они знают только о шине. Технологически шина построена на **Redis Streams** (живые события для доставки в реальном времени) с архивом в **PostgreSQL** (таблица `events_archive`).
@@ -1385,7 +1451,9 @@ Poison-сообщение видно в общем логе и в `events_archiv
 
 ### 7.4. Обработка ошибок
 
-Все ошибки публикуются на шину со статусом `error` — отдельных систем сбора ошибок нет. Различают два типа:
+**Уточнение фактических повторов (2026-10-27).** `core.bus.read_group` читает новые события через `XREADGROUP ... >`; автоматического возврата pending через `XCLAIM`/`XAUTOCLAIM` или отдельного чтения PEL нет. `record_failure` сам не планирует повтор. Необработанное исключение без ACK не гарантирует новую попытку; перехваченное исключение с обычным возвратом может закончиться ACK. Terminal CRM finalizer теперь сохраняет отдельный журнал попыток (§15), но общий bus и оценщик от этого не получают автоматического reclaim.
+
+Инструментированные бизнес-ошибки публикуются на шину со статусом `error`; часть исключений (в том числе при редактировании сообщений report-bot и работе фонового тикера) остаётся только в логах процесса. Поэтому отсутствие ошибок в `events_archive` не доказывает их полного отсутствия; диагностика учитывает также логи и незавершённые операции. Для публикуемых событий различают два типа:
 
 - **Ошибки в рамках события** — транскрибация не удалась, файл не загрузился и т.д. Публикуются как обычное событие со статусом `error` и `parent_id` на родительское событие:
 
@@ -1466,7 +1534,7 @@ data: {
 
 **`account.deleted`** — аккаунт удалён. Публикует менеджер воркеров после полного удаления аккаунта и его данных.
 
-**`worker.started` / `worker.stopped` / `worker.crashed` / `worker.restarted`** — статусы воркера. Публикует менеджер воркеров. `worker.crashed` — финальный крах (останавливает auto-runner); `worker.restarted` — транзиентный крах, восстановленный одним авторестартом (auto-runner его игнорирует, см. раздел «Менеджер воркеров»).
+**`worker.started` / `worker.stopped` / `worker.crashed` / `worker.restarted`** — события жизненного цикла воркера. `worker.stopped` публикуется при обычном stop/нормальном выходе; при техническом app shutdown с сохранением intent подавляется, чтобы следующий AutoRunner-consumer не очистил расписание. `worker.crashed` — финальный крах (останавливает auto-runner); `worker.restarted` — транзиентный крах, восстановленный одним авторестартом (auto-runner его игнорирует, см. раздел «Менеджер воркеров»). `worker.started` публикует Worker после подключения, остальные события — менеджер.
 
 #### Нагон истории
 
@@ -1501,6 +1569,10 @@ data: {
 #### Системные
 
 **`system.error`** — системная ошибка. Публикует любой модуль при технической ошибке, не связанной с конкретным сообщением. Поле `account_id` может быть `null`, если ошибка общесистемная. Тип `poison_message` (см. раздел «Poison messages и dead-letter») публикуется шиной как частный случай `system.error`.
+
+**Durable-границы событий.** `message.saved.data` содержит Telegram `date` и `saved_at`. При включённом журнале новое актуальное входящее и намерение его обработки фиксируются в одной history-транзакции **до** публикации `message.saved` и ACK исходного события; падение публикации не теряет намерение. Повтор сообщения не создаёт новую работу. Статус/reason/source/watermark фиксируются атомарно, `dialog.status_changed` публикуется после commit. Журнальный `autochat.finished_by_llm` передаёт идентификаторы batch и исходного входящего для проверки свежести.
+
+Redis PEL по-прежнему не имеет общего автоматического reclaim; незавершённая оценка после ошибки consumer не получает гарантированного повтора от этой правки. Диагностика показывает overdue completion/evaluation. Журнал ответа и CRM-журнал закрывают свои окна, но не предоставляют общей exactly-once гарантии всем событиям, оценкам и отчётам.
 
 ### 7.7. Пример цепочки событий
 
@@ -2047,6 +2119,7 @@ class _Slot:
     started_at: float          # time.monotonic() на момент старта
     restart_count: int = 0
     last_error: str | None = None
+    stop_requested: bool = False
 ```
 
 Все операции старта/остановки/удаления сериализованы через `asyncio.Lock`.
@@ -2088,7 +2161,8 @@ Redis-payload статуса (записывается методом `_set_stat
 |---|---|---|---|
 | `GET /workers` | — | список всех аккаунтов + их статус | массив DTO (ниже) |
 | `POST /workers/{account_id}/start` | — | запустить воркер | `{account_id, status: "starting"}` |
-| `POST /workers/{account_id}/stop` | — | остановить воркер | `{account_id, status: "stopping"}` |
+| `POST /workers/{account_id}/stop` | — | отключить желаемый запуск и остановить; отсутствие task не ошибка | `{account_id, status: "stopping"}` либо `"stopped"` |
+| `POST /workers/{account_id}/recover` | — | восстановить только сохранённое разрешение | `{account_id, status: "starting"}` |
 | `DELETE /accounts/{account_id}` | заголовок `X-Confirm-Delete: yes` | полное удаление аккаунта | `{deleted: true, stats: {...}}` |
 | `GET /workers/stream` | — | SSE-поток изменений статусов | `text/event-stream` |
 
@@ -2113,13 +2187,13 @@ DTO одного элемента `GET /workers`:
 | `ACCOUNT_NOT_FOUND` | 404 | аккаунта нет в `accounts` |
 | `ACCOUNT_INACTIVE` | 409 | `is_active = false` |
 | `ALREADY_RUNNING` | 409 | воркер уже в `_slots` |
-| `NOT_RUNNING` | 409 | слота нет при stop |
+| `RECOVERY_DISABLED` | 409 | recover без сохранённого разрешения или при session_expired |
 | `CONFIRMATION_REQUIRED` | 428 | при delete нет `X-Confirm-Delete: yes` |
 | `SERVICE_ACCOUNT_NOT_STARTABLE` | 409 | попытка запустить сервис-аккаунт доставки как воркер |
 
 #### Сервис-аккаунт доставки
 
-Аккаунт с именем `settings.SERVICE_ACCOUNT_NAME` скрыт из `GET /workers` (`WHERE name <> $1`) и не запускается как воркер: своим Telegram-подключением управляет модуль `report_delivery` (см. раздел «Доставка отчётов»), второй коннект на ту же сессию запрещён. При попытке `start` — `SERVICE_ACCOUNT_NOT_STARTABLE` (409).
+Аккаунт с именем `settings.SERVICE_ACCOUNT_NAME` скрыт из `GET /workers` (`WHERE name <> $1`) и не запускается как воркер: он зарезервирован под legacy `report_delivery` (сейчас отключён); текущий ReportBot использует отдельный bot client. Второй коннект на ту же пользовательскую сессию запрещён. При попытке `start` — `SERVICE_ACCOUNT_NOT_STARTABLE` (409).
 
 #### SSE-поток `GET /workers/stream`
 
@@ -2133,17 +2207,17 @@ DTO одного элемента `GET /workers`:
 1. Под локом проверяет, что `account_id` ещё не в `_slots`, иначе `ALREADY_RUNNING`.
 2. Читает из `accounts` поля `id, name, session_data, proxy_primary, proxy_fallback, is_active`. Если ряда нет — `ACCOUNT_NOT_FOUND`.
 3. Если имя совпадает с `SERVICE_ACCOUNT_NAME` — `SERVICE_ACCOUNT_NOT_STARTABLE`; если `is_active = false` — `ACCOUNT_INACTIVE`.
-4. Ставит статус `starting`, вызывает `_spawn(...)`.
+4. Явный start сохраняет `worker_desired_running=true`, ставит `starting`, вызывает `_spawn(...)`; если создание слота не удалось, возвращает прежний intent. Вариант `recover=True` не выдаёт новое разрешение и проверяет сохранённый intent и отсутствие `session_expired`.
 
 `_spawn` создаёт `Worker(account_id, account_name, session_data, proxy_primary, proxy_fallback)`, оборачивает `worker.run()` в asyncio-таск (`_runner`) и регистрирует слот. Статус остаётся `starting` — в `running` его флипает колбэк `Worker._on_ready` **только после успешного connect** (чтобы UI/`get_wrapper()` не считали воркер живым до реального подключения). Событие `worker.started` публикует сам `Worker` (тонкий супервайзер поверх авто-реконнекта Telethon, см. §8.7): один раз подключается, один раз вешает хендлеры и делает `get_me()`/`get_dialogs()` (снапшот для нагона), запускает нагон, дальше супервизит последовательные свитчи прокси. Из `run()` управление выходит только при `stop()` или `SessionExpired`; сетевые сбои воркер ретраит сам и наружу не эскалирует.
 
 #### stop
 
 `WorkerManager.stop(account_id)`:
-1. Под локом находит слот (иначе `NOT_RUNNING`), ставит статус `stopping`, вызывает `slot.worker.stop()` (аккуратное завершение текущих задач).
+1. Под локом сохраняет `worker_desired_running=false`. Если слота нет, идемпотентно возвращает `stopped`. Иначе выставляет `slot.stop_requested=true`, статус `stopping` и вызывает `slot.worker.stop()` (аккуратное завершение текущих задач).
 2. Вне лока ждёт завершения таска `asyncio.wait_for(slot.task, timeout=30)`; по таймауту — `task.cancel()`.
 
-Финальный статус `stopped` проставляет `_runner` при штатном выходе `worker.run()` (вместе с публикацией `worker.stopped`).
+Финальный статус `stopped` проставляет `_runner` при штатном выходе `worker.run()`. Обычный stop публикует `worker.stopped`; `shutdown()` вызывает `stop(..., preserve_intent=True)` и помечает **конкретный захваченный slot** флагом `suppress_stopped_event`, поэтому техническая остановка процесса не создаёт событие, очищающее расписание после следующего boot. Повторный технический stop не отменяет уже выставленную ручную остановку; manual stop в любом порядке снимает suppression. Проверка принадлежности slot, финальный статус и решение о публикации сериализованы manager lock, а ожидание task в stop остаётся вне lock. Старый runner не меняет статус, не публикует stopped и не удаляет заменивший его slot. Offline manual stop сохраняет прежнюю семантику: отменяет intent без синтетического worker.stopped.
 
 #### Завершение таска `_runner` и обработка падений
 
@@ -2151,7 +2225,8 @@ DTO одного элемента `GET /workers`:
 
 | Исход | Статус | Событие шины |
 |---|---|---|
-| штатный выход | `stopped` | `worker.stopped` (Status SUCCESS) |
+| штатный выход / ручной stop | `stopped` | `worker.stopped` (Status SUCCESS) |
+| штатный выход по app shutdown с сохранением intent | `stopped` | `worker.stopped` не публикуется; расписание остаётся для native resume |
 | `SessionExpired` | `session_expired` | `account.session_expired` (публикует враппер) |
 | `ProxyUnavailable` | `crashed` (+`last_error`) | `system.error` (враппер) + `worker.crashed` |
 | прочее `Exception`, авторестарт **удался** | кратко `crashed` → снова `running` | `worker.restarted` (Status ERROR, `data.error`) |
@@ -2221,8 +2296,12 @@ async def reconcile_on_boot(self) -> None:
 Терминальные `stopped`, `crashed`, `session_expired` не трогаются — `crashed` с `last_error` информативнее голого `stopped`, а `session_expired` — единственный сигнал необходимости reauth.
 
 Решения по дизайну:
-- **Воркеры не поднимаются автоматически.** Старт — осознанное ручное действие оператора через Start; авто-старт дёргал бы Telegram API на каждом `docker compose restart` и мог поднять `session_expired`. Reconcile «в stopped» — честное достаточное состояние.
+- **Сам lifespan не поднимает воркеры.** Ручной Start сохраняет разрешение; отдельно управляемый Windows/Linux recovery (§5.8) использует native `/recover`, повторно проверяющий разрешение под общей с manual stop блокировкой. Reconcile сохраняет честное stopped-состояние до фактического запуска; session_expired не реавторизуется.
 - **Без TTL/heartbeat на Redis-ключе.** Это потребовало бы фонового heartbeat-таска в каждом воркере (лишняя точка отказа) и нагружало Redis. Пока воркеров немного, проход на старте проще. К TTL/heartbeat вернутся, если воркеров станут десятки.
+
+**Сохранённое разрешение и фактическая готовность.** `shutdown()` использует `stop(..., preserve_intent=True)`; техническая остановка процесса, reconcile и переключение прокси не отменяют операторское намерение. `SessionExpired` сбрасывает intent в false. Прозрачный рестарт не выполняется при `stop_requested`. Миграция 0029 задаёт false всем существующим аккаунтам: первичное заполнение допускается только по отдельно проверенному списку фактически разрешённых воркеров, не по кэшированному running и не по outreach-исключениям. Сервисный аккаунт по `SERVICE_ACCOUNT_NAME` исключён.
+
+`GET /system/readiness` читает `accounts` и actual in-memory slot/task/wrapper, возвращая `ready`, `desired`, `connected`, `desired_connected`, `task_alive`, а также `workers` с account_id, is_active, desired_running, status, task_alive, connected, recoverable. `status` из Redis показан отдельно и не доказывает жизнь. Готовность означает подключение всех разрешённых воркеров, не наличие свежего входящего. Телефонов, сессий и proxy credentials в ответе нет; прежняя семантика `/system/health` не меняется.
 
 ### 10.5. Авто-раннер воркеров (Worker Auto Runner)
 
@@ -2729,6 +2808,14 @@ parent_id = id исходного message.received
 
 ---
 
+### Защита нового входящего и позднего ответа после тишины
+
+History сохраняет сообщение, медиа и (при `autochat.reply_journal_enabled=true`) intent `generating` в одной транзакции под уже взятым lock строки диалога. Intent создаётся только для нового последнего входящего в последнюю активную AutoChat-сессию и при отсутствии защищённого завершения. Это происходит до `message.saved`, enter/reply-таймеров и LLM. Повтор Telegram-сообщения, старый импорт, выключенный флаг или защищённое решение не создают работу. Payload `message.saved` включает `date` и `saved_at`; старый Telegram timestamp не подменяет момент первого локального сохранения.
+
+Перед staging history может вернуть локальный статус в «Общение» **только** если текущий `status_source='event:silence_timer.no_response'`, есть watermark и входящее строго новее него по `(date, telegram_message_id, id)`, это актуальное последнее сообщение, последняя сессия активна, оценки и любой модерации нет. Reason допускается `no_response` или NULL (CRM finalizer после подтверждения очищает reason). Изменение атомарно очищает pending reason, записывает source `event:message_received.late_inbound` и новый watermark; событие статуса публикуется после commit. Исторический неизвестный source, ручная остановка, failed, успех, невалид и модерация не переоткрываются. Обратного изменения уже переданного статуса CRM нет.
+
+---
+
 ## 12. Транскрибация и описание медиа
 
 Два независимых модуля переводят медиа из Telegram в текст для понимания контекста диалога: `modules/transcription` переводит звук в текст (Whisper), `modules/media_description` описывает визуальный контент (GPT-4o). Оба работают по одному шаблону consumer-loop'а, оба читают файл из MinIO байтами и не пишут в БД сами — результат публикуется на шину, в `media` дописывает модуль истории (см. раздел «История диалогов»). Общение с AI-сервисами идёт только через единый клиент `core/openrouter.py`.
@@ -3006,7 +3093,7 @@ modules/autochat/
 | `initial_sent_text` | text | что реально отправили первым сообщением |
 | `status` | string | `starting` / `active` / `paused` / `failed` / `stopped` |
 | `in_chat` | bool | текущее InChat (дублируется в Redis для быстрого чтения, в БД — для восстановления) |
-| `last_our_activity_at` | timestamp | время последнего нашего сообщения |
+| `last_our_activity_at` | timestamp | служебная метка нашей активности: обновляется также после генерации/enqueue, до отправки; не является подтверждением доставки |
 | `last_their_message_at` | timestamp | время последнего сообщения собеседника |
 | `last_any_message_at` | timestamp | `max(above)` — для расчёта enter-timer |
 | `last_error` | text | последняя ошибка (nullable, для UI) |
@@ -3079,7 +3166,7 @@ _media_ready  (asyncio.Event)  ← сигнал «медиа готово» → 
 **Зачем разделять planner и sender:** собеседник может написать, пока мы отправляем предыдущий ответ. С разделением новое сообщение запускает новый reply_timer → новая генерация идёт параллельно с текущим send → результат ложится в очередь, и sender доберётся до него, закончив текущий набор. Для пользователя это выглядит естественно: две пачки ответов подряд.
 
 **Зачем сериализовать отправку:** только один sender_loop на сессию, никогда два. Без этого при двух параллельных генерациях второй ответ начал бы печататься, пока первый ещё не дописан — в UI Telegram это глюк.
-**Зачем сериализовать генерацию (`self._generating`).** И `planner_loop`, и принудительная `force_generate_reply` (её дёргает догон missed-inbound по событию `worker.started` при рестарте воркера) теперь идут через ОДИН `asyncio.Lock` `self._generating`. Раньше `planner_loop` генерил без лока, и при рестарте воркера на одно inbound уходило ДВА ответа: `force_generate_reply` генерил ответ A, а `reply_timer` планнера через 30с — ответ B. Внутри лока — re-check: если `last_our_activity_at >= last_their_message_at` (кто-то уже ответил на последнее inbound), генерация пропускается. `last_our_activity_at` метится СРАЗУ после постановки сегментов в `send_queue` (а не только после реальной отправки в `_send_segment`), иначе селектор missed-inbound (`last_their > last_our`) продолжал бы выбирать эту сессию до конца отправки, и повторный `worker.started` регенерил бы дубль. Если генерация уже идёт, второй вызов `force_generate_reply` просто выходит (`skipped: already_generating`).
+**Сериализация генерации (`self._generating`).** Планнер, ручная генерация и recovery используют общий lock и перепроверяют актуальность работы. В legacy-ветке при выключенном journal сохранено подавление генерации по `last_our_activity_at`, обновляемому уже после enqueue; это не подтверждение доставки. При включённом журнале источником незавершённой работы служит batch (§13.10), а поздний результат LLM, устаревшая очередь и finish проверяются относительно исходного входящего. RAM-очередь сама по себе по-прежнему непостоянна.
 
 #### Bump-pattern (дебаунс reply_timer)
 
@@ -3203,6 +3290,7 @@ _by_tg_user:     {(account_id, telegram_user_id): session_id}
 | `message.saved` | Поймать сообщение по `dialog_id` ∈ активных (или `telegram_user_id`). Обновить `last_their_message_at` / `last_any_message_at`; для `is_outgoing=true` — `last_our_activity_at`. |
 | `message.updated` | Дождаться готовности `transcription` / `description` у inbound. Пока не готово — не стартуем reply_timer. |
 | `dialog.typing_observed` | Перезапустить reply_timer, если идёт. В `InChat=0` — игнор (typing не запускает вход в чат). Публикуется враппером. |
+| `worker.started` | Включённый journal: только сохранённая работа и отдельный флаг recovery (§13.10). Выключенный journal: прежняя ветка активных сессий с TTL 6 часов. |
 
 | Событие (публикует) | Когда |
 |---|---|
@@ -3271,6 +3359,8 @@ AutoChatError (base)
 #### Восстановление при рестарте
 
 `AutoChatService.run()` после `ensure_group` и до consumer-loop зовёт `_restore_active_sessions()`. Для каждой строки `WHERE status='active'`: принудительный сброс `in_chat=False` (таймеры enter/idle рестарт не переживают; следующее inbound нормально запустит enter-timer), создание `AutoChatSession`, регистрация в индексах, `session.start()`. Persist `in_chat=false` делается первым `_persist_state()` внутри `start()`. Воркер на момент restore может быть ещё не запущен (стартует вручную) — сессия просто ждёт событий, оживёт при первом inbound после поднятия воркера. Restore передаёт `on_finished_by_llm` callback — маркер финиша работает и для восстановленных сессий.
+
+После `worker.started` выбор зависит от глобального флага журнала. При выключенном `reply_journal_enabled` остаётся legacy-селектор `last_their_message_at > COALESCE(last_our_activity_at, epoch)` с TTL 6 часов; enqueue может скрыть потерянную RAM-очередь. При включённом журнале legacy-селектор **не вызывается**, даже если отдельный флаг recovery выключен: восстанавливаются только новые сохранённые задания по §13.10. Старые сессии без журнала не переигрываются. `stop_session()` удаляет сессию из индексов, поэтому её позднее входящее сохраняется history, но автоматически не включает AutoChat. Происхождение статуса тишины хранится отдельно; оно не отменяет ручной stop.
 
 ### 13.7. Редактируемые промты (per-worker, freeform editor, preview)
 
@@ -3377,6 +3467,18 @@ Pydantic-лимиты: `username` 1–64, `system_prompt` 1–20000, `initial_pr
 | `autochat.openrouter_retries` | `2` | Ретраи при ошибке OpenRouter |
 | `autochat.typing_ms_per_char` | `40` | Имитация печати — мс на символ |
 
+
+---
+
+### 13.10. Журнал ответа и ограниченное recovery
+
+`modules/autochat/reply_journal.py` сохраняет future intent до LLM (для входящих — ещё в history-транзакции), затем результат и готовые сегменты до enqueue. Перед каждым Telegram RPC фаза становится `sending`, после подтверждения записываются Telegram ID и `next_index`. Уже подтверждённые части не отправляются повторно. `finish_requested` выполняется после сегментов; `finishing` защищает публикацию `autochat.finished_by_llm` с `reply_batch_id` и `input_message_id`. Успешная фиксация завершает batch. Первое outreach-сообщение этим журналом не покрывается.
+
+Порядок блокировок: диалог → batch; перед generation/store/enqueue/каждым segment/finish перепроверяются последняя сессия, входящее, terminal/evaluation/moderation. Новое входящее делает старый результат неактуальным. Подтверждённая старая отправка сохраняется как факт, но не считается обработкой нового входящего. Неопределённый RPC (`sending` без подтверждения) и незавершённая публикация finish переводятся в `review`, **без resend**. Совпадение текста не доказывает доставку; exactly-once не обещается.
+
+На `worker.started` восстановление разрешено только при обоих флагах true. Выбираются pending записи активных сессий; ручные stopped, failed, закрытые/оценённые/модерируемые диалоги не оживают. Используется существующий подключённый wrapper, без дополнительной Telethon-сессии: проверяются последние 100 Telegram-сообщений, их наличие в сохранённой неудалённой истории и исходный anchor. Нет достоверной истории — нет отправки. `history_anchor_outside_window` требует разбора, а не увеличения окна. Только выбранные session IDs с `history_not_caught_up` могут получить до трёх дополнительных проверок через 1/5/15 секунд; используются per-account singleflight и семафор на четыре аккаунта. Это ограниченный догон одного события, не периодический полный скан.
+
+`generating` повторно использует уже сохранённый intent через ожидание медиа и захват генерации; отмена recovery его не стирает. `ready` продолжает только оставшиеся достоверно не отправленные сегменты обычным sender с паузами. Busy live-генерация/отправка/очередь не дублируется. Если LLM вернула устаревший результат, а idle уже вывел из InChat, новый enter-таймер ставится только при актуальном pending intent; существующие настройки пауз и общий cooldown не меняются. Глобальные флаги по умолчанию false; per-account pilot в коде отсутствует. Нет backfill старых диалогов, периодического восстановления всего архива, автоматического снятия review или восстановления решения CRM.
 
 ---
 
@@ -3506,7 +3608,7 @@ FloodWait разделён на короткий/длинный по порог�
 `modules/dialog_statuses/` — автономный модуль (`__init__.py` + `service.py` + `routes.py`):
 
 - Каталог: `list_statuses / create_status / update_status / delete_status / get_status`.
-- `set_dialog_status(dialog_id, status_id, *, source)` — единственная точка присвоения статуса. Зовётся и из UI (через ручку), и будущей автоматизацией (`source="event:autochat.finished_by_llm"` и т.п.).
+- `set_dialog_status(dialog_id, status_id, *, source, expected_status_id=UNSET)` — обычная точка присвоения статуса. Под lock строки диалога записывает status/source/watermark; optional CAS различает отсутствие проверки и ожидаемый NULL. При несовпадении возвращает `changed=false` без события; обработчик `message.saved` использует CAS, чтобы не стереть новое решение. Watcher/evaluator/history могут записать согласованные поля в своей общей транзакции и вызвать `publish_status_changed` после commit.
 
 Маршруты:
 
@@ -3533,7 +3635,7 @@ FloodWait разделён на короткий/длинный по порог�
 - Тип `DialogSummary`: поле `user_status` → `status: DialogStatusRef | null` (`DialogStatusRef = { id, label, color }`); enum `DialogUserStatus` убран. `setDialogStatus(dialogId, statusId: number | null)`. Временный адаптер, мостивший старые 4 ключа на новый бэкенд (введён вместе с бэкендом для атомарного коммита), полностью снят.
 - Vite-прокси: префикс `/dialog-statuses` добавлен в `modules/ui_web/vite.config.ts`. Был баг — рядом лежал устаревший артефакт `vite.config.js` (оба в `.gitignore`, но локально присутствовали); Vite v6 резолвит `.js` раньше `.ts` и читал старые правила. Лечится удалением `vite.config.js` / `vite.config.d.ts` с диска. Диагностический приём: `ls modules/ui_web/vite.config.*` должен вернуть только `.ts`.
 
-Программное проставление статуса от событий шины архитектурно готово (снаружи вызвать `set_dialog_status`), но отдельный listener-модуль — отложенная задача. SSE-инвалидация каталога по `dialog_statuses.catalog_changed` пока не подключена (хватает `staleTime: 60_000` + ручной refetch).
+Программные переходы выполняют `lead_evaluator`, `silence_watcher` и узкая ветка late-inbound в history; CAS/source/watermark защищают их от устаревших решений. SSE-инвалидация каталога по `dialog_statuses.catalog_changed` пока не подключена (хватает `staleTime: 60_000` + ручной refetch).
 
 ### 14.4. Пополнение CRM-пула (refill)
 
@@ -3568,6 +3670,14 @@ curl -X POST http://localhost:8000/partner-crm/pool/refill \
 Контекст: `/start` партнёрской CRM нам не подходит (`409 l1_account_not_assigned` — требует привязки TG-аккаунта через `/set-primary-account`, у нас свой Telethon). `/status` работает без привязки и служит каналом управления лидом — и для `in_progress`, и для финальных значений.
 
 ### 14.5. Обработка ошибок и устойчивость
+
+#### Диагностика обработки входящих (ручной read-only endpoint)
+
+Свежие события воркера и успешный `/system/health` не доказывают обработку каждого входящего. Реализован ручной read-only `GET /autochat/attention`: `account_id` optional, `limit` 1–500 (default 100), `after_dialog_id` для постраничного прохода. Snapshot PostgreSQL читается в repeatable-read с timeout 10 секунд; live-состояние только считывается из памяти. Ответ содержит observed_at, scope=`dialog_page`, scanned_dialogs, next_after_dialog_id/has_more, counts, review_count, items, snapshot_errors/limitations. Счётчики относятся **только к странице**, не ко всему проекту.
+
+Классификация различает обычные enter/reply/media/delivery/generation паузы, processing unconfirmed, generation failed, unknown send/review, отключённый worker, незарегистрированную/остановленную/failed сессию, terminal/moderated follow-up, completion/evaluation pending и overdue. Учитываются discovery time и ограниченный grace; недоступный live snapshot не объявляется healthy. Входящее без исходящего — кандидат, а не само по себе ошибка или команда ответить. Endpoint не раскрывает текст переписки и не вызывает LLM, Telegram или CRM. Автономного периодического монитора/уведомлений нет. HTML/report delivery сохраняют прежний контур; неопределённая доставка отчёта требует проверки, не снятия dedup и массовой пересылки.
+
+Сборка HTML и его доставка в группу также могут закончиться перехваченной ошибкой с ACK события; собственного постоянного расписания повторов у этих операций нет. Это отличается от отложенного CRM-push модерации. У report-bot есть окно между отправкой файла и сохранением `report_moderation`: отсутствие строки не доказывает отсутствие сообщения в Telegram, поэтому повторную отправку нельзя делать только по этому признаку. Существующий Redis claim не является подтверждением фактической доставки. При неопределённом исходе нужна отдельная сверка (§19.6).
 
 #### Автозапуск оценщика после `<finishdialog/>` (dispatch finished_by_llm)
 
@@ -3671,11 +3781,7 @@ except RPCError as e:
 ### Принципы интеграции
 
 1. **CRM — внешний контур, своих сущностей не плодим.** Лид = диалог. Никакой таблицы `leads`; связь с CRM держится колонками на `dialogs`. `dialogs.username` совпадает с CRM-идентификатором, поэтому отдельная колонка `partner_crm_id` не нужна.
-2. **С CRM общаемся ровно два раза за лида**: при взятии в работу (`POST /leads/:u/start`) и при финальном закрытии (`POST /leads/:u/status`). Между этими касаниями партнёр о статусе ничего не слышит — промежуточные пузыри живут локально.
-3. **Межмодульная коммуникация только через шину** (см. раздел «Шина событий»). `partner_crm` не дёргает `autochat` напрямую, оба слушают/публикуют события.
-4. **Каждая таблица — собственность одного модуля.** `crm_lead_pool` принадлежит `partner_crm`, `lead_evaluations` — `lead_evaluator`.
-5. **Промты редактируются вживую** — файлы в `prompts/`, как у autochat (HTML-комментарии вырезаются).
-6. Двусторонняя синхронизация (если партнёр сам сменит статус) не реализована: работает только направление «мы → они». Переоткрытие лида после терминального статуса считаем недоступным (CRM возвращает `400 lead_status_locked` для финальных `approved`/`transferred`).
+2. **Два основных бизнес-перехода:** взять лида в работу и передать финальный результат. Фактических HTTP-запросов может быть больше: чтение карточки, модерация/назначение L2, ограниченный retry и reconciliation. Это не обещание ровно двух сетевых вызовов.
 
 ### Партнёрская CRM: API и токен
 
@@ -3780,6 +3886,8 @@ lead_evaluations
 
 Единственная точка общения приложения с CRM. Файлы: `__init__.py`; `errors.py` (`PartnerCrmError` → `NotConfigured`/`CrmHttpError`/`InvalidStatus`); `client.py` (async httpx-обёртка над `/api/l1/*`); `service.py` (`PartnerCrmService`); `routes.py`; `poller.py`; `finalizer.py`. Один httpx-клиент на всё приложение (keep-alive); в lifespan создаётся один `PartnerCrmService`, владеющий клиентом и закрывающий его на shutdown.
 
+**Граница гарантии доставки статуса (2026-10-27).** Terminal finalizer использует собственный durable-журнал §6 и ограниченный retry ниже. Модерация остаётся отдельным существующим контуром `report_moderation`: тикер, `push_after`, `push_attempts`, `push_error`, до трёх попыток с паузами 15 и 60 минут. Общий per-dialog lock защищает terminal push, callback выбора и push модерации в текущем единственном процессе; это не распределённый lock. Сетевая ошибка не стирает уже выбранное решение модератора. Исторические ошибки автоматически не backfill-ятся.
+
 `PartnerCrmService` методы: `pool_size`, `list_pool`, `refill_pool`, `claim_lead_for_account`, `reinsert_into_pool`, `push_lead_started`, `push_lead_finalized`, `get_preferences`. **Простая модель (2026-07-13, решение владельца):** `claim_lead_for_account` СРАЗУ удаляет забранного лида из пула (`FOR UPDATE SKIP LOCKED` + `DELETE` в одной транзакции), поэтому ВСЕ строки `crm_lead_pool` — свободные: `pool_size` = `SELECT COUNT(*) FROM crm_lead_pool` без фильтра, `list_pool` показывает все строки. `reinsert_into_pool` просто вставляет лида обратно (`INSERT ... ON CONFLICT (username) DO UPDATE SET fetched_at=NOW()`, освежает позицию в очереди) — без attempts/штрафа, всегда возвращает `True`. `reap_stale_claims` УДАЛЁН: раз claim не оставляет `claimed_at`, зависших claim'ов не бывает и реапер не нужен. Колонки `claimed_at`/`assigned_account_id`/`attempts` и индекс `crm_lead_pool_free_idx` **дропнуты миграцией `0022`** (2026-07-13) — в `crm_lead_pool` остались только `id`/`username`/`gender`/`fetched_at`.
 
 #### Эндпоинты `/partner-crm/*`
@@ -3846,25 +3954,13 @@ HistoryService._on_message_received → _upsert_dialog
 
 #### Финализатор (`PartnerCrmFinalizer`)
 
-Фоновый consumer (consumer group `partner-crm-finalizer`) на событие `dialog.status_changed`. При появлении терминального пузыря на CRM-диалоге отправляет касание №2:
+Consumer `partner-crm-finalizer` слушает `dialog.status_changed`. Для CRM-диалога с terminal-кодом и без **любой** строки модерации он под lock диалога сохраняет snapshot desired status/version и source status/reason в `partner_crm_finalizations` до HTTP. Первый запрос остаётся реакцией на новое событие и не требует включённого retry. Подтверждённая версия дедуплицируется; очистка reason после успеха не создаёт новый запрос для того же подтверждения.
 
-```
-event dialog.status_changed {dialog_id, status_id}
-        ▼
-SELECT d.from_crm, d.partner_crm_terminal_reason, d.username,
-       ds.partner_terminal_status
-FROM dialogs d JOIN dialog_statuses ds ON ds.id = d.status_id
-        ▼
-1. from_crm = FALSE                                → skip
-2. partner_terminal_status IS NULL (промежуточный) → skip
-3. terminal = stored_reason || partner_terminal_status
-4. POST /api/l1/leads/{username}/status {status: terminal}
-5. UPDATE dialogs.partner_crm_terminal_reason = NULL
-        ▼
-publish partner_crm.status_pushed | partner_crm.status_push_failed
-```
+Перед HTTP сохраняются `sending`/attempt и контрольная следующая проверка (5 минут), поэтому падение после начала запроса не забывается. Успех подтверждает запись; reason очищается только при совпадении версии/исходного статуса и отсутствии модерации. Новое локальное решение не перезаписывается старым ответом сети.
 
-Источник правды для кода — `dialogs.partner_crm_terminal_reason` (что решили послать), а не `partner_terminal_status` пузыря; пузырь — fallback на случай ручного выставления оператором (тогда `stored_reason` пуст). После push `stored_reason` обнуляется — защита от повторной отправки. Push не блокирует ack: если CRM недоступна, ловится `PartnerCrmError`, событие ack-ается, на шину уходит `partner_crm.status_push_failed` (иначе consumer-group завис бы на одной группе событий при долгом сбое CRM).
+Отдельный тикер включается только `partner_crm.finalizer_retry_enabled=true`: каждые 60 секунд, до 20 записей за проход. Временные network/429/5xx ошибки допускают до трёх попыток с интервалами 15 и 60 минут; постоянные 401/403/404 и неоднозначные случаи переходят в `review`. Перед повтором выполняется GET карточки: совпавший желаемый статус подтверждается локально **без POST**; другая финальная стадия, неизвестный/чужой владелец защищаются. POST разрешён только если карточка ещё `in_progress`, владелец совпадает с явно настроенным числовым `partner_crm.retry_owner_id`, а локальный snapshot после GET всё ещё актуален. Пустой owner запрещает такую повторную мутацию.
+
+Журнал не является сканером всех старых `partner_crm_terminal_reason` и не подделывает строки модерации для no_response. Ошибки/подтверждения по-прежнему публикуются как `partner_crm.status_push_failed` / `partner_crm.status_pushed`. Общего reclaim Redis PEL этот механизм не добавляет.
 
 ### Локальные статусы: 7 пузырей
 
@@ -3905,7 +4001,9 @@ publish partner_crm.status_pushed | partner_crm.status_push_failed
 **Timer-driven** (`SilenceWatcher` — отдельная фоновая таска, не блокирует consumer, раз в `lead_evaluator.silence_check_interval_sec`):
 
 - «Общение» + последнее **входящее** старше `silence_to_obryv_hours` (4ч) → «Обрыв». По входящему, а не по любому сообщению: если мы пингуем, а лид молчит — это всё ещё обрыв (JOIN с `messages` по `is_outgoing=false`).
-- «Первый контакт» / «Обрыв» + любое сообщение старше `silence_to_close_hours` (48ч) → «Завершен провал». Reason пишется ДО смены статуса, в одной транзакции: сначала `UPDATE dialogs.partner_crm_terminal_reason='no_response'`, затем `set_dialog_status` (который публикует `dialog.status_changed`), чтобы финализатор увидел согласованное состояние.
+- «Первый контакт» / «Обрыв» + последнее актуальное сообщение старше `silence_to_close_hours` (48ч) → «Завершен провал»/`no_response`. После грубой выборки каждый кандидат перепроверяется в короткой транзакции с `SELECT ... FOR UPDATE` диалога: текущий status/reason, свежая неудалённая история, оценка, модерация и pending batch. Status/reason/source/watermark пишутся атомарно; событие — после commit. Та же защита применяется к переходу 4ч в «Обрыв». Для недавно обнаруженной истории grace учитывает `max(date, saved_at)`; исторический NULL не превращается в выдуманное время.
+
+`SilenceWatcher` не вызывает остановку AutoChat. Он пропускает защищённое завершение, любую оценку/модерацию, batch в generating/ready/sending/finishing/review, а также активную AutoChat-сессию с последним входящим: это наша необработанная работа, а не молчание лида. Позднее новое входящее может локально вернуть доказанно закрытый именно таймером no_response диалог в «Общение» по строгим условиям §11; неизвестное происхождение остаётся без изменений. CRM-результат обратно не переводится. Разовая остановка 23 298 сессий 15 октября не является штатным watcher и автоматически не отменяется.
 
 ID пузырей кэшируются по лейблу в памяти процесса (`_label_cache`, без TTL, ≤6 меток): `message.saved` — частое событие, SELECT по каталогу на каждое было бы избыточен. При переименовании пузыря старый ключ промахнётся, новый подтянется при следующем обращении.
 
@@ -3972,15 +4070,15 @@ LLM возвращает теги по аналогии с `<msg>`/`<finishdialo
 4. openrouter.chat_completion(..., model=OPENROUTER_MODEL_EVALUATOR)   (+1 ретрай при непарсе)
 5. UPSERT lead_evaluations (UNIQUE dialog_id)
 6. UPDATE dialogs.partner_crm_terminal_reason:
-     verdict=success → 'ready_for_transfer'
+     verdict=success → NULL (дальше решение принимает модератор)
      verdict=archive → 'no_response'
-7. dialog_statuses.set_dialog_status — терминальный пузырь:
+7. В той же транзакции — status/source/watermark:
      success → "Модерация"   (терминальный пузырь ставит report_bot после пуша)
      archive → "Завершен провал"
 8. publish lead_evaluator.completed  (или .parse_failed при битом парсинге)
 ```
 
-`set_dialog_status` публикует `dialog.status_changed` внутри себя — это и есть сигнал финализатору `partner_crm` запушить статус в CRM. `partner_crm_terminal_reason` пишет именно `lead_evaluator` (там принимается решение «что хотим послать»), а читает `partner_crm` в момент push — один писатель. Маппинг вердикта в пузырь — лукапом по лейблу (`"Модерация"`/`"Завершен провал"`); при переименовании терминального пузыря оператором привязка теряется, пишется warning.
+Для автоматического `finished_by_llm` оценщик проверяет batch/input и защищённое решение до вызова LLM, затем после ответа вновь захватывает dialog lock и проверяет свежесть. Только актуальная оценка атомарно пишет `lead_evaluations`, reason, status/source/watermark; события публикуются после commit. Поздний ответ оценщика не закрывает диалог поверх нового входящего или решения модератора. Остановка сессии по finish также условна относительно того же batch. При успехе reason=NULL и статус «Модерация»; archive ставит no_response/«Завершен провал». Ручная оценка остаётся явным операторским действием. Автоматического reclaim потерянного задания оценщика нет; overdue показывается диагностикой.
 
 #### Эндпоинты `/lead-evaluator/*`
 
@@ -4077,7 +4175,11 @@ ReportConsumer → save_report_for_dialog → MinIO {success|failed|archive}/...
 
 ## 16. Доставка отчётов
 
-Модуль `report_delivery` — изолированная надстройка, которая автоматически заливает HTML-отчёты по успешно завершённым диалогам в Telegram-группы выгрузки через выделенный сервисный аккаунт. До этого модуля оператор забирал файлы из MinIO вручную.
+**Текущий контур — `report_bot`.** Отдельный MTProto bot client доставляет success HTML и кнопки в настроенные семейные группы, хранит `report_moderation` и передаёт выбранный результат в CRM. Legacy `ReportDeliveryService` отключён в lifespan с 2026-08-23; его service22-прокси не участвуют в текущем ReportBot. Общий per-dialog guard сериализует callback выбора и CRM-push с terminal finalizer; существующие три попытки модерации с паузами 15/60 минут сохранены, сетевая ошибка не стирает choice. Готовый HTML, подтверждённая отправка в группу и решение модератора — разные факты.
+
+### Legacy ReportDeliveryService (сохранённый отключённый модуль)
+
+Описание ниже относится к сохранённой прежней реализации `report_delivery`, а не к активному ReportBot. Она автоматически заливала HTML через выделенный сервисный аккаунт; её схема приведена для сопровождения оставленного кода.
 
 Модуль не трогает схему БД (миграций нет), не добавляет UI и не правит лид-воркеров. Он состоит из bus-консьюмера `ReportDeliveryService`, тонкого метода `send_file` во враппере, трёх событий шины, двух ключей конфигурации и фильтра в `WorkerManager`, скрывающего сервис-аккаунт.
 
@@ -5207,6 +5309,19 @@ UPDATE-only хранилище key→value (все ключи приходят �
 
 ---
 
+### 18.17. Диагностика и управляемое восстановление
+
+| Метод / путь | Контракт |
+|---|---|
+| `GET /system/readiness` | Read-only actual task/connection и desired intent; infrastructure health остаётся отдельным |
+| `POST /workers/{account_id}/recover` | Только уже разрешённый активный worker, не session_expired/service; HTTP 409 RECOVERY_DISABLED при отсутствии разрешения |
+| `POST /workers/{account_id}/stop` | Идемпотентно отключает durable intent даже при отсутствии live task |
+| `GET /autochat/attention?limit=100&after_dialog_id=0` | Ручной read-only постраничный анализ; optional account_id; счётчики только текущей страницы, без LLM/TG/CRM-вызовов |
+
+Эти ручки не запускают новый outreach и не импортируют лидов. Readiness не заменяет проверку обработки диалогов, attention не является командой автоматического ответа. Детальные предикаты и границы — §10, §13, §14.
+
+---
+
 ## 19. Известные проблемы и исправления
 
 Раздел фиксирует значимые дефекты, разобранные в ходе эволюции проекта, их корневые причины, итоговое решение и текущее состояние (закрыто / частично / открыто), а также результаты аудита кодовой базы и сводку нерешённых вопросов на дату сборки спецификации (2026-06-26).
@@ -5406,6 +5521,33 @@ WHERE a.lead_source = 'partner_crm' AND war.is_running = TRUE
 
 **Текущее состояние.** Закрыто. Дедуп «никогда повторно одному человеку» держится на двух уровнях: железобетонный — глобальный `telegram_user_id` в `create_session`; дешёвый пре-фильтр — `contacted_leads` по username в `claim_lead_for_account` и `_take_into_pool` (не тратим цикл на заведомо контактированного). Реестр переживает wipe, потому что бэкфилится из durable-лога.
 
+
+---
+
+### 19.6. Пропущенные ответы и восстановление — ВКЛЮЧЕНО (2026-10-27)
+
+Дополнение 2 ноября: для переноса на Linux подготовлены start-only Compose unit и bounded worker recovery helper (§5.8), а также узкий slot-local guard штатного app shutdown: отложенный `worker.stopped` больше не создаётся технической остановкой и не очищает расписание после следующего boot. Manual stop, final crash и session expiry сохраняют прежнюю семантику. Это не watchdog после каждого app restart и не механизм переигрывания исторических диалогов/кампаний. До отдельной deployment-квитанции наличие исходников не доказывает установку на сервере.
+
+**Состояние:** решение проверено изолированно и включено в production 27 октября. Миграции имеют безопасные defaults: reply journal/recovery/CRM retry false, CRM retry owner пуст, worker desired intent false. На данном хосте три флага включены; owner 1367/l1_ai_eka подтверждён свежими CRM GET, intent установлен ровно для 64 проверенных живых воркеров, кроме service22 и MESSI_05/71. Флаги глобальные: отдельного per-account pilot нет. Новые журналы не заполнялись историческими диалогами.
+
+| Проблема | Реализованная защита | Граница |
+|---|---|---|
+| Входящее сохранено, таймер/очередь потеряны при сбое | Intent в history-транзакции, результат до enqueue, подтверждения сегментов в PostgreSQL | Только новая работа при включённом journal; старый архив не переигрывается |
+| Telegram мог принять сообщение до падения | Sending-checkpoint и сохранённый Telegram ID | Неизвестный RPC → review без resend; exactly-once не обещается |
+| Старый результат LLM/finish после нового входящего | Проверки версии входящего, batch и решения до/после LLM и перед segment/finish; условная остановка/оценка | Ручные решения, успех/невалид/модерация защищены |
+| Таймер закрывает одновременно пришедшее входящее | Общая блокировка dialog с history, атомарные status/reason/source/watermark, проверка pending работы | Watcher не останавливает сессию; старые ручные остановки не отменяются |
+| Поздний ответ после доказанной тишины | Узкий local reopen при точном source/watermark и активной последней сессии, без оценки/модерации | Неизвестное происхождение не угадывается; CRM reverse отсутствует |
+| Health зелёный, Telegram не работает | Actual readiness и ручной paged attention | Нет автономного периодического мониторинга/уведомлений |
+| Terminal CRM push потерян после ошибки | Свой журнал/version, ограниченный retry с GET reconcile и проверкой владельца | Старые отказы не backfill-ятся; чужое/новое решение → review |
+| ПК перезагрузился | Один guarded recovery-скрипт и один AtLogOn task текущего пользователя | Только durable-разрешённые workers; без новых кампаний/reauth/socket deletion |
+
+Исходный аудит: `.claude/operations/2026-10-27-health-1605/` и `.claude/operations/2026-10-15-close-silent-48h/`. Исторические PIPITO_03/dialog366017 и SAD_01/dialog392696 после ручной очистки, а также AFERIST_04/dialog410998 с принятым handoff не исправляются слепым ответом или массовым включением stopped. Их содержание и исход требуют отдельного решения. Реакции и `<reactionwait/>` остаются отложенной функцией.
+
+**Проверки.** Изолированная PostgreSQL с полной схемой проверяет реальные SQL-предикаты, row locks, позднее входящее и гонку watcher, durable intent при отказе публикации, crash-границы отправки/finish и CRM reconciliation. Smoke suites покрывают attention, reply journal/recovery, finish freshness, silence recovery, CRM finalization и worker recovery; Windows PowerShell 5.1 проверен через dry-run/WhatIf и сценарии с подменёнными внешними вызовами. Сводный подтверждённый запуск: 123 теста прошли (8,734 секунды); отдельно legacy smoke — 4 PASS, Windows PowerShell — 2 PASS; API импортирован с 76 routes, цепочка миграций до 0029 применена на второй чистой тестовой БД. Позднейшие узкие исправления проходят свои suites; окончательную сводку фиксирует rollout-квитанция. Реальные сообщения лидам для тестирования не отправляются.
+
+**Выполненное внедрение.** Сохранены исходные файлы, схема и baseline 18:20:29 МСК. Перед остановкой нет генераций за 30 минут и свежих входящих активных сессий за 10 минут. Применены миграции 0027–0029, до загрузки нового процесса включены флаги и intent 64 воркеров; обновлён только контейнер app, затем выполнено native-восстановление. В 18:40:51 МСК подтверждены 64 actual primary TCP connections и readiness 64/64. Настройки аккаунтов, прокси, промпты и полные записи runner совпали с baseline; новых кампаний нет. BANAN/MESSI/DORA outreach exclusions, service22 и выключенный MESSI_05/71 сохранены. Windows task зарегистрирован с production ProjectPath. GET attention на трёх исходных проблемных диалогах и проверки пагинации/границ прошли; диагностика ничего им не отправила.
+
+**Откат и оставшиеся пределы.** Сначала выключить recovery/CRM retry, сохранив journal и доказательства отправок. Не удалять незавершённые журналы; downgrade 0027 защищён, downgrade 0028 удаляет CRM receipts и для штатного отката не применяется. Выключение reply_journal_enabled возвращает legacy timestamp recovery, поэтому это не универсальный аварийный выключатель. Уже начатый RPC нельзя считать отменённым остановкой task. Общего Redis PEL reclaim, автоматического восстановления потерянной оценки и outbox для всех отчётов нет; unknown delivery и overdue evaluation требуют разбора. Проверка истории ограничена remote100 и кратким retry только выбранных pending сессий; неготовая история не даёт разрешения отправлять. AtLogOn проверен ручными прогонами без реального reboot; runtime-проверка не заменяет последующее наблюдение за реальным входящим.
 
 ---
 
@@ -5994,7 +6136,7 @@ WHERE a.lead_source = 'partner_crm' AND war.is_running = TRUE
   3. **Маппинг решения в CRM** (`PartnerCrmService.push_lead_moderated`): `Валид, беру` → `POST /assign-l2` на `l2_login` семейства (эндпоинт сам переводит лида в `transferred`), при отсутствии логина или ошибке HTTP — деградация в `ready_for_transfer`; `Валид, не беру` → `ready_for_transfer` без назначения; `Невалид` → `invalid` + добавление в блэклист. Назначаем на L2 **того семейства, чья группа**, а не того, кто нажал.
   4. **Новый пузырь «Модерация»** (промежуточный, `partner_terminal_status = NULL`). Оценщик на `verdict=success` теперь ставит его и **не** пишет `partner_crm_terminal_reason` — то есть финализатор молчит. Терминальный пузырь («Завершен успешно» для обоих валидных исходов, «Невалид» для невалида) выставляет сам `report_bot` уже **после** успешного пуша.
   5. **Защита от двойного пуша.** Когда бот ставит терминальный пузырь, `dialog.status_changed` прилетает финализатору — без защиты тот отправил бы партнёру второй статус, затерев решение модератора (`transferred` → `ready_for_transfer`). `PartnerCrmFinalizer._handle` теперь проверяет `report_moderation.pushed_at IS NOT NULL` и молча выходит.
-  6. **Состояние — в БД, не в памяти** (миграция `0024_report_moderation.py`): `report_families` (семейство → `chat_id` + `l2_login`, засеяно 13 семейств, 8 с логинами: sad, joker, Pipito, Kalaw, Afferist, Face, Extaz, Yasya) и `report_moderation` (выбор, кто и когда нажал, `push_after`, `pushed_at`, `pushed_status`, `push_error`; CHECK на три значения `choice`). Перезапуск приложения не теряет и не дублирует отложенные пуши. Дедуп отправки — Redis-ключ `report_moderation_sent:{dialog_id}` (событие может обогнать появление строки в БД).
+  6. **Состояние — в БД, не в памяти** (миграция `0024_report_moderation.py`): `report_families` (семейство → `chat_id` + `l2_login`, засеяно 13 семейств, 8 с логинами: sad, joker, Pipito, Kalaw, Afferist, Face, Extaz, YASYA) и `report_moderation` (выбор, кто и когда нажал, `push_after`, `pushed_at`, `pushed_status`, `push_error`; CHECK на три значения `choice`). Перезапуск приложения не теряет и не дублирует отложенные пуши. Дедуп отправки — Redis-ключ `report_moderation_sent:{dialog_id}` (событие может обогнать появление строки в БД).
   7. **`report_delivery` отключён** — из `api/main.py` больше не создаётся, код оставлен в репозитории. `REPORT_GROUP_MAP` помечен deprecated (карта переехала в `report_families`), `SERVICE_ACCOUNT_NAME` продолжает прятать служебный аккаунт из `GET /workers`. Имена событий `report.delivered` / `report.delivery_failed` / `report.delivery_skipped` сохранены — статистика по группам осталась непрерывной.
   *Тесты:* `tests/smoke/test_report_moderation.py` — 10 кейсов: три ветки маппинга в CRM, деградация `take` без `l2_login`, таймер не стартует без нажатия, нажатие ставит +4 ч, перевыбор сдвигает срок, после пуша выбор не меняется, «Модерация» не терминальна, оценщик ставит именно её, финализатор видит отметку модерации, карта семейств читается из БД. Все PASS; общий прогон — 16/17 сьютов (падение `test_resilient_worker` предсуществующее, к этой правке отношения не имеет).
   *Проверено вживую:* бот `@batyara7_bot` (id `8999124533`) видит все 13 групп; вброс события по диалогу 226319 (SAD_05_RU / @Natalimurrrr) → отчёт с HTML-файлом, подписью и тремя кнопками доставлен в группу SAD, `push_after = NULL` (таймер корректно ждёт первого нажатия).
@@ -6016,3 +6158,54 @@ WHERE a.lead_source = 'partner_crm' AND war.is_running = TRUE
   *Фикс:* как в `TelegramWrapper.send_file` — байты оборачиваются в `io.BytesIO`, имя задаётся через `.name` (Telethon берёт его оттуда), плюс `force_document=True`, иначе Telegram пытается отрисовать HTML как медиа. MIME при этом остаётся `application/octet-stream` — так помечает HTML сам Telegram, на скачивание и открытие по расширению это не влияет.
   *Восстановление:* семь уже доставленных отчётов **не** переотправлялись (часть была размечена кнопками — переотправка стёрла бы решения). Читаемые копии досланы реплаем к оригиналам отдельным сообщением; разметка, таймеры и `message_id` в `report_moderation` остались нетронутыми.
   Затронуто: `modules/report_bot/service.py`.
+
+- **2026-10-10 — Сокращение общей паузы после flood, только в исходниках.**
+  По указанию оператора общий расчёт `_trigger_flood_recovery` сохранён: положительные `seconds` от Telegram, иначе базовые 15 минут, плюс случайная добавка. Добавка сокращена с 10–20 до 0–5 минут. Без явного срока Telegram итоговая пауза теперь в исходниках составляет **15–20 минут**, с явным сроком N — **N секунд + 0–5 минут**; ниже заданного Telegram срока ожидание не сокращается. Два обращения к SpamBot и пересборка оставшегося расписания сохранены.
+  **Применение отложено:** оператор явно запретил перезапуск. Работающий процесс не перезапускался и не перезагружал код; до будущего штатного перезапуска он продолжает использовать прежние 25–35 минут без явного срока / N + 10–20 минут с явным сроком. Уже записанные cooldown и расписания не изменялись. Квитанция: `.claude/operations/2026-10-10-cooldown/`.
+
+### 2026-10-27 — Минимальный проект устранения пропущенных ответов и уточнение гарантий восстановления
+
+По запросу оператора сопоставлены текущий код, октябрьские квитанции и причины пропущенных ответов. Разделены штатное закрытие по тишине (без остановки AutoChat) и разовая остановка 23 298 старых сессий 15 октября. Подтверждены ограничение recovery шестью часами, отличие enqueue от доставки и инфраструктурного health от работоспособности Telegram. Уточнены отсутствие общей транзакции в silence watcher, ограничения Redis pending и отсутствие автоматического retry в terminal finalizer/сборке и доставке отчётов; существующий CRM-retry модерации сохранён в описании.
+
+В §19.6 зафиксирован **проект, ещё не внедрённый**: сначала общий диагностический разбор без отправок, затем сохранение незавершённого ответа в существующем PostgreSQL с защитой от дублей и устаревшей генерации. Исправление гонки silence, CRM-повторы и запуск хоста выделены в отдельные изменения. Указаны инварианты, границы работы со старыми остановленными сессиями, неопределённым результатом Telegram/CRM, порядок проверки и откат. Реакции и `<reactionwait/>` в эту работу не включены.
+
+Актуализированы текущие разделы **5, 6, 7, 13, 14, 15, 19**, добавлена эта запись §20 и обновлена дата документа. Четыре существующих mock smoke-теста AutoChat resume прошли; их недостаточность для будущего recovery отмечена явно. Код приложения, production-БД, переписки, статусы CRM и конфигурация запуска не менялись, перезапуска не было. Предшествующие незакоммиченные изменения спеки и cooldown сохранены. Квитанция проверки: `.claude/operations/2026-10-27-minimal-recovery-design/verification.json`.
+
+
+### 2026-10-27 — Журнал ответов, защита поздних входящих и управляемое восстановление
+
+Реализован ранее описанный минимальный проект: ручная постраничная диагностика без отправок; durable intent нового входящего в одной history-транзакции; сохранённые сегменты/подтверждения; ограниченный recovery через существующий wrapper; защита устаревшего LLM/finish/оценки; транзакционные таймеры тишины и узкое local reopen доказанного no_response. Unknown Telegram RPC переводится в review без автоматического повтора. Сохранённые ручные остановки и модераторские решения не отменяются.
+
+Добавлены миграции 0027–0029, terminal CRM journal/retry с version/owner reconciliation и общий guard с модерацией, durable worker desired intent, actual readiness, PowerShell recovery и installer одной Interactive AtLogOn-задачи. Общий cooldown и существующий retry модерации сохранены. Реакции не реализованы. Нет backfill старых диалогов, новых кампаний, автоматического reclaim оценщика и периодического монитора.
+
+Проверки проведены на изолированной PostgreSQL и с безопасными сетевыми подменами: сводный запуск 123 тестов PASS (8,734 секунды), отдельно legacy smoke — 4 PASS и Windows PowerShell — 2 PASS, импорт 76 API routes, повторное применение миграций на чистой БД; дополнительные узкие исправления проверяются профильными suites. Новые флаги имеют false defaults, owner пуст, desired intent false без legacy backfill. Подготовленные исходники не означают, что production уже обновлён или Windows task установлен; фактическое внедрение и окончательная проверка оформляются отдельно в `.claude/operations/2026-10-27-recovery-implementation/`.
+
+Актуализированы разделы **5, 6, 7, 10, 11, 13, 14, 15, 16, 18, 19** и эта история. Предыдущая запись проекта решения сохранена как исторический этап; прежние изменения YASYA/cooldown не отменены.
+
+### 2026-10-27 — Включение восстановления в production
+
+По прямому указанию оператора «вводи изменения» применены миграции 0027–0029 и загружен проверенный код. До остановки app сохранены копии изменяемых исходников, schema-only backup, реальные подключения, промпты/прокси и полные настройки расписаний. Миграция 0027 выполняется одной транзакцией: тест с искусственным сбоем до создания индекса подтвердил полный rollback и успешный повтор. При обновлении старый app завершился кодом 137 после 60-секундного stop; перед ним подтверждено отсутствие генераций 30 минут и свежих входящих активных сессий 10 минут. Остальные четыре контейнера не перезапускались.
+
+В 18:38:24 МСК отдельно включены reply journal, reply recovery и terminal CRM retry; владелец 1367/l1_ai_eka проверен через два GET. Worker intent установлен только для 64 уже живых аккаунтов. После загрузки кода native recover восстановил их: в 18:40:51 МСК health OK, readiness 64/64 и 64 фактических TCP-подключения к основным прокси; MESSI_05/71 сохраняет session_expired. Промпты, прокси, source/gender и полные runner-записи совпадают с baseline, все runners off.
+
+Зарегистрирована одна скрытая Interactive AtLogOn-задача `ProjectOutRich-WorkerRecovery`. Повторный ручной запуск завершился ready64/64 без единого нового worker_requested. Read-only attention smoke подтвердил три исторических случая, пагинацию до 500 диалогов и HTTP422 на некорректных границах. В срезе после запуска новых ошибок нет; исторические Redis pending сохраняются и не объявляются исправленными. Исторические stopped-сессии не включались, тестовые сообщения не отправлялись, CRM-статусы вручную не менялись. Реальная перезагрузка Windows и production crash с отправкой лида не выполнялись.
+
+Результат реализации и ограничения отражены в текущих разделах. Полные квитанции и итоговая проверка: `.claude/operations/2026-10-27-recovery-implementation/`.
+
+### 2026-11-02 — Linux-восстановление для переноса на VPS: подготовка исходников
+
+По запросу оператора на перенос проекта подготовлены стандартный Python helper `scripts/recover_workers_linux.py` и два reviewable systemd unit в `deploy/systemd/`. Compose unit только запускает существующие контейнеры с фиксированными project/path/file. Worker unit от отдельного непривилегированного пользователя ждёт health/readiness и запрашивает native recover для сохранённых разрешённых аккаунтов. Защиты: singleton flock, общий deadline, один запрос на ID за прогон, actual task/connection readiness, отказ от remote API/proxy/redirect, maintenance marker, дополнительные исключения22/71. Helper не касается БД, промптов, прокси, лидов и расписаний; существующая native повторная проверка intent сохраняет ручные stops.
+
+Изолированные contract-тесты покрывают восстановление64, manual-stop race, session_expired/denylist, живую отключённую task, неясный POST без повтора, неготовый health, повреждённый снимок, общий deadline, marker между запросами, отсутствие I/O в dry-run, безопасный вывод, запрет redirects/proxy, файловый flock и symlink. На Windows выполнены15 проверок,2 Linux-only пропущены; в одноразовом Linux-контейнере все17 PASS (0,012 секунды), network=none, исходники read-only, без проектных volumes и секретов. Эти проверки не создают Telegram-сессий и не отправляют сообщения.
+
+Область действия намеренно ограничена boot/явным запуском: нет timer/watchdog, автоматического триггера после отдельного app crash, создания новых контейнеров, scale app>1, нового импорта/кампании или исторического replay. `.maintenance` не подавляет собственную Docker restart policy; cutover требует отдельно остановить старый экземпляр и подтвердить отсутствие параллельного доступа к Telegram-сессиям. Windows/production и VPS этим изменением исходников не запускались и не перезапускались. Установка units и фактический перенос оформляются отдельной deployment-квитанцией. Обновлены разделы4,5,10,19 и эта история; предыдущие эксплуатационные изменения сохранены.
+
+При подготовке публикации добавлены исключения `AGENTS.md` и `outputs/` в `.gitignore`; Docker build context дополнительно исключает `.claude/`, операторские инструкции, outputs и node_modules. Это не удаляет уже опубликованную историю: её проверка выполняется отдельно. Для VPS подготовлена изоляция проекта и суммарные лимиты8CPU/15,5GiB (§5.8), сохраняющие ресурсный бюджет для других приложений. Операционные квитанции и артефакты переноса не входят в набор для публикации: секреты, сессии, `.env`, дампы и служебные Git refs остаются локальными.
+
+### 2026-11-02 — Сохранение расписаний при штатной остановке приложения: подготовка исправления
+
+При подготовке Linux cutover обнаружена узкая ошибка: lifespan сначала останавливает AutoRunner-consumer, затем WorkerManager. Ранее `shutdown(preserve_intent=True)` сохранял разрешение worker, но при нормальном выходе всё равно публиковал `worker.stopped`; durable stream сохранял событие, и новый consumer при следующем запуске выполнял stop/clear_session. Единственный destructive consumer этого события — Worker Auto Runner; UI использует его только для обновления отображаемых данных.
+
+Добавлен in-memory флаг конкретного slot `suppress_stopped_event`. Он выставляется только техническим stop с сохранением intent; ручная остановка имеет необратимый приоритет в обоих порядках гонки. Runner захватывает свой slot и под manager lock проверяет его актуальность перед status/event; отставший runner не действует на заменивший его slot. Для normal app shutdown статус становится stopped, но destructive event не публикуется. Final crash/session expiry и обычный manual stop не подавляются; схемы БД, AutoRunner-consumer, кампании и история событий не изменены.
+
+Изолированные проверки реального manager и delayed consumer:9 новых lifecycle/race-тестов плюс7 прежних worker recovery — все16 PASS (0,282 секунды). Покрыты manual stop с очисткой расписания, app shutdown без очистки, оба порядка manual/shutdown, ручная запись intent в полёте, замена slot и независимость её suppression, final crash и session expiry. Tests работают без сети/Telegram/БД. Исправление подготовлено в worktree для review и последующего VPS-deploy; сам живой исходный app этим изменением не перезапускался. Обновлены разделы5,7,10,19 и эта история.

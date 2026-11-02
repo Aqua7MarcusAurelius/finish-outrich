@@ -62,6 +62,17 @@ async def stop_worker(
         return _err(e)
 
 
+@router.post("/workers/{account_id}/recover")
+async def recover_worker(
+    account_id: int, manager: WorkerManager = Depends(get_manager),
+):
+    """Restore previously requested work; never opt an account into recovery."""
+    try:
+        return await manager.start(account_id, recover=True)
+    except ManagerError as e:
+        return _err(e)
+
+
 @router.delete("/accounts/{account_id}")
 async def delete_account(
     account_id: int,

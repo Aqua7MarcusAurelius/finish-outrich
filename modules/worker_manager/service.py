@@ -81,6 +81,12 @@ class NotRunning(ManagerError):
     status_code = 409
 
 
+class RecoveryDisabled(ManagerError):
+    code = "RECOVERY_DISABLED"
+    message = "Автовосстановление воркера не разрешено"
+    status_code = 409
+
+
 class ConfirmationRequired(ManagerError):
     code = "CONFIRMATION_REQUIRED"
     message = "Требуется заголовок X-Confirm-Delete: yes"
@@ -113,6 +119,8 @@ class _Slot:
     started_at: float
     restart_count: int = 0
     last_error: str | None = None
+    stop_requested: bool = False
+    suppress_stopped_event: bool = False
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -132,9 +140,9 @@ class WorkerManager:
         ``NOT_RUNNING`` (409), UI получает "kнопка не работает".
 
         Лечение — один проход при инициализации: любой не-терминальный
-        статус при пустом slot превращается в ``stopped``. Воркеры в
-        этом проекте стартуются вручную через ``POST /workers/{id}/start``,
-        так что после reconcile пользователь видит честное ``stopped``.
+        статус при пустом slot превращается в ``stopped``. Сохранённое
+        намерение worker_desired_running не меняется: последующий явный
+        старт или boot-recover использует реальное состояние менеджера.
         """
         pool = db.get_pool()
         async with pool.acquire() as conn:
@@ -188,7 +196,56 @@ class WorkerManager:
             })
         return out
 
-    async def start(self, account_id: int) -> dict[str, Any]:
+    async def readiness(self) -> dict[str, Any]:
+        """Actual local tasks/connections, separate from cached UI status."""
+        pool = db.get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, is_active, worker_desired_running FROM accounts "
+                "WHERE name <> $1 ORDER BY id", settings.SERVICE_ACCOUNT_NAME,
+            )
+        workers = []
+        for row in rows:
+            account_id = row["id"]
+            slot = self._slots.get(account_id)
+            task_alive = bool(slot and not slot.task.done())
+            connected = bool(task_alive and slot.worker.wrapper.is_connected())
+            status = await self._get_status(account_id) or STATUS_STOPPED
+            desired = bool(row["worker_desired_running"])
+            workers.append({
+                "account_id": account_id,
+                "is_active": row["is_active"],
+                "desired_running": desired,
+                "status": status,
+                "task_alive": task_alive,
+                "connected": connected,
+                "recoverable": bool(desired and row["is_active"]
+                                    and status != STATUS_SESSION_EXPIRED),
+            })
+        desired_workers = [w for w in workers if w["desired_running"]]
+        ready = all(w["connected"] for w in desired_workers)
+        return {
+            "ready": ready,
+            "desired": len(desired_workers),
+            "connected": sum(w["connected"] for w in workers),
+            "desired_connected": sum(w["connected"] for w in desired_workers),
+            "task_alive": sum(w["task_alive"] for w in workers),
+            "workers": workers,
+        }
+
+    async def _set_desired_running(self, account_id: int, enabled: bool) -> None:
+        pool = db.get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE accounts SET worker_desired_running = $2 WHERE id = $1",
+                account_id, enabled,
+            )
+        if result == "UPDATE 0":
+            raise AccountNotFound()
+
+    async def start(
+        self, account_id: int, *, recover: bool = False,
+    ) -> dict[str, Any]:
         async with self._lock:
             if account_id in self._slots:
                 raise AlreadyRunning()
@@ -199,7 +256,7 @@ class WorkerManager:
                     "SELECT id, name, session_data, proxy_primary, "
                     "proxy_fallback, is_active, api_id, api_hash, "
                     "device_model, system_version, app_version, "
-                    "lang_code, system_lang_code, lang_pack "
+                    "lang_code, system_lang_code, lang_pack, worker_desired_running "
                     "FROM accounts WHERE id = $1",
                     account_id,
                 )
@@ -211,6 +268,12 @@ class WorkerManager:
                 raise ServiceAccountNotStartable()
             if not row["is_active"]:
                 raise AccountInactive()
+            if recover:
+                # Recheck under the same lock as manual stop. A previously
+                # fetched readiness response is never authority to restart.
+                if (not row["worker_desired_running"]
+                        or await self._get_status(account_id) == STATUS_SESSION_EXPIRED):
+                    raise RecoveryDisabled()
             if (not row["api_id"] or not row["api_hash"]
                     or not row["device_model"]
                     or not row["system_version"]
@@ -221,30 +284,53 @@ class WorkerManager:
                 # ошибка при регистрации; запускать опасно — свалится при connect.
                 raise AccountFingerprintMissing()
 
-            await self._set_status(account_id, STATUS_STARTING)
-            await self._spawn(
-                account_id=account_id,
-                account_name=row["name"],
-                session_data=row["session_data"],
-                proxy_primary=row["proxy_primary"],
-                proxy_fallback=row["proxy_fallback"],
-                api_id=int(row["api_id"]),
-                api_hash=row["api_hash"],
-                device_model=row["device_model"],
-                system_version=row["system_version"],
-                app_version=row["app_version"],
-                lang_code=row["lang_code"] or "en",
-                system_lang_code=row["system_lang_code"] or "en",
-                lang_pack=row["lang_pack"] or "",
-            )
+            if not recover:
+                await self._set_desired_running(account_id, True)
+            try:
+                await self._set_status(account_id, STATUS_STARTING)
+                await self._spawn(
+                    account_id=account_id,
+                    account_name=row["name"],
+                    session_data=row["session_data"],
+                    proxy_primary=row["proxy_primary"],
+                    proxy_fallback=row["proxy_fallback"],
+                    api_id=int(row["api_id"]),
+                    api_hash=row["api_hash"],
+                    device_model=row["device_model"],
+                    system_version=row["system_version"],
+                    app_version=row["app_version"],
+                    lang_code=row["lang_code"] or "en",
+                    system_lang_code=row["system_lang_code"] or "en",
+                    lang_pack=row["lang_pack"] or "",
+                )
+            except BaseException:
+                if not recover:
+                    await self._set_desired_running(
+                        account_id, bool(row["worker_desired_running"]),
+                    )
+                raise
 
         return {"account_id": account_id, "status": STATUS_STARTING}
 
-    async def stop(self, account_id: int) -> dict[str, Any]:
+    async def stop(
+        self, account_id: int, *, preserve_intent: bool = False,
+    ) -> dict[str, Any]:
         async with self._lock:
+            if not preserve_intent:
+                # Even an offline account can be explicitly disabled. This
+                # durable write precedes shutdown and prevents boot recovery.
+                await self._set_desired_running(account_id, False)
             slot = self._slots.get(account_id)
             if slot is None:
-                raise NotRunning()
+                return {"account_id": account_id, "status": STATUS_STOPPED}
+            # Process shutdown must not enqueue a destructive worker.stopped:
+            # AutoRunner may consume it only after the next boot. A manual
+            # stop wins over technical shutdown, regardless of their order.
+            if not slot.stop_requested:
+                slot.suppress_stopped_event = preserve_intent
+            elif not preserve_intent:
+                slot.suppress_stopped_event = False
+            slot.stop_requested = True
             await self._set_status(account_id, STATUS_STOPPING)
             await slot.worker.stop()
 
@@ -361,7 +447,7 @@ class WorkerManager:
         ids = list(self._slots.keys())
         for acc_id in ids:
             try:
-                await self.stop(acc_id)
+                await self.stop(acc_id, preserve_intent=True)
             except Exception:
                 log.exception("shutdown: failed to stop %s", acc_id)
 
@@ -412,14 +498,22 @@ class WorkerManager:
             try:
                 await worker.run()
                 # Штатное завершение — по stop()
-                await self._set_status(account_id, STATUS_STOPPED)
-                await bus.publish(
-                    module=Module.WORKER,
-                    type=EventType.WORKER_STOPPED,
-                    status=Status.SUCCESS,
-                    account_id=account_id,
-                )
+                async with self._lock:
+                    # The old task must neither read a replacement slot's
+                    # stop intent nor publish an event that stops its runner.
+                    if self._slots.get(account_id) is owned_slot:
+                        await self._set_status(account_id, STATUS_STOPPED)
+                        if not owned_slot.suppress_stopped_event:
+                            await bus.publish(
+                                module=Module.WORKER,
+                                type=EventType.WORKER_STOPPED,
+                                status=Status.SUCCESS,
+                                account_id=account_id,
+                            )
             except SessionExpired as e:
+                # Persist the block across Redis loss / host reboot. Only a
+                # subsequent explicit start can opt this account in again.
+                await self._set_desired_running(account_id, False)
                 await self._set_status(account_id, STATUS_SESSION_EXPIRED)
                 log.warning(
                     "worker account=%s session expired: %s", account_id, e,
@@ -449,6 +543,7 @@ class WorkerManager:
                     if (
                         slot and slot.worker is worker
                         and slot.restart_count == 0 and not is_restart
+                        and not slot.stop_requested
                     ):
                         slot.restart_count = 1
                         restart_attempted = True
@@ -501,12 +596,13 @@ class WorkerManager:
 
         task = asyncio.create_task(_runner())
 
-        self._slots[account_id] = _Slot(
+        owned_slot = _Slot(
             worker=worker,
             task=task,
             started_at=time.monotonic(),
             restart_count=1 if is_restart else 0,
         )
+        self._slots[account_id] = owned_slot
 
         # Статус RUNNING писать здесь НЕЛЬЗЯ — connect ещё не отработал,
         # а get_wrapper()/UI решат что воркер живой (сценарий #1 из аудита

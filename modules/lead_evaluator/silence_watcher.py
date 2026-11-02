@@ -12,15 +12,15 @@
 - `Обрыв` + последнее сообщение (любое) старше `silence_to_close_hours` →
   тот же терминальный `Завершен провал` + `no_response`.
 
-При финализации записываем reason в `dialogs.partner_crm_terminal_reason`
-ДО постановки пузыря — чтобы partner_crm (10.8) сразу увидел правильный
-код когда среагирует на `dialog.status_changed`.
+Кандидаты повторно проверяются под блокировкой строки диалога. Статус,
+reason и происхождение меняются одной транзакцией; событие публикуется
+после commit. Незавершённые ответы и решения оценщика/модератора защищены.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from datetime import timedelta
 
 from core import bus, db
 from modules.dialog_statuses import service as dialog_statuses_service
@@ -139,7 +139,7 @@ class SilenceWatcher:
                 LEFT JOIN LATERAL (
                     SELECT MAX(date) AS last_in
                     FROM messages
-                    WHERE dialog_id = d.id AND is_outgoing = FALSE
+                    WHERE dialog_id = d.id AND is_outgoing = FALSE AND deleted_at IS NULL
                 ) m ON TRUE
                 WHERE d.status_id = $1
                   AND (m.last_in IS NULL
@@ -149,19 +149,10 @@ class SilenceWatcher:
             )
 
         for r in rows:
-            dialog_id = int(r["dialog_id"])
-            try:
-                await dialog_statuses_service.set_dialog_status(
-                    dialog_id, s_obryv, source="event:silence_timer.obryv",
-                )
-                log.info(
-                    "SilenceWatcher: dialog %s Общение→Обрыв (тишина >%dч)",
-                    dialog_id, hours,
-                )
-            except dialog_statuses_service.DialogStatusError:
-                log.exception(
-                    "SilenceWatcher: failed to set Обрыв on dialog %s", dialog_id,
-                )
+            await self._try_transition(
+                int(r["dialog_id"]), [s_obshenie], s_obryv, hours,
+                incoming_only=True, source="event:silence_timer.obryv",
+            )
 
     # ─── Первый контакт / Обрыв → Завершен провал ────────────────────
 
@@ -185,7 +176,7 @@ class SilenceWatcher:
                 FROM dialogs d
                 LEFT JOIN LATERAL (
                     SELECT MAX(date) AS last_any
-                    FROM messages WHERE dialog_id = d.id
+                    FROM messages WHERE dialog_id = d.id AND deleted_at IS NULL
                 ) m ON TRUE
                 WHERE d.status_id = ANY($1::int[])
                   AND (m.last_any IS NOT NULL
@@ -194,34 +185,81 @@ class SilenceWatcher:
                 [s_pervyi, s_obryv], int(hours),
             )
 
-            # Сначала пишем reason, потом меняем статус — partner_crm в 10.8
-            # читает обе колонки и должен видеть согласованное состояние.
-            for r in rows:
-                dialog_id = int(r["dialog_id"])
-                await conn.execute(
-                    """
-                    UPDATE dialogs
-                    SET partner_crm_terminal_reason = 'no_response',
-                        updated_at = NOW()
-                    WHERE id = $1
-                    """,
-                    dialog_id,
-                )
-
         for r in rows:
-            dialog_id = int(r["dialog_id"])
-            try:
-                await dialog_statuses_service.set_dialog_status(
-                    dialog_id, s_proval,
-                    source="event:silence_timer.no_response",
+            await self._try_transition(
+                int(r["dialog_id"]), [s_pervyi, s_obryv], s_proval, hours,
+                incoming_only=False, source="event:silence_timer.no_response",
+            )
+
+    async def _try_transition(
+        self, dialog_id: int, expected_status_ids: list[int], target_status_id: int,
+        hours: int, *, incoming_only: bool, source: str,
+    ) -> bool:
+        """Recheck under the history/status row lock; never close pending work.
+
+        The initial scan is only a candidate list. It cannot authorize a later
+        update after history, the evaluator or the operator changed the dialog.
+        """
+        pool = db.get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                dialog = await conn.fetchrow(
+                    "SELECT id, account_id, status_id, partner_crm_terminal_reason "
+                    "FROM dialogs WHERE id=$1 FOR UPDATE", dialog_id,
                 )
-                log.info(
-                    "SilenceWatcher: dialog %s → Завершен провал "
-                    "(тишина >%dч, reason=no_response)",
-                    dialog_id, hours,
+                if (dialog is None or dialog["status_id"] not in expected_status_ids
+                        or dialog["partner_crm_terminal_reason"] is not None):
+                    return False
+                protected = await conn.fetchval(
+                    """SELECT
+                        EXISTS(SELECT 1 FROM dialog_statuses WHERE id=$2 AND closes_dialog)
+                        OR EXISTS(SELECT 1 FROM lead_evaluations WHERE dialog_id=$1)
+                        OR EXISTS(SELECT 1 FROM report_moderation WHERE dialog_id=$1)
+                        OR EXISTS(SELECT 1 FROM autochat_reply_batches WHERE dialog_id=$1
+                          AND phase IN ('generating','ready','sending','finishing','review'))""",
+                    dialog_id, dialog["status_id"],
                 )
-            except dialog_statuses_service.DialogStatusError:
-                log.exception(
-                    "SilenceWatcher: failed to close dialog %s as no_response",
+                if protected:
+                    return False
+                latest = await conn.fetchrow(
+                    """SELECT id, date, saved_at, is_outgoing FROM messages
+                       WHERE dialog_id=$1 AND deleted_at IS NULL
+                       ORDER BY date DESC, telegram_message_id DESC, id DESC LIMIT 1""",
                     dialog_id,
                 )
+                if latest is None:
+                    return False
+                if not latest["is_outgoing"]:
+                    active = await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM autochat_sessions "
+                        "WHERE dialog_id=$1 AND status='active')", dialog_id,
+                    )
+                    if active:
+                        # This is our unprocessed input, not the lead's silence.
+                        return False
+                activity = latest
+                if incoming_only:
+                    activity = await conn.fetchrow(
+                        """SELECT date, saved_at FROM messages
+                           WHERE dialog_id=$1 AND NOT is_outgoing AND deleted_at IS NULL
+                           ORDER BY date DESC, telegram_message_id DESC, id DESC LIMIT 1""",
+                        dialog_id,
+                    ) or latest
+                last_activity = max(activity["date"], activity["saved_at"] or activity["date"])
+                # Catch-up receives its own grace; an old Telegram timestamp
+                # must not immediately close freshly discovered conversation.
+                if last_activity >= bus.now_utc() - timedelta(hours=max(1, hours)):
+                    return False
+                await conn.execute(
+                    """UPDATE dialogs SET status_id=$2, status_source=$3,
+                           status_source_message_id=$4,
+                           partner_crm_terminal_reason=$5, updated_at=NOW()
+                       WHERE id=$1""",
+                    dialog_id, target_status_id, source, latest["id"],
+                    None if incoming_only else "no_response",
+                )
+        await dialog_statuses_service.publish_status_changed(
+            dialog_id, int(dialog["account_id"]), target_status_id, source,
+        )
+        log.info("SilenceWatcher: dialog=%s status=%s source=%s", dialog_id, target_status_id, source)
+        return True

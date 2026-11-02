@@ -22,6 +22,8 @@ from typing import Any
 
 from core import bus, db
 from core.events import EventType, Module, Status
+from modules.autochat import reply_journal
+from modules.dialog_statuses import service as dialog_statuses_service
 
 log = logging.getLogger(__name__)
 
@@ -180,6 +182,7 @@ class HistoryService:
         # Пишутся только при ПЕРВОМ создании dialog'а — _upsert_dialog
         # передаёт их в INSERT и не трогает на UPDATE.
         partner_crm_meta = data.get("partner_crm_meta")
+        reopened_status_id = None
 
         pool = db.get_pool()
         async with pool.acquire() as conn:
@@ -212,7 +215,7 @@ class HistoryService:
                         media_group_id
                     ) VALUES ($1, $2, $3, 'regular', $4, $5, $6, $7, $8, $9, $10, $11)
                     ON CONFLICT (dialog_id, telegram_message_id) DO NOTHING
-                    RETURNING id
+                    RETURNING id, saved_at
                     """,
                     dialog_id, telegram_message_id, is_outgoing, msg_date, text,
                     reply_internal_id,
@@ -265,6 +268,31 @@ class HistoryService:
                         "duration": media.get("duration"),
                     })
 
+                if not is_outgoing:
+                    # _upsert_dialog already holds this dialog's row lock.
+                    reopened_status_id = await self._reopen_silence_closed(
+                        conn, dialog_id, message_id,
+                    )
+                    enabled = await conn.fetchval(
+                        "SELECT value FROM settings WHERE key='autochat.reply_journal_enabled'",
+                    )
+                    if str(enabled).lower() in ("true", "1", "yes"):
+                        latest_id = await conn.fetchval(
+                            """SELECT id FROM messages WHERE dialog_id=$1 AND deleted_at IS NULL
+                               ORDER BY date DESC, telegram_message_id DESC, id DESC LIMIT 1""",
+                            dialog_id,
+                        )
+                        session = await conn.fetchrow(
+                            "SELECT id, status FROM autochat_sessions WHERE dialog_id=$1 "
+                            "ORDER BY id DESC LIMIT 1", dialog_id,
+                        )
+                        if latest_id == message_id and session and session["status"] == "active":
+                            # Persist intent with history, before the human delay
+                            # or Redis publication can be interrupted by a crash.
+                            await reply_journal.stage_input(
+                                conn, int(session["id"]), dialog_id, int(account_id),
+                            )
+
         # 5. Публикуем message.saved — уже вне транзакции, чтобы к моменту
         # доставки события медиа-модулям запись точно закоммичена.
         flags = _compute_flags(text, media_list)
@@ -279,10 +307,18 @@ class HistoryService:
                 "telegram_message_id": telegram_message_id,
                 "dialog_id": dialog_id,
                 "is_outgoing": is_outgoing,
+                "date": msg_date.isoformat(),
+                "saved_at": message_row["saved_at"].isoformat(),
                 **flags,
                 "media": saved_media,
             },
         )
+
+        if reopened_status_id is not None:
+            await dialog_statuses_service.publish_status_changed(
+                dialog_id, int(account_id), reopened_status_id,
+                "event:message_received.late_inbound",
+            )
 
         # 6. Если диалог только что появился — даём знать peer_profile (он
         # дотянет bio + день рождения через GetFullUserRequest). Событие
@@ -300,6 +336,45 @@ class HistoryService:
                     "telegram_user_id": telegram_user_id,
                 },
             )
+
+    async def _reopen_silence_closed(
+        self, conn: Any, dialog_id: int, message_id: int,
+    ) -> int | None:
+        """Only a proven new inbound can undo our own silence-only status.
+
+        Caller holds the dialog row lock in its history transaction. This does
+        not restart a session, send a reply or reverse a previously pushed CRM
+        result. Unknown historical provenance remains deliberately untouched.
+        """
+        return await conn.fetchval(
+            """UPDATE dialogs d SET
+                   status_id=target.id,
+                   status_source='event:message_received.late_inbound',
+                   status_source_message_id=$2,
+                   partner_crm_terminal_reason=NULL,
+                   updated_at=NOW()
+               FROM dialog_statuses target, messages incoming, messages watermark
+               WHERE d.id=$1
+                 AND target.id=(SELECT id FROM dialog_statuses
+                                WHERE label='Общение' AND NOT closes_dialog ORDER BY id LIMIT 1)
+                 AND d.status_source='event:silence_timer.no_response'
+                 AND (d.partner_crm_terminal_reason IS NULL
+                      OR d.partner_crm_terminal_reason='no_response')
+                 AND incoming.id=$2 AND incoming.dialog_id=d.id
+                 AND NOT incoming.is_outgoing AND incoming.deleted_at IS NULL
+                 AND watermark.id=d.status_source_message_id AND watermark.dialog_id=d.id
+                 AND (incoming.date, incoming.telegram_message_id, incoming.id) >
+                     (watermark.date, watermark.telegram_message_id, watermark.id)
+                 AND incoming.id=(SELECT id FROM messages WHERE dialog_id=d.id
+                                  AND deleted_at IS NULL
+                                  ORDER BY date DESC, telegram_message_id DESC, id DESC LIMIT 1)
+                 AND (SELECT status FROM autochat_sessions WHERE dialog_id=d.id
+                      ORDER BY id DESC LIMIT 1)='active'
+                 AND NOT EXISTS(SELECT 1 FROM lead_evaluations WHERE dialog_id=d.id)
+                 AND NOT EXISTS(SELECT 1 FROM report_moderation WHERE dialog_id=d.id)
+               RETURNING d.status_id""",
+            dialog_id, message_id,
+        )
 
     async def _upsert_dialog(
         self,

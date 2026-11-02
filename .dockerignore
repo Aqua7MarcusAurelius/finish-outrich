@@ -11,3 +11,8 @@ __pycache__/
 *.log
 .DS_Store
 Thumbs.db
+.claude/
+outputs/
+AGENTS.md
+node_modules/
+**/node_modules/

@@ -49,6 +49,7 @@ from core.config import settings
 from core.events import EventType, Module, Status
 from modules.dialog_statuses import service as dialog_statuses_service
 from modules.partner_crm.errors import PartnerCrmError
+from modules.partner_crm.guard import dialog_guard
 from modules.partner_crm.service import PartnerCrmService
 
 log = logging.getLogger(__name__)
@@ -459,25 +460,25 @@ class ReportBotService:
 
         push_after = _now() + timedelta(seconds=MODERATION_DELAY_SEC)
 
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                UPDATE report_moderation
-                SET choice         = $2,
-                    chosen_by      = $3,
-                    chosen_by_name = $4,
-                    chosen_at      = NOW(),
-                    push_after     = $5,
-                    push_attempts  = 0,
-                    push_error     = NULL
-                WHERE dialog_id = $1
-                  AND pushed_at IS NULL
-                RETURNING dialog_id
-                """,
-                dialog_id, choice, int(event.sender_id),
-                sender_name, push_after,
-            )
-
+        async with dialog_guard(dialog_id):
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    UPDATE report_moderation
+                    SET choice         = $2,
+                        chosen_by      = $3,
+                        chosen_by_name = $4,
+                        chosen_at      = NOW(),
+                        push_after     = $5,
+                        push_attempts  = 0,
+                        push_error     = NULL
+                    WHERE dialog_id = $1
+                      AND pushed_at IS NULL
+                    RETURNING dialog_id
+                    """,
+                    dialog_id, choice, int(event.sender_id),
+                    sender_name, push_after,
+                )
         if row is None:
             # Либо строки нет, либо уже отправлено в CRM — менять поздно.
             await event.answer(
@@ -558,6 +559,21 @@ class ReportBotService:
                 )
 
     async def _finalize_one(self, r: dict[str, Any]) -> None:
+        dialog_id = int(r["dialog_id"])
+        async with dialog_guard(dialog_id):
+            # The ticker's row may predate a button press. Re-read under the
+            # same per-dialogue lock used by callbacks and the terminal finalizer.
+            async with db.get_pool().acquire() as conn:
+                current = await conn.fetchrow("""
+                    SELECT * FROM report_moderation WHERE dialog_id=$1
+                      AND pushed_at IS NULL AND choice IS NOT NULL
+                      AND push_after <= NOW() AND push_attempts < $2
+                """, dialog_id, MAX_PUSH_ATTEMPTS)
+            if current is None:
+                return
+            await self._finalize_current(dict(current))
+
+    async def _finalize_current(self, r: dict[str, Any]) -> None:
         dialog_id = int(r["dialog_id"])
         choice = r["choice"]
         fam = self._families.get((r["family"] or "").upper()) or {}

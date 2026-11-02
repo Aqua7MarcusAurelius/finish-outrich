@@ -98,6 +98,15 @@ async def system_stats():
     }
 
 
+@router.get("/readiness")
+async def system_readiness(request: Request):
+    """Worker task/transport readiness; does not change /health semantics."""
+    manager = getattr(request.app.state, "worker_manager", None)
+    if manager is None:
+        return JSONResponse(status_code=503, content={"ready": False, "workers": []})
+    return await manager.readiness()
+
+
 # ── Proxy check ───────────────────────────────────────────────────
 
 class ProxyCheckIn(BaseModel):

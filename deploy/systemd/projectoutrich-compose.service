@@ -1,0 +1,20 @@
+[Unit]
+Description=ProjectOutRich start existing Compose containers
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/projectoutrich/docker-compose.vps.yml
+ConditionPathExists=!/opt/projectoutrich/.maintenance
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/projectoutrich
+ExecStart=/usr/bin/docker compose -p projectoutrich -f docker-compose.vps.yml start
+TimeoutStartSec=180
+UMask=0077
+# Start-only: no ExecStop/down/rebuild. Stop containers explicitly for maintenance.
+# .maintenance guards these units, not Docker's container restart policies.
+
+[Install]
+WantedBy=multi-user.target

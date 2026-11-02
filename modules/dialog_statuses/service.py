@@ -10,8 +10,9 @@
      Эта функция — единственная точка входа: её зовут и UI (через ручку),
      и будущая автоматизация (listener событий типа autochat.finished_by_llm).
 
-Параметр `source` у set_dialog_status пробрасывается в JSONB-data события,
-чтобы потом можно было различать «кто проставил».
+Параметр `source` хранится вместе с watermark последнего сообщения и
+пробрасывается в JSONB-data события. Автоматические переходы могут
+передать ожидаемый прежний статус для защиты от устаревшего решения.
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ from core.events import EventType, Module, Status
 
 _HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 _LABEL_MIN, _LABEL_MAX = 1, 32
+_UNSET = object()
 
 
 class DialogStatusError(Exception):
@@ -188,6 +190,7 @@ async def set_dialog_status(
     status_id: int | None,
     *,
     source: str = "manual",
+    expected_status_id: int | None | object = _UNSET,
 ) -> dict[str, Any]:
     """
     Присвоить (или снять, если status_id=None) операторский статус диалогу.
@@ -201,49 +204,64 @@ async def set_dialog_status(
     """
     pool = db.get_pool()
     async with pool.acquire() as conn:
-        if status_id is not None:
-            exists = await conn.fetchval(
-                "SELECT 1 FROM dialog_statuses WHERE id = $1", status_id,
+        async with conn.transaction():
+            if status_id is not None:
+                exists = await conn.fetchval(
+                    "SELECT 1 FROM dialog_statuses WHERE id = $1", status_id,
+                )
+                if not exists:
+                    raise StatusNotFound()
+            row = await conn.fetchrow(
+                "SELECT id, account_id, status_id FROM dialogs WHERE id=$1 FOR UPDATE",
+                dialog_id,
             )
-            if not exists:
-                raise StatusNotFound()
+            if row is None:
+                raise DialogNotFound()
+            changed = (expected_status_id is _UNSET
+                       or row["status_id"] == expected_status_id)
+            if changed:
+                row = await conn.fetchrow(
+                    """UPDATE dialogs SET status_id=$2, status_source=$3,
+                           status_source_message_id=(
+                               SELECT id FROM messages WHERE dialog_id=$1 AND deleted_at IS NULL
+                               ORDER BY date DESC, telegram_message_id DESC, id DESC LIMIT 1),
+                           updated_at=NOW()
+                       WHERE id=$1 RETURNING id, account_id, status_id""",
+                    dialog_id, status_id, source,
+                )
 
-        row = await conn.fetchrow(
-            """
-            UPDATE dialogs
-            SET status_id = $2, updated_at = NOW()
-            WHERE id = $1
-            RETURNING id, account_id, status_id
-            """,
-            dialog_id, status_id,
+            status_card: dict[str, Any] | None = None
+            if row["status_id"] is not None:
+                s = await conn.fetchrow(
+                    "SELECT id, label, color, sort_order FROM dialog_statuses WHERE id = $1",
+                    row["status_id"],
+                )
+                if s is not None:
+                    status_card = _row_to_dict(s)
+
+    if changed:
+        await publish_status_changed(
+            int(row["id"]), int(row["account_id"]), row["status_id"], source,
         )
-        if row is None:
-            raise DialogNotFound()
+    return {"id": int(row["id"]), "status": status_card, "changed": changed}
 
-        # Полная карточка статуса (для возврата UI'ю и data в событии).
-        status_card: dict[str, Any] | None = None
-        if row["status_id"] is not None:
-            s = await conn.fetchrow(
-                "SELECT id, label, color, sort_order FROM dialog_statuses WHERE id = $1",
-                row["status_id"],
-            )
-            if s is not None:
-                status_card = _row_to_dict(s)
+
+async def publish_status_changed(
+    dialog_id: int, account_id: int, status_id: int | None, source: str,
+) -> None:
+    """Publish only after the caller's status/reason transaction commits."""
 
     await bus.publish(
         module=Module.DIALOG_STATUSES,
         type=EventType.DIALOG_STATUS_CHANGED,
         status=Status.SUCCESS,
-        account_id=int(row["account_id"]),
+        account_id=account_id,
         data={
-            "dialog_id": int(row["id"]),
-            "status_id": int(row["status_id"]) if row["status_id"] is not None else None,
+            "dialog_id": dialog_id,
+            "status_id": int(status_id) if status_id is not None else None,
             "source": source,
         },
     )
-
-    return {"id": int(row["id"]), "status": status_card}
-
 
 # ─────────────────────────────────────────────────────────────────────
 # Внутреннее
