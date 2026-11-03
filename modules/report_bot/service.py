@@ -132,6 +132,7 @@ class ReportBotService:
         self._client: TelegramClient | None = None
         self._stop_event = asyncio.Event()
         self._ticker_task: asyncio.Task | None = None
+        self._demo_tasks: set[asyncio.Task] = set()
         self._families: dict[str, dict[str, Any]] = {}
         self._families_at: float = 0.0
 
@@ -210,6 +211,11 @@ class ReportBotService:
 
     async def stop(self) -> None:
         self._stop_event.set()
+        demo_tasks = list(self._demo_tasks)
+        for task in demo_tasks:
+            task.cancel()
+        if demo_tasks:
+            await asyncio.gather(*demo_tasks, return_exceptions=True)
         if self._ticker_task is not None and not self._ticker_task.done():
             self._ticker_task.cancel()
             try:
@@ -485,6 +491,11 @@ class ReportBotService:
         Ошибки глушим и отвечаем всплывашкой: необработанное исключение
         в обработчике оставит кнопку «в часиках» у нажавшего.
         """
+        if (event.data or b"").startswith(b"demo:"):
+            from .demo import handle_demo_callback
+            await handle_demo_callback(event, self._client)
+            return
+
         try:
             raw = (event.data or b"").decode("utf-8", "replace")
             parts = raw.split(":")

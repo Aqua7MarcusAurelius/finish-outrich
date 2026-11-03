@@ -6,6 +6,10 @@ Endpoint'ы системной группы. Health, stats, proxy-check, debug.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import logging
+import re
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -19,6 +23,56 @@ from core.config import settings
 from core.proxy import check_socks5
 
 router = APIRouter(prefix="/system", tags=["system"])
+log = logging.getLogger(__name__)
+
+
+@router.post("/report-demo", status_code=202)
+async def send_report_demo(request: Request):
+    """Spend one short-lived operator grant issued through trusted SSH.
+
+    No default API token, request-supplied recipients or filesystem paths.
+    The unpredictable bearer is single-use and never included in access URLs.
+    """
+    header = request.headers.get("authorization", "")
+    match = re.fullmatch(r"Bearer ([0-9a-f]{64})", header)
+    if not match:
+        raise HTTPException(401, detail="A one-use report demo grant is required")
+    service = getattr(request.app.state, "report_bot_service", None)
+    if service is None or service._client is None or not service._client.is_connected():
+        raise HTTPException(503, detail="Report bot is not connected")
+    redis = redis_mod.get_client()
+    grant_key = "report_demo_grant:" + hashlib.sha256(match[1].encode()).hexdigest()
+    payload = await redis.getdel(grant_key)
+    if not payload:
+        raise HTTPException(401, detail="Report demo grant expired or already used")
+    try:
+        job = json.loads(payload)
+        valid = (isinstance(job, dict) and isinstance(job.get("run_id"), str)
+                 and re.fullmatch(r"[0-9a-f]{32}", job["run_id"])
+                 and isinstance(job.get("families"), list) and 0 < len(job["families"]) <= 20
+                 and all(isinstance(f, str) and re.fullmatch(r"[A-Z]{2,16}", f)
+                         for f in job["families"]))
+    except (TypeError, ValueError):
+        valid = False
+    if not valid:
+        raise HTTPException(422, detail="Invalid operator demo grant")
+    from modules.report_bot.demo_sender import send_demo_batch
+
+    async def run():
+        try:
+            await send_demo_batch(service, job)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Report demo job failed: %s", type(exc).__name__)
+            await redis.set("report_demo_run:" + job["run_id"], json.dumps({
+                "phase": "failed", "groups": [], "error_kind": type(exc).__name__,
+            }), ex=86400, nx=True)
+
+    task = asyncio.create_task(run(), name="report-demo-" + job["run_id"])
+    service._demo_tasks.add(task)
+    task.add_done_callback(service._demo_tasks.discard)
+    return {"accepted": True, "run_id": job["run_id"]}
 
 
 @router.get("/health")
