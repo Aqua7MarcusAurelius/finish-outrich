@@ -172,7 +172,9 @@ async def lifespan(app: FastAPI):
     # потому что через него финализирует лида (assign-l2 / status).
     # Без REPORT_BOT_TOKEN тихо выключается: успехи копятся в пузыре
     # «Модерация» и ждут, ничего не теряется.
-    report_bot_service = ReportBotService(partner_crm_service)
+    report_bot_service = ReportBotService(
+        partner_crm_service, worker_manager=app.state.worker_manager,
+    )
     app.state.report_bot_service = report_bot_service
     report_bot_task = asyncio.create_task(report_bot_service.run())
     app.state.report_bot_task = report_bot_task

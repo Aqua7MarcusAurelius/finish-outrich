@@ -155,6 +155,7 @@ class EventType:
     # ── Доставка отчётов в TG-группы (этап 10.20) ────────────────────
     # Сервис-аккаунт залил success-отчёт в группу выгрузки воркера.
     REPORT_DELIVERED = "report.delivered"
+    REPORT_PHOTOS_ATTACHED = "report.photos_attached"
     # Не смогли залить (сервис-аккаунт офлайн / ошибка отправки в TG).
     REPORT_DELIVERY_FAILED = "report.delivery_failed"
     # Пропущено осознанно: для воркера нет группы в REPORT_GROUP_MAP.

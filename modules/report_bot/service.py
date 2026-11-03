@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -51,6 +52,8 @@ from modules.dialog_statuses import service as dialog_statuses_service
 from modules.partner_crm.errors import PartnerCrmError
 from modules.partner_crm.guard import dialog_guard
 from modules.partner_crm.service import PartnerCrmService
+from .media import collect_report_photos
+from .privacy import anonymize_report, redact_text
 
 log = logging.getLogger(__name__)
 
@@ -111,11 +114,21 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _report_aliases(info: dict[str, Any], *, username: str | None = None,
+                    minio_key: str | None = None) -> list[str]:
+    aliases = [username or "", info.get("username") or "", info.get("target_username") or ""]
+    original = re.search(r"_@([A-Za-z0-9_]+)_\d{2}-\d{2}-\d{2}_", minio_key or "")
+    if original:
+        aliases.append(original[1])
+    return aliases
+
+
 class ReportBotService:
     """Бот-клиент + модерация. Живёт синглтоном в lifespan."""
 
-    def __init__(self, partner_crm: PartnerCrmService) -> None:
+    def __init__(self, partner_crm: PartnerCrmService, *, worker_manager=None) -> None:
         self._crm = partner_crm
+        self._worker_manager = worker_manager
         self._client: TelegramClient | None = None
         self._stop_event = asyncio.Event()
         self._ticker_task: asyncio.Task | None = None
@@ -333,20 +346,29 @@ class ReportBotService:
             blob = await minio.get_object(
                 minio_key, bucket=settings.MINIO_REPORTS_BUCKET,
             )
-            caption = await self._build_caption(dialog_id, worker_name)
+            aliases = _report_aliases(info, minio_key=minio_key)
+            caption = await self._build_caption(
+                dialog_id, worker_name, identity_aliases=aliases,
+            )
             # Telethon берёт имя вложения из `.name` потока — параметра
             # file_name у send_file нет (1.36), он молча уходил в kwargs,
             # и отчёт приезжал в группу как «unnamed» без расширения.
             # force_document=True — иначе Telegram пытается отрисовать HTML
             # как медиа вместо того чтобы отдать файлом.
-            buf = io.BytesIO(blob)
-            buf.name = minio_key.rsplit("/", 1)[-1]
+            # The stored report remains the canonical internal copy. The group
+            # receives a separate copy with no contact handle, including title,
+            # quoted messages and the attachment filename.
+            buf = io.BytesIO(anonymize_report(
+                blob, aliases, info.get("telegram_user_id"),
+            ))
+            buf.name = f"report_{dialog_id}.html"
             sent = await self._client.send_file(   # type: ignore[union-attr]
                 fam["chat_id"],
                 buf,
                 caption=caption,
                 force_document=True,
                 buttons=self._buttons(dialog_id, chosen=None),
+                parse_mode=None,
             )
         except Exception as e:
             # Не смогли отправить — снимаем claim, чтобы следующая
@@ -386,6 +408,8 @@ class ReportBotService:
                 fam["chat_id"], int(sent.id), minio_key,
             )
 
+        # Record the delivered anchor before optional photo I/O. Cancellation
+        # during enrichment must not erase its confirmed delivery event.
         await bus.publish(
             module=Module.REPORT_DELIVERY,
             type=EventType.REPORT_DELIVERED,
@@ -394,8 +418,46 @@ class ReportBotService:
             data={
                 "dialog_id": dialog_id, "worker": worker_name,
                 "chat_id": fam["chat_id"], "minio_key": minio_key,
+                "telegram_message_id": int(sent.id), "awaiting_moderation": True,
+            },
+        )
+
+        # Albums cannot carry inline buttons. Keep the HTML+buttons as the
+        # existing moderation anchor, and attach only photos as a reply album.
+        # An album failure must never release the claim or resend the anchor.
+        photo_count = 0
+        photo_error = None
+        try:
+            photos = await collect_report_photos(
+                self._worker_manager, account_id, info.get("telegram_user_id"),
+            )
+            if photos:
+                album = await asyncio.wait_for(
+                    self._client.send_file(  # type: ignore[union-attr]
+                        fam["chat_id"], photos if len(photos) > 1 else photos[0],
+                        reply_to=int(sent.id),
+                        force_document=False, parse_mode=None,
+                    ), timeout=60,
+                )
+                photo_count = len(album) if isinstance(album, (list, tuple)) else 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            photo_error = type(exc).__name__
+            log.warning("report_bot: photo attachment failed for dialog %s (%s)",
+                        dialog_id, photo_error)
+
+        await bus.publish(
+            module=Module.REPORT_DELIVERY,
+            type=EventType.REPORT_PHOTOS_ATTACHED,
+            status=Status.ERROR if photo_error else Status.SUCCESS,
+            account_id=account_id,
+            data={
+                "dialog_id": dialog_id, "worker": worker_name,
+                "chat_id": fam["chat_id"], "minio_key": minio_key,
                 "telegram_message_id": int(sent.id),
-                "awaiting_moderation": True,
+                "photo_count": photo_count,
+                "photo_error": photo_error,
             },
         )
         log.info(
@@ -474,27 +536,41 @@ class ReportBotService:
                         push_error     = NULL
                     WHERE dialog_id = $1
                       AND pushed_at IS NULL
-                    RETURNING dialog_id
+                      AND chat_id = $6 AND message_id = $7
+                    RETURNING dialog_id, username, account_id, family,
+                              chat_id, message_id, minio_key
                     """,
                     dialog_id, choice, int(event.sender_id),
                     sender_name, push_after,
+                    getattr(event, "chat_id", None),
+                    getattr(event, "message_id", None),
                 )
-        if row is None:
-            # Либо строки нет, либо уже отправлено в CRM — менять поздно.
-            await event.answer(
-                "Статус уже отправлен в CRM, изменить нельзя", alert=True,
-            )
-            return
-
-        try:
-            await event.edit(buttons=self._buttons(dialog_id, chosen=choice))
-        except Exception:
-            # Кнопки не перерисовались (сообщение удалили, FloodWait) —
-            # выбор в БД уже записан, тикер отработает.
-            log.warning(
-                "report_bot: не удалось обновить кнопки диалога %s", dialog_id,
-                exc_info=True,
-            )
+            if row is None:
+                await event.answer(
+                    "Карточка недоступна или статус уже отправлен в CRM", alert=True,
+                )
+                return
+            # Serialize the visible contact with the stored decision. A slow
+            # take edit cannot run after a later no_take/invalid edit.
+            try:
+                info = await self._dialog_info(dialog_id, row["account_id"])
+                worker_name = info["worker_name"] if info else row["family"]
+                caption = await self._build_caption(
+                    dialog_id, worker_name, reveal_username=choice == "take",
+                    username_override=row["username"],
+                    identity_aliases=_report_aliases(
+                        info or {}, username=row["username"], minio_key=row["minio_key"],
+                    ),
+                )
+                if self._client is not None:
+                    await asyncio.wait_for(self._client.edit_message(
+                        int(row["chat_id"]), int(row["message_id"]), caption,
+                        buttons=self._buttons(dialog_id, chosen=choice), parse_mode=None,
+                    ), timeout=10)
+            except Exception:
+                # Choice and its existing CRM timer have already committed.
+                log.warning("report_bot: card edit failed for dialog %s", dialog_id,
+                            exc_info=True)
 
         hours = MODERATION_DELAY_SEC // 3600
         await event.answer(
@@ -664,7 +740,7 @@ class ReportBotService:
         text = (
             f"⚠️ Не удалось передать в CRM статус «{choice_label}» "
             f"после {attempts} попыток.\n"
-            f"Ошибка: {err[:200]}\n"
+            "Подробности ошибки сохранены в журнале сервера.\n"
             f"Диалог остаётся в модерации — нажмите кнопку ещё раз, "
             f"чтобы повторить."
         )
@@ -689,10 +765,17 @@ class ReportBotService:
             tail += f"\nРешение: {who}"
 
         try:
-            msg = await self._client.get_messages(
-                int(r["chat_id"]), ids=int(r["message_id"]),
+            info = await self._dialog_info(int(r["dialog_id"]), int(r["account_id"]))
+            worker_name = info["worker_name"] if info else r["family"]
+            base = await self._build_caption(
+                int(r["dialog_id"]), worker_name, reveal_username=choice == "take",
+                username_override=r["username"],
+                identity_aliases=_report_aliases(
+                    info or {}, username=r["username"], minio_key=r.get("minio_key"),
+                ),
             )
-            base = (getattr(msg, "message", "") or "") if msg else ""
+            if choice != "take":
+                tail = redact_text(tail, [r["username"]])
             # Подпись Telegram ограничена 1024 символами — режем начало,
             # хвост с итогом важнее.
             room = _CAPTION_MAX - len(tail)
@@ -700,7 +783,7 @@ class ReportBotService:
                 base = base[: max(0, room - 1)].rstrip() + "…"
             await self._client.edit_message(
                 int(r["chat_id"]), int(r["message_id"]),
-                base + tail, buttons=None,
+                base + tail, buttons=None, parse_mode=None,
             )
         except Exception:
             log.warning(
@@ -739,10 +822,15 @@ class ReportBotService:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT d.username AS username, a.name AS worker_name
+                SELECT d.username AS username, d.telegram_user_id,
+                       a.name AS worker_name,
+                       (SELECT s.target_username FROM autochat_sessions s
+                        WHERE s.account_id=d.account_id
+                          AND s.telegram_user_id=d.telegram_user_id
+                        ORDER BY s.id DESC LIMIT 1) AS target_username
                 FROM dialogs d
-                JOIN accounts a ON a.id = $2
-                WHERE d.id = $1
+                JOIN accounts a ON a.id = d.account_id
+                WHERE d.id = $1 AND d.account_id = $2
                 """,
                 dialog_id, account_id,
             )
@@ -752,9 +840,12 @@ class ReportBotService:
                 dialog_id, account_id,
             )
             return None
-        return {"username": row["username"], "worker_name": row["worker_name"]}
+        return dict(row)
 
-    async def _build_caption(self, dialog_id: int, worker_name: str) -> str:
+    async def _build_caption(self, dialog_id: int, worker_name: str, *,
+                             reveal_username: bool = False,
+                             username_override: str | None = None,
+                             identity_aliases: list[str] | None = None) -> str:
         """Подпись к отчёту: воркер, собеседник, поля оценщика, время.
 
         Формат сохранён из `report_delivery` — операторы к нему привыкли.
@@ -774,16 +865,14 @@ class ReportBotService:
             )
         ctx = dict(row) if row is not None else {}
 
-        uname = ctx.get("username")
+        uname = username_override or ctx.get("username")
         full = " ".join(
             p for p in (ctx.get("first_name"), ctx.get("last_name")) if p
         ).strip()
-        if uname:
+        if reveal_username and uname:
             partner = f"@{uname}" + (f" ({full})" if full else "")
-        elif ctx.get("telegram_user_id") is not None:
-            partner = f"id{ctx['telegram_user_id']}" + (f" ({full})" if full else "")
         else:
-            partner = full or "—"
+            partner = full or "Лид"
 
         lines: list[str] = [
             f"✅ Успешный диалог — {worker_name}",
@@ -813,4 +902,8 @@ class ReportBotService:
                 + finished.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             )
 
-        return "\n".join(lines)[:_CAPTION_MAX]
+        text = "\n".join(lines)
+        if not reveal_username:
+            text = redact_text(text, [*(identity_aliases or []), uname or "", ctx.get("username") or ""],
+                               ctx.get("telegram_user_id"))
+        return text[:_CAPTION_MAX]

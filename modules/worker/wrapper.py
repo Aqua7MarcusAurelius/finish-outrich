@@ -874,6 +874,149 @@ class TelegramWrapper:
 
         return {"bio": bio, "birthday": birthday}
 
+    async def fetch_report_photos(self, user_id: int, limit: int = 10) -> list[bytes]:
+        """Read visible profile photos, then accessible pinned-story photos.
+
+        Uses this worker's existing connection only. Optional report enrichment:
+        at most ten static JPEGs, three story pages, twenty downloads, 20 MiB
+        total and thirty seconds. No archive/view acknowledgement or sends.
+        Normal session-error handling stays in ``_guard``; cancellation escapes.
+        """
+        import copy
+        import hashlib
+
+        from telethon.errors import FloodWaitError
+        from telethon.tl.functions.stories import GetPinnedStoriesRequest
+        from telethon.tl.types import (
+            Photo, PhotoCachedSize, PhotoSize, PhotoSizeProgressive, StoryItem,
+        )
+
+        limit = max(0, min(int(limit), 10))
+        if not limit:
+            return []
+        client = self.client
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 30.0
+        total_budget = 20 * 1024 * 1024
+        per_photo_budget = 4 * 1024 * 1024
+        photos: list[bytes] = []
+        photo_ids: set[int] = set()
+        digests: set[bytes] = set()
+        download_attempts = 0
+
+        async def invoke(call):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            return await asyncio.wait_for(self._guard(call), min(5.0, remaining))
+
+        class CappedBuffer(io.BytesIO):
+            def __init__(self, cap: int):
+                super().__init__()
+                self.cap = cap
+
+            def write(self, chunk):
+                nonlocal total_budget
+                if self.tell() + len(chunk) > self.cap or len(chunk) > total_budget:
+                    raise ValueError("report photo exceeds byte budget")
+                written = super().write(chunk)
+                total_budget -= written
+                return written
+
+        def size_bytes(size):
+            if isinstance(size, PhotoCachedSize):
+                return len(size.bytes)
+            if isinstance(size, PhotoSizeProgressive):
+                return max(size.sizes, default=0)
+            return getattr(size, "size", 0)
+
+        async def add_photo(photo):
+            nonlocal total_budget, download_attempts
+            if (not isinstance(photo, Photo) or photo.id in photo_ids
+                    or len(photos) >= limit or download_attempts >= 20):
+                return
+            photo_ids.add(photo.id)
+            cap = min(per_photo_budget, total_budget)
+            sizes = [size for size in photo.sizes
+                     if isinstance(size, (PhotoSize, PhotoSizeProgressive, PhotoCachedSize))
+                     and 0 < size_bytes(size) <= cap]
+            if not sizes:
+                return
+            selected = max(sizes, key=lambda size: (size.w * size.h, size_bytes(size)))
+            # In Telethon 1.36 the default (also thumb=-1) prefers video_sizes.
+            # Progressive sizes must be selected by type, not by object.
+            static_photo = copy.copy(photo)
+            static_photo.sizes = [selected]
+            static_photo.video_sizes = []
+            download_attempts += 1
+            with CappedBuffer(cap) as target:
+                try:
+                    await invoke(lambda: client.download_media(
+                        static_photo, file=target, thumb=selected.type,
+                    ))
+                except (SessionExpired, FloodWaitError, asyncio.TimeoutError):
+                    raise
+                except Exception as exc:
+                    log.info("report photo unavailable account=%s error=%s",
+                             self.account_id, type(exc).__name__)
+                    return
+                data = target.getvalue()
+            # Telegram Photo is JPEG. Never upload unexpected video/file bytes.
+            if not data.startswith(b"\xff\xd8\xff"):
+                return
+            digest = hashlib.sha256(data).digest()
+            if digest in digests:
+                return
+            digests.add(digest)
+            photos.append(data)
+
+        try:
+            peer = await invoke(lambda: client.get_input_entity(int(user_id)))
+            try:
+                profile = await invoke(lambda: client.get_profile_photos(peer, limit=10))
+            except (SessionExpired, FloodWaitError, asyncio.TimeoutError):
+                raise
+            except Exception as exc:
+                log.info("report profile photos unavailable account=%s error=%s",
+                         self.account_id, type(exc).__name__)
+                profile = []
+            for photo in (profile or [])[:10]:
+                await add_photo(photo)
+                if len(photos) >= limit:
+                    return photos
+
+            offset_id = 0
+            for _ in range(3):
+                if len(photos) >= limit or total_budget <= 0 or download_attempts >= 20:
+                    break
+                page = await invoke(lambda: client(GetPinnedStoriesRequest(
+                    peer=peer, offset_id=offset_id, limit=100,
+                )))
+                stories = list(getattr(page, "stories", None) or [])[:100]
+                if not stories:
+                    break
+                for story in stories:
+                    # Respect Telegram access and protection; do not fetch archives.
+                    if (isinstance(story, StoryItem) and not story.noforwards
+                            and isinstance(story.media, MessageMediaPhoto)):
+                        await add_photo(story.media.photo)
+                    if len(photos) >= limit or download_attempts >= 20:
+                        break
+                ids = [story.id for story in stories if getattr(story, "id", 0) > 0]
+                next_offset = min(ids, default=0)
+                if not next_offset or (offset_id and next_offset >= offset_id):
+                    break
+                offset_id = next_offset
+        except SessionExpired:
+            raise
+        except (FloodWaitError, asyncio.TimeoutError) as exc:
+            log.info("report photo collection bounded account=%s error=%s",
+                     self.account_id, type(exc).__name__)
+        except Exception as exc:
+            log.info("report photos unavailable account=%s error=%s",
+                     self.account_id, type(exc).__name__)
+        return photos
+
     async def set_typing(self, user_id: int) -> None:
         """
         Включить индикатор "печатает" в private-диалоге с user_id.
